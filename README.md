@@ -63,7 +63,7 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 
 ### **Анализ производительности**
 
-1. **Small Batch Dominance:** На единичных запросах (`batch=1`) ArKan **уничтожает** PyTorch за счет отсутствия оверхеда интерпретатора и абстракций. Это позволяет совершать \~33,000 инференсов в секунду против \~1,000 у PyTorch.  
+1. **Small Batch Dominance:** На единичных запросах (`batch=1`) ArKan **опережает** PyTorch за счет отсутствия оверхеда интерпретатора и абстракций. Это позволяет совершать \~33,000 инференсов в секунду против \~1,000 у PyTorch.  
 2. **Throughput Scaling:** На больших батчах PyTorch выигрывает за счет высокооптимизированных BLAS-библиотек (MKL/OpenBLAS), которые лучше утилизируют кэш на огромных матрицах. Однако цель ArKan — предсказуемая задержка (Latency) на малых батчах, критичная для real-time систем.
 
 ## **Сравнение с аналогами (Prior Art)**
@@ -182,7 +182,7 @@ Comparison of ArKan (Rust) vs. optimized vectorized PyTorch implementation (CPU)
 
 ### **Performance Analysis**
 
-1. **Small Batch Dominance:** On single requests (`batch=1`), ArKan **destroys** PyTorch due to the lack of interpreter overhead and abstractions. This allows for \~33,000 inferences per second vs \~1,000 for PyTorch.  
+1. **Small Batch Dominance:** On single requests (`batch=1`), ArKan **outperforms** PyTorch due to the lack of interpreter overhead and abstractions. This allows for \~33,000 inferences per second vs \~1,000 for PyTorch.  
 2. **Throughput Scaling:** On very large batches, PyTorch wins due to highly optimized BLAS libraries (MKL), but ArKan maintains predictable execution time without GC pauses (Stop-the-world). The goal of ArKan is low latency.
 
 ## **Comparison with Analogues (Prior Art)**
