@@ -38,17 +38,18 @@ network.forward_batch(&inputs, &mut outputs, &mut workspace);
 - `spline`: Cox-de Boor для B-spline, SIMD-нормализация пачек.
 - `baked`: магик-байты и заглушка под квантованные веса (f16).
 
-## Бенчмарки (Criterion)
-Запуск: `cargo bench --bench forward`
+## Бенчмарки
+- Rust (Criterion): `cargo bench --bench forward`
+- Python (CPU, PyTorch, наивная KAN): `python scripts/bench_pytorch.py`
 
-| Batch | Время на batch (median) | Элементов/с (thrpt) | Комментарий |
-|-------|-------------------------|---------------------|-------------|
-| 1     | ~30 µs                  | ~0.69 M elems/s     | forward_single через batch API |
-| 16    | ~0.98 ms                | ~0.34 M elems/s     | прогретый workspace |
-| 64    | ~3.93 ms                | ~0.34 M elems/s     | стабильная полоса |
-| 256   | ~15.7 ms                | ~0.34 M elems/s     | масштабируется линейно |
+| Batch | ArKan (Rust) время | ArKan thrpt | PyTorch KAN время | PyTorch thrpt | Комментарий |
+|-------|--------------------|-------------|-------------------|---------------|-------------|
+| 1     | ~30 µs             | ~0.69 M/s   | ~32.9 ms          | ~0.00064 M/s  | Rust быстрее ~1000x |
+| 16    | ~0.98 ms           | ~0.34 M/s   | ~540 ms           | ~0.00062 M/s  | |
+| 64    | ~3.93 ms           | ~0.34 M/s   | ~2238 ms          | ~0.00060 M/s  | |
+| 256   | ~15.7 ms           | ~0.34 M/s   | ~8778 ms          | ~0.00061 M/s  | |
 
-Python сравнение: добавьте аналогичный скрипт на PyTorch KAN и замерьте `batch=256` на том же CPU; заполните таблицу выше второй строкой (Python) для резюме.
+Примечание: Python-бенч требует `pip install torch --index-url https://download.pytorch.org/whl/cpu`.
 
 ## Roadmap перед релизом
 - [x] Структуры слоёв/сети, workspace, оптимизаторы, лоссы.
