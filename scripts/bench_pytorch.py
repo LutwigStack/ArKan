@@ -50,7 +50,9 @@ def compute_basis_vectorized(
         saved = torch.zeros(batch, in_dim, dtype=torch.float32)
         for r in range(j):
             denom = right[r + 1] + left[j - r]
-            temp = torch.where(denom.abs() > 1e-6, basis[:, :, r] / denom, 0.0)
+            mask = denom.abs() > 1e-6
+            safe_denom = torch.where(mask, denom, torch.ones_like(denom))
+            temp = (basis[:, :, r] / safe_denom) * mask
             basis[:, :, r] = saved + right[r + 1] * temp
             saved = left[j - r] * temp
         basis[:, :, j] = saved
