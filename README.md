@@ -40,16 +40,16 @@ network.forward_batch(&inputs, &mut outputs, &mut workspace);
 
 ## Бенчмарки
 - Rust (Criterion): `cargo bench --bench forward`
-- Python (CPU, PyTorch, наивная KAN): `python scripts/bench_pytorch.py`
+- Python (CPU, PyTorch, векторизованный скрипт): `python scripts/bench_pytorch.py`
 
 | Batch | ArKan (Rust) время | ArKan thrpt | PyTorch KAN время | PyTorch thrpt | Комментарий |
 |-------|--------------------|-------------|-------------------|---------------|-------------|
-| 1     | ~30 µs             | ~0.69 M/s   | ~32.9 ms          | ~0.00064 M/s  | Rust быстрее ~1000x |
-| 16    | ~0.98 ms           | ~0.34 M/s   | ~540 ms           | ~0.00062 M/s  | |
-| 64    | ~3.93 ms           | ~0.34 M/s   | ~2238 ms          | ~0.00060 M/s  | |
-| 256   | ~15.7 ms           | ~0.34 M/s   | ~8778 ms          | ~0.00061 M/s  | |
+| 1     | ~30 µs             | ~0.69 M/s   | ~0.95 ms          | ~0.02 M/s     | Rust быстрее ~30x |
+| 16    | ~0.98 ms           | ~0.34 M/s   | ~1.85 ms          | ~0.18 M/s     | |
+| 64    | ~3.93 ms           | ~0.34 M/s   | ~2.78 ms          | ~0.48 M/s     | PyTorch догоняет за счет einsum |
+| 256   | ~15.7 ms           | ~0.34 M/s   | ~9.32 ms          | ~0.58 M/s     | На CPU PyTorch может быть быстрее для крупных батчей |
 
-Примечание: Python-бенч требует `pip install torch --index-url https://download.pytorch.org/whl/cpu`.
+Примечание: Python-бенч требует `pip install torch --index-url https://download.pytorch.org/whl/cpu`. Для честного сравнения с CUDA/torch_kan можно добавить GPU-замеры.
 
 ## Roadmap перед релизом
 - [x] Структуры слоёв/сети, workspace, оптимизаторы, лоссы.
