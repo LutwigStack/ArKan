@@ -18,7 +18,7 @@ fn main() {
 
     // Batch forward (batch = 8).
     let batch = 8;
-    let mut batch_inputs = vec![0.0f32; batch * config.input_dim];
+    let batch_inputs = vec![0.0f32; batch * config.input_dim];
     let mut batch_outputs = vec![0.0f32; batch * config.output_dim];
     network.forward_batch(&batch_inputs, &mut batch_outputs, &mut workspace);
     println!("batch forward, first sample out[0] = {}", batch_outputs[0]);

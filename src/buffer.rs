@@ -1,6 +1,8 @@
 //! Aligned buffers and workspace for zero-allocation inference.
 
 use crate::config::KanConfig;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
 
@@ -219,6 +221,30 @@ impl std::ops::IndexMut<usize> for AlignedBuffer {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         assert!(index < self.len, "Index out of bounds");
         unsafe { &mut *self.ptr.as_ptr().add(index) }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for AlignedBuffer {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.as_slice().serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for AlignedBuffer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let data: Vec<f32> = Vec::<f32>::deserialize(deserializer)?;
+        let mut buf = AlignedBuffer::with_capacity(data.len());
+        buf.resize(data.len());
+        buf.as_mut_slice().copy_from_slice(&data);
+        Ok(buf)
     }
 }
 
