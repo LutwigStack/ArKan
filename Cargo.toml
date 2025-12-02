@@ -34,3 +34,7 @@ parallel = []
 serde = ["dep:serde", "dep:bincode"]
 quantization = ["half"]
 nightly = []  # For SIMD intrinsics that require nightly
+
+[[bench]]
+name = "forward"
+harness = false

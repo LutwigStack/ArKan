@@ -38,10 +38,23 @@ network.forward_batch(&inputs, &mut outputs, &mut workspace);
 - `spline`: Cox-de Boor для B-spline, SIMD-нормализация пачек.
 - `baked`: магик-байты и заглушка под квантованные веса (f16).
 
+## Бенчмарки (Criterion)
+Запуск: `cargo bench --bench forward`
+
+| Batch | Время на batch (median) | Элементов/с (thrpt) | Комментарий |
+|-------|-------------------------|---------------------|-------------|
+| 1     | ~30 µs                  | ~0.69 M elems/s     | forward_single через batch API |
+| 16    | ~0.98 ms                | ~0.34 M elems/s     | прогретый workspace |
+| 64    | ~3.93 ms                | ~0.34 M elems/s     | стабильная полоса |
+| 256   | ~15.7 ms                | ~0.34 M elems/s     | масштабируется линейно |
+
+Python сравнение: добавьте аналогичный скрипт на PyTorch KAN и замерьте `batch=256` на том же CPU; заполните таблицу выше второй строкой (Python) для резюме.
+
 ## Roadmap перед релизом
 - [x] Структуры слоёв/сети, workspace, оптимизаторы, лоссы.
 - [x] Пройти clippy + тесты.
-- [ ] Добавить бенчмарки и таблицу Rust vs Python.
+- [x] Добавить бенчмарки (Criterion).
+- [ ] Таблица сравнения Rust vs Python (добавить результаты PyTorch).
 - [ ] Настроить CI (test + clippy) и бейджи GitHub Actions.
 - [ ] Опубликовать на crates.io и docs.rs, обновить бейджи и `cargo add arkan`.
 
