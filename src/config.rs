@@ -24,32 +24,32 @@ pub const fn basis_size(grid_size: usize, spline_order: usize) -> usize {
 pub struct KanConfig {
     /// Input dimension.
     pub input_dim: usize,
-    
+
     /// Output dimension.
     pub output_dim: usize,
-    
+
     /// Hidden layer dimensions (empty = no hidden layers).
     pub hidden_dims: Vec<usize>,
-    
+
     /// Grid size (number of intervals). Max 16 for SIMD index optimization.
     pub grid_size: usize,
-    
+
     /// Spline order (3 = cubic, recommended).
     pub spline_order: usize,
-    
+
     /// Grid range (min, max) for normalized inputs.
     pub grid_range: (f32, f32),
-    
+
     /// Input feature means for normalization.
     pub input_mean: Vec<f32>,
-    
+
     /// Input feature standard deviations for normalization.
     pub input_std: Vec<f32>,
-    
+
     /// Batch size threshold for multithreading.
     /// Batches smaller than this are processed single-threaded.
     pub multithreading_threshold: usize,
-    
+
     /// SIMD vector width for basis alignment (8 for AVX2, 16 for AVX-512).
     pub simd_width: usize,
 }
@@ -73,7 +73,7 @@ impl Default for KanConfig {
 
 impl KanConfig {
     /// Creates a configuration optimized for poker solver.
-    /// 
+    ///
     /// - Input: 21 features (from nn crate)
     /// - Output: 24 (8 strategy probs + 8 Q-values + 8 mask)
     /// - Hidden: [64, 64]
@@ -91,26 +91,26 @@ impl KanConfig {
             simd_width: 8,
         }
     }
-    
+
     /// Number of basis functions per connection.
     #[inline]
     pub fn basis_size(&self) -> usize {
         basis_size(self.grid_size, self.spline_order)
     }
-    
+
     /// Basis size padded to SIMD width.
     #[inline]
     pub fn basis_size_aligned(&self) -> usize {
         let bs = self.basis_size();
-        ((bs + self.simd_width - 1) / self.simd_width) * self.simd_width
+        bs.div_ceil(self.simd_width) * self.simd_width
     }
-    
+
     /// Total number of layers (hidden + output).
     #[inline]
     pub fn num_layers(&self) -> usize {
         self.hidden_dims.len() + 1
     }
-    
+
     /// Layer dimensions: [input, hidden..., output].
     pub fn layer_dims(&self) -> Vec<usize> {
         let mut dims = Vec::with_capacity(self.num_layers() + 1);
@@ -119,7 +119,7 @@ impl KanConfig {
         dims.push(self.output_dim);
         dims
     }
-    
+
     /// Validates the configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.input_dim == 0 {
@@ -151,12 +151,12 @@ impl KanConfig {
         let global_basis = self.basis_size();
         if self.spline_order + 1 > global_basis {
             return Err(ConfigError::InvalidDimension(
-                "spline_order + 1 must be <= grid_size + spline_order"
+                "spline_order + 1 must be <= grid_size + spline_order",
             ));
         }
         Ok(())
     }
-    
+
     /// Updates normalization parameters from data statistics.
     pub fn set_normalization(&mut self, mean: Vec<f32>, std: Vec<f32>) {
         assert_eq!(mean.len(), self.input_dim);
@@ -194,19 +194,19 @@ impl Default for LayerConfig {
 pub enum ConfigError {
     #[error("Invalid dimension: {0}")]
     InvalidDimension(&'static str),
-    
+
     #[error("Grid size must be 1-16, got {0}")]
     InvalidGridSize(usize),
-    
+
     #[error("Spline order must be 1-5, got {0}")]
     InvalidSplineOrder(usize),
-    
+
     #[error("Invalid grid range")]
     InvalidGridRange,
-    
+
     #[error("Mismatched normalization array: {0}")]
     MismatchedNormalization(&'static str),
-    
+
     #[error("SIMD width must be 4, 8, or 16, got {0}")]
     InvalidSimdWidth(usize),
 }
@@ -214,13 +214,13 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_default_config() {
         let config = KanConfig::default();
         assert!(config.validate().is_ok());
     }
-    
+
     #[test]
     fn test_poker_config() {
         let config = KanConfig::default_poker();
@@ -228,7 +228,7 @@ mod tests {
         assert_eq!(config.input_dim, 21);
         assert_eq!(config.output_dim, 24);
     }
-    
+
     #[test]
     fn test_basis_size() {
         let config = KanConfig::default();
@@ -237,14 +237,14 @@ mod tests {
         // Already aligned to 8
         assert_eq!(config.basis_size_aligned(), 8);
     }
-    
+
     #[test]
     fn test_layer_dims() {
         let config = KanConfig::default_poker();
         let dims = config.layer_dims();
         assert_eq!(dims, vec![21, 64, 64, 24]);
     }
-    
+
     #[test]
     fn test_invalid_grid_size() {
         let mut config = KanConfig::default();

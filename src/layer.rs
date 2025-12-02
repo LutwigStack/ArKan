@@ -75,19 +75,19 @@ impl KanLayer {
 
         // Global basis: one B-spline per knot interval that can be active
         let global_basis_size = grid_size + order;
-        
+
         // Local: only order+1 functions are non-zero at any point
         let local_basis_size = order + 1;
         let basis_aligned = (local_basis_size + simd_width - 1) & !(simd_width - 1);
 
         let knots = compute_knots(grid_size, order, grid_range);
-        
+
         // Normalization: only apply to input layer (where in_dim matches config)
         // Hidden layers use identity normalization (mean=0, std=1)
         let (mean, std) = if in_dim == config.input_dim && config.input_mean.len() == in_dim {
             (
                 config.input_mean.clone(),
-                config.input_std.iter().map(|s| s.max(EPSILON)).collect()
+                config.input_std.iter().map(|s| s.max(EPSILON)).collect(),
             )
         } else {
             (vec![0.0; in_dim], vec![1.0; in_dim])
@@ -123,30 +123,30 @@ impl KanLayer {
             simd_width,
         }
     }
-    
+
     /// Creates layer from config (alias for new).
     pub fn from_config(in_dim: usize, out_dim: usize, config: &KanConfig) -> Self {
         Self::new(in_dim, out_dim, config)
     }
-    
+
     /// Returns the weight index for coefficient c[out_idx, in_idx, basis_idx].
     #[inline]
     fn weight_index(&self, out_idx: usize, in_idx: usize, basis_idx: usize) -> usize {
         (out_idx * self.in_dim + in_idx) * self.global_basis_size + basis_idx
     }
-    
+
     /// Basis size aligned to SIMD width.
     #[inline]
     pub fn basis_aligned(&self) -> usize {
         self.basis_aligned
     }
-    
+
     /// Total number of parameters.
     #[inline]
     pub fn param_count(&self) -> usize {
         self.weights.len() + self.bias.len()
     }
-    
+
     /// Sets normalization parameters (mean/std).
     pub fn set_normalization(&mut self, mean: &[f32], std: &[f32]) {
         assert_eq!(mean.len(), self.in_dim);
@@ -158,12 +158,7 @@ impl KanLayer {
     }
 
     /// Forward pass for a single input sample (with simple basis buffer).
-    pub fn forward_single(
-        &self,
-        input: &[f32],
-        output: &mut [f32],
-        basis_buf: &mut [f32],
-    ) {
+    pub fn forward_single(&self, input: &[f32], output: &mut [f32], basis_buf: &mut [f32]) {
         debug_assert_eq!(input.len(), self.in_dim);
         debug_assert_eq!(output.len(), self.out_dim);
         debug_assert!(basis_buf.len() >= self.basis_aligned);
@@ -172,10 +167,10 @@ impl KanLayer {
         output.copy_from_slice(&self.bias);
 
         // For each input, compute basis and accumulate
-        for i in 0..self.in_dim {
-            let z = ((input[i] - self.mean[i]) / self.std[i])
-                .clamp(self.grid_range.0, self.grid_range.1);
-            
+        for (i, raw) in input.iter().enumerate() {
+            let z =
+                ((*raw - self.mean[i]) / self.std[i]).clamp(self.grid_range.0, self.grid_range.1);
+
             // Find span and compute basis
             let span = find_span(z, &self.knots, self.order, self.grid_size);
             compute_basis(
@@ -185,28 +180,24 @@ impl KanLayer {
                 self.order,
                 &mut basis_buf[..self.local_basis_size],
             );
-            
+
             let start_idx = span - self.order;
-            
+            let basis_slice = &basis_buf[..self.local_basis_size];
+
             // Accumulate for each output
-            for j in 0..self.out_dim {
+            for (j, out) in output.iter_mut().enumerate() {
                 let mut sum = 0.0f32;
-                for k in 0..self.local_basis_size {
+                for (k, basis_value) in basis_slice.iter().enumerate() {
                     let weight_idx = self.weight_index(j, i, start_idx + k);
-                    sum += self.weights[weight_idx] * basis_buf[k];
+                    sum += self.weights[weight_idx] * *basis_value;
                 }
-                output[j] += sum;
+                *out += sum;
             }
         }
     }
 
     /// Forward pass for a batch of samples using workspace.
-    pub fn forward_batch(
-        &self,
-        inputs: &[f32],
-        outputs: &mut [f32],
-        workspace: &mut Workspace,
-    ) {
+    pub fn forward_batch(&self, inputs: &[f32], outputs: &mut [f32], workspace: &mut Workspace) {
         let batch_size = inputs.len() / self.in_dim;
         debug_assert_eq!(inputs.len(), batch_size * self.in_dim);
         debug_assert_eq!(outputs.len(), batch_size * self.out_dim);
@@ -216,7 +207,7 @@ impl KanLayer {
         if workspace.basis_values.len() < basis_needed {
             workspace.basis_values.resize(basis_needed);
         }
-        
+
         let spans_needed = batch_size * self.in_dim;
         if workspace.grid_indices.len() < spans_needed {
             workspace.grid_indices.resize(spans_needed, 0);
@@ -234,7 +225,7 @@ impl KanLayer {
                     .clamp(self.grid_range.0, self.grid_range.1);
                 let span = find_span(z, &self.knots, self.order, self.grid_size);
                 workspace.grid_indices[span_batch_start + i] = span as u32;
-                
+
                 let basis_start = basis_batch_start + i * self.basis_aligned;
                 let basis_slice = workspace.basis_values.as_mut_slice();
                 compute_basis(
@@ -244,7 +235,7 @@ impl KanLayer {
                     self.order,
                     &mut basis_slice[basis_start..basis_start + self.local_basis_size],
                 );
-                
+
                 // Zero padding for alignment
                 for j in self.local_basis_size..self.basis_aligned {
                     basis_slice[basis_start + j] = 0.0;
@@ -260,37 +251,32 @@ impl KanLayer {
     fn accumulate_batch(&self, workspace: &Workspace, outputs: &mut [f32], batch_size: usize) {
         let basis_slice = workspace.basis_values.as_slice();
         let spans = &workspace.grid_indices;
-        
+
         for b in 0..batch_size {
             let span_batch_start = b * self.in_dim;
             let basis_batch_start = b * self.in_dim * self.basis_aligned;
             let out_start = b * self.out_dim;
 
             // Initialize outputs with bias
-            for j in 0..self.out_dim {
-                outputs[out_start + j] = self.bias[j];
-            }
+            let out_slice = &mut outputs[out_start..out_start + self.out_dim];
+            out_slice.copy_from_slice(&self.bias);
 
-            for j in 0..self.out_dim {
+            for (j, out) in out_slice.iter_mut().enumerate() {
                 let sum = match self.simd_width {
-                    8 if self.local_basis_size <= 8 && self.in_dim >= 8 => {
-                        self.accumulate_simd8(
-                            basis_slice,
-                            spans,
-                            basis_batch_start,
-                            span_batch_start,
-                            j,
-                        )
-                    }
-                    4 if self.local_basis_size <= 4 && self.in_dim >= 4 => {
-                        self.accumulate_simd4(
-                            basis_slice,
-                            spans,
-                            basis_batch_start,
-                            span_batch_start,
-                            j,
-                        )
-                    }
+                    8 if self.local_basis_size <= 8 && self.in_dim >= 8 => self.accumulate_simd8(
+                        basis_slice,
+                        spans,
+                        basis_batch_start,
+                        span_batch_start,
+                        j,
+                    ),
+                    4 if self.local_basis_size <= 4 && self.in_dim >= 4 => self.accumulate_simd4(
+                        basis_slice,
+                        spans,
+                        basis_batch_start,
+                        span_batch_start,
+                        j,
+                    ),
                     _ => {
                         // Scalar fallback
                         let mut s = 0.0f32;
@@ -308,7 +294,7 @@ impl KanLayer {
                     }
                 };
 
-                outputs[out_start + j] += sum;
+                *out += sum;
             }
         }
     }

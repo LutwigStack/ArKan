@@ -20,6 +20,7 @@
 //! network.forward_batch(&inputs, &mut outputs, &mut workspace);
 //! ```
 
+pub mod baked;
 pub mod buffer;
 pub mod config;
 pub mod layer;
@@ -27,17 +28,18 @@ pub mod loss;
 pub mod network;
 pub mod optimizer;
 pub mod spline;
-pub mod baked;
 
 // Re-exports
-pub use buffer::{AlignedBuffer, Workspace, CACHE_LINE};
-pub use config::{KanConfig, LayerConfig, EPSILON, DEFAULT_GRID_SIZE};
-pub use layer::KanLayer;
-pub use loss::{masked_mse, masked_cross_entropy, poker_combined_loss, softmax, masked_softmax};
-pub use network::KanNetwork;
-pub use optimizer::{Adam, AdamConfig, AdamState, SGD, LrScheduler, StepLR, CosineAnnealingLR};
-pub use spline::{compute_knots, find_span, compute_basis, compute_basis_and_deriv, normalize_batch};
 pub use baked::BakedModel;
+pub use buffer::{AlignedBuffer, Workspace, CACHE_LINE};
+pub use config::{KanConfig, LayerConfig, DEFAULT_GRID_SIZE, EPSILON};
+pub use layer::KanLayer;
+pub use loss::{masked_cross_entropy, masked_mse, masked_softmax, poker_combined_loss, softmax};
+pub use network::KanNetwork;
+pub use optimizer::{Adam, AdamConfig, AdamState, CosineAnnealingLR, LrScheduler, StepLR, SGD};
+pub use spline::{
+    compute_basis, compute_basis_and_deriv, compute_knots, find_span, normalize_batch,
+};
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
