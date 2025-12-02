@@ -24,11 +24,7 @@ fn bench_forward(c: &mut Criterion) {
         group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
         group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &_batch| {
             b.iter(|| {
-                network.forward_batch(
-                    black_box(&inputs),
-                    black_box(&mut outputs),
-                    &mut workspace,
-                );
+                network.forward_batch(black_box(&inputs), black_box(&mut outputs), &mut workspace);
             });
         });
     }
