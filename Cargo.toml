@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "High-performance KAN (Kolmogorov-Arnold Network) for poker solver"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/LutwigStack/ArKan"
+documentation = "https://docs.rs/arkan"
+readme = "README.md"
+keywords = ["kan", "ml", "simd", "spline", "inference"]
+categories = ["algorithms", "science"]
+exclude = ["target/*", "scripts/*", ".github/*", "README for KAN.md"]
 
 [dependencies]
 # SIMD abstractions

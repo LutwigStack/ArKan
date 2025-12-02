@@ -1,5 +1,9 @@
 # **ArKan**
 
+![crates.io](https://img.shields.io/crates/v/arkan.svg)
+![docs.rs](https://docs.rs/arkan/badge.svg)
+![ci](https://github.com/LutwigStack/ArKan/actions/workflows/ci.yml/badge.svg)
+
 <a name="arkan-ru"></a>   **ArKan** — это высокопроизводительная реализация сетей Колмогорова-Арнольда (KAN) на Rust, оптимизированная для задач с критическими требованиями к задержкам (Low Latency Inference).
 
 Библиотека создавалась специально для интеграции в игровые солверы (например, Poker AI / MCTS), где требуется выполнять тысячи одиночных инференсов в секунду без оверхеда, свойственного большим ML-фреймворкам.
@@ -74,11 +78,11 @@ ArKan занимает нишу **специализированного выс�
 
 ## Быстрый старт
 
-Подключение через Cargo (пример для локальной разработки):
+Установка из crates.io:
 
 ```toml
 [dependencies]
-arkan = { git = "https://github.com/LutwigStack/ArKan" }
+arkan = "0.1"
 ```
 Пример использования (смотрите также `examples/basic.rs`):
 ```
@@ -193,11 +197,11 @@ ArKan occupies the niche of **specialized high-performance inference**.
 
 ## **Quick Start**
 
-Installation via Cargo (git dependency):
+Install from crates.io:
 
 ```toml
 [dependencies]
-arkan = { git = "https://github.com/LutwigStack/ArKan" }
+arkan = "0.1"
 ```
 
 Usage Example (see also `examples/basic.rs`):
