@@ -1,0 +1,36 @@
+[package]
+name = "arkan"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance KAN (Kolmogorov-Arnold Network) for poker solver"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# SIMD abstractions
+wide = "0.7"
+
+# Parallelism
+rayon = "1.10"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"], optional = true }
+bincode = { version = "2.0.0-rc.3", optional = true }
+
+# Half precision (optional, for baked models)
+half = { version = "2.4", optional = true }
+
+# Error handling
+thiserror = "1.0"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+rand_distr = "0.4"
+
+[features]
+default = []
+simd = []
+parallel = []
+serde = ["dep:serde", "dep:bincode"]
+quantization = ["half"]
+nightly = []  # For SIMD intrinsics that require nightly
