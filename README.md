@@ -1,6 +1,6 @@
 # **ArKan**
 
-\<a name="arkan-ru"\>\</a\> **ArKan** — это высокопроизводительная реализация сетей Колмогорова-Арнольда (KAN) на Rust, оптимизированная для задач с критическими требованиями к задержкам (Low Latency Inference).
+<a name="arkan-ru"></a>   **ArKan** — это высокопроизводительная реализация сетей Колмогорова-Арнольда (KAN) на Rust, оптимизированная для задач с критическими требованиями к задержкам (Low Latency Inference).
 
 Библиотека создавалась специально для интеграции в игровые солверы (например, Poker AI / MCTS), где требуется выполнять тысячи одиночных инференсов в секунду без оверхеда, свойственного большим ML-фреймворкам.
 
@@ -72,36 +72,38 @@ ArKan занимает нишу **специализированного выс�
 | [`fekan`](https://crates.io/crates/fekan) | Богатый функционал (CLI, dataset loaders). General-purpose библиотека. | ArKan изначально спроектирован под SIMD (AVX2) и параллелизм, тогда как в `fekan` это пока в планах. |
 | [`rusty_kan`](https://crates.io/crates/rusty_kan) | Базовая реализация, образовательный проект. | ArKan фокусируется на production-ready оптимизациях: workspace, батчинг, многопоточность. |
 
-## **Быстрый старт**
+## Быстрый старт
 
 Подключение через Cargo (пример для локальной разработки):
 
+```toml
 [dependencies]
-arkan = { git = "[https://github.com/LutwigStack/ArKan](https://github.com/LutwigStack/ArKan)" }
-
+arkan = { git = "https://github.com/LutwigStack/ArKan" }
+```
 Пример использования:
-
+```
 use arkan::{KanConfig, KanNetwork};
 
-fn main() {  
-    // 1\. Конфигурация (Poker Solver preset)  
-    let config \= KanConfig::default\_poker();  
-      
-    // 2\. Инициализация сети  
-    let network \= KanNetwork::new(config.clone());  
-      
-    // 3\. Создание Workspace (аллокация памяти один раз)  
-    let mut workspace \= network.create\_workspace(64); // Max batch size \= 64
+fn main() {
+    // 1. Конфигурация (Poker Solver preset)
+    let config = KanConfig::default_poker();
 
-    // 4\. Данные  
-    let inputs \= vec\!\[0.0f32; 64 \* config.input\_dim\];  
-    let mut outputs \= vec\!\[0.0f32; 64 \* config.output\_dim\];
+    // 2. Инициализация сети
+    let network = KanNetwork::new(config.clone());
 
-    // 5\. Инференс (Zero allocations here\!)  
-    network.forward\_batch(\&inputs, \&mut outputs, \&mut workspace);  
-      
-    println\!("Inference done. Output\[0\]: {}", outputs\[0\]);  
+    // 3. Создание Workspace (аллокация памяти один раз)
+    let mut workspace = network.create_workspace(64); // Max batch size = 64
+
+    // 4. Данные
+    let inputs = vec![0.0f32; 64 * config.input_dim];
+    let mut outputs = vec![0.0f32; 64 * config.output_dim];
+
+    // 5. Инференс (Zero allocations here!)
+    network.forward_batch(&inputs, &mut outputs, &mut workspace);
+
+    println!("Inference done. Output[0]: {}", outputs[0]);
 }
+```
 
 ## **Архитектура**
 
@@ -113,7 +115,7 @@ fn main() {
 
 Распространяется под двойной лицензией **MIT** и **Apache-2.0**.
 
-\<a name="arkan-en"\>\</a\>
+<a name="arkan-en"></a>
 
 # **ArKan (English Version)**
 
@@ -179,7 +181,7 @@ Comparison of ArKan (Rust) vs. optimized vectorized PyTorch implementation (CPU)
 1. **Small Batch Dominance:** On single requests (`batch=1`), ArKan **destroys** PyTorch due to the lack of interpreter overhead and abstractions. This allows for \~33,000 inferences per second vs \~1,000 for PyTorch.  
 2. **Throughput Scaling:** On very large batches, PyTorch wins due to highly optimized BLAS libraries (MKL), but ArKan maintains predictable execution time without GC pauses (Stop-the-world). The goal of ArKan is low latency.
 
-## ** Comparison with Analogues (Prior Art)**
+## **Comparison with Analogues (Prior Art)**
 
 ArKan occupies the niche of **specialized high-performance inference**.
 
@@ -191,34 +193,37 @@ ArKan occupies the niche of **specialized high-performance inference**.
 
 ## **Quick Start**
 
-Dependency via Cargo:
+Installation via Cargo (git dependency):
 
+```toml
 [dependencies]
-arkan = { git = "[https://github.com/LutwigStack/ArKan](https://github.com/LutwigStack/ArKan)" }
+arkan = { git = "https://github.com/LutwigStack/ArKan" }
+```
 
 Usage Example:
-
+```
 use arkan::{KanConfig, KanNetwork};
 
-fn main() {  
-    // 1\. Configuration (Poker Solver preset)  
-    let config \= KanConfig::default\_poker();  
-      
-    // 2\. Network Initialization  
-    let network \= KanNetwork::new(config.clone());  
-      
-    // 3\. Create Workspace (allocate memory once)  
-    let mut workspace \= network.create\_workspace(64); // Max batch size \= 64
+fn main() {
+    // 1. Configuration (Poker Solver preset)
+    let config = KanConfig::default_poker();
 
-    // 4\. Data  
-    let inputs \= vec\!\[0.0f32; 64 \* config.input\_dim\];  
-    let mut outputs \= vec\!\[0.0f32; 64 \* config.output\_dim\];
+    // 2. Network initialization
+    let network = KanNetwork::new(config.clone());
 
-    // 5\. Inference (Zero allocations here\!)  
-    network.forward\_batch(\&inputs, \&mut outputs, \&mut workspace);  
-      
-    println\!("Inference done. Output\[0\]: {}", outputs\[0\]);  
+    // 3. Create Workspace (memory allocated once)
+    let mut workspace = network.create_workspace(64); // Max batch size = 64
+
+    // 4. Data preparation
+    let inputs = vec![0.0f32; 64 * config.input_dim];
+    let mut outputs = vec![0.0f32; 64 * config.output_dim];
+
+    // 5. Inference (Zero allocations here!)
+    network.forward_batch(&inputs, &mut outputs, &mut workspace);
+
+    println!("Inference done. Output[0]: {}", outputs[0]);
 }
+```
 
 ## **Architecture**
 
