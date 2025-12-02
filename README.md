@@ -4,7 +4,7 @@
 
 Библиотека создавалась специально для интеграции в игровые солверы (например, Poker AI / MCTS), где требуется выполнять тысячи одиночных инференсов в секунду без оверхеда, свойственного большим ML-фреймворкам.
 
-## ** Теория: Что такое KAN?**
+## **Теория: Что такое KAN?**
 
 В отличие от классических многослойных перцептронов (MLP), где функции активации зафиксированы на узлах (нейронах), а обучаются линейные веса, в **Kolmogorov-Arnold Networks (KAN)** всё наоборот:
 
@@ -32,7 +32,7 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 * $G$ — размер сетки (grid size).  
 * $p$ — порядок сплайна (spline order).
 
-## ** Ключевые возможности**
+## **Ключевые возможности**
 
 * **Zero-Allocation Inference:** Весь `forward` проход выполняется на предвыделенном буфере (`Workspace`). Никаких аллокаций в горячем пути (Hot Path).  
 * **SIMD-Optimized B-Splines:** Вычисление базисных функций B-сплайнов векторизовано (AVX2/AVX-512 через крейт `wide`).  
@@ -40,7 +40,7 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 * **Standalone:** Минимальные зависимости (`rayon`, `wide`). Не тянет за собой `torch` или `burn`, идеально для встраивания.  
 * **Quantization Ready:** Архитектура подготовлена для работы с квантованными весами (baked models) для дальнейшего ускорения.
 
-## ** Бенчмарки (CPU)**
+## **Бенчмарки (CPU)**
 
 Сравнение ArKan (Rust) против оптимизированной векторизованной реализации на PyTorch (CPU).
 
@@ -62,7 +62,7 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 1. **Small Batch Dominance:** На единичных запросах (`batch=1`) ArKan **уничтожает** PyTorch за счет отсутствия оверхеда интерпретатора и абстракций. Это позволяет совершать \~33,000 инференсов в секунду против \~1,000 у PyTorch.  
 2. **Throughput Scaling:** На больших батчах PyTorch выигрывает за счет высокооптимизированных BLAS-библиотек (MKL/OpenBLAS), которые лучше утилизируют кэш на огромных матрицах. Однако цель ArKan — предсказуемая задержка (Latency) на малых батчах, критичная для real-time систем.
 
-## ** Сравнение с аналогами (Prior Art)**
+## **Сравнение с аналогами (Prior Art)**
 
 ArKan занимает нишу **специализированного высокопроизводительного инференса**.
 
@@ -72,7 +72,7 @@ ArKan занимает нишу **специализированного выс�
 | [`fekan`](https://crates.io/crates/fekan) | Богатый функционал (CLI, dataset loaders). General-purpose библиотека. | ArKan изначально спроектирован под SIMD (AVX2) и параллелизм, тогда как в `fekan` это пока в планах. |
 | [`rusty_kan`](https://crates.io/crates/rusty_kan) | Базовая реализация, образовательный проект. | ArKan фокусируется на production-ready оптимизациях: workspace, батчинг, многопоточность. |
 
-## ** Быстрый старт**
+## **Быстрый старт**
 
 Подключение через Cargo (пример для локальной разработки):
 
@@ -103,13 +103,13 @@ fn main() {
     println\!("Inference done. Output\[0\]: {}", outputs\[0\]);  
 }
 
-## ** Архитектура**
+## **Архитектура**
 
 * **`KanLayer`**: Реализует слой KAN. Хранит сплайновые коэффициенты. Использует локальное окно `order+1` для вычислений, что позволяет эффективно использовать кэш CPU.  
 * **`Workspace`**: Ключевая структура для производительности. Содержит выровненные (`AlignedBuffer`) буферы для промежуточных вычислений. Переиспользуется между вызовами.  
 * **`spline`**: Модуль с реализацией алгоритма Cox-de Boor. Содержит SIMD-интринсики.
 
-## ** Лицензия**
+## **Лицензия**
 
 Распространяется под двойной лицензией **MIT** и **Apache-2.0**.
 
@@ -121,7 +121,7 @@ fn main() {
 
 The library was created specifically for integration into game solvers (e.g., Poker AI / MCTS), where thousands of single inferences per second are required without the overhead typical of large ML frameworks.
 
-## ** Theory: What is KAN?**
+## **Theory: What is KAN?**
 
 Unlike classical Multi-Layer Perceptrons (MLP), where activation functions are fixed on nodes (neurons) and linear weights are learned, in **Kolmogorov-Arnold Networks (KAN)**, it's the opposite:
 
@@ -149,7 +149,7 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 * $G$ — grid size.  
 * $p$ — spline order.
 
-## ** Key Features**
+## **Key Features**
 
 * **Zero-Allocation Inference:** The entire `forward` pass runs on a pre-allocated buffer (`Workspace`). No allocations in the Hot Path.  
 * **SIMD-Optimized B-Splines:** B-spline basis evaluation is vectorized (AVX2/AVX-512 via `wide` crate).  
@@ -157,7 +157,7 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 * **Standalone:** Minimal dependencies (`rayon`, `wide`). No `torch` or `burn` bloat, ideal for embedding.  
 * **Quantization Ready:** Architecture is ready for quantized weights (baked models) for further acceleration.
 
-## ** Benchmarks (CPU)**
+## **Benchmarks (CPU)**
 
 Comparison of ArKan (Rust) vs. optimized vectorized PyTorch implementation (CPU).
 
@@ -189,7 +189,7 @@ ArKan occupies the niche of **specialized high-performance inference**.
 | [`fekan`](https://crates.io/crates/fekan) | Rich functionality, general-purpose library. | ArKan is designed with SIMD/Parallelism as core features, whereas `fekan` plans to add them later. |
 | [`rusty_kan`](https://crates.io/crates/rusty_kan) | Basic implementation, educational project. | ArKan focuses on production-ready optimizations: workspace, batching, multithreading. |
 
-## ** Quick Start**
+## **Quick Start**
 
 Dependency via Cargo:
 
@@ -220,13 +220,13 @@ fn main() {
     println\!("Inference done. Output\[0\]: {}", outputs\[0\]);  
 }
 
-## ** Architecture**
+## **Architecture**
 
 * **`KanLayer`**: Implements the KAN layer. Stores spline coefficients. Uses a local window `order+1` for calculations, allowing efficient CPU cache usage.  
 * **`Workspace`**: Key structure for performance. Contains aligned (`AlignedBuffer`) buffers for intermediate calculations. Reused between calls.  
 * **`spline`**: Module with the Cox-de Boor algorithm implementation. Contains SIMD intrinsics.
 
-## ** License**
+## **License**
 
 Distributed under a dual license **MIT** and **Apache-2.0**.
 
