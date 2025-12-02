@@ -80,7 +80,7 @@ ArKan занимает нишу **специализированного выс�
 [dependencies]
 arkan = { git = "https://github.com/LutwigStack/ArKan" }
 ```
-Пример использования:
+Пример использования (смотрите также `examples/basic.rs`):
 ```
 use arkan::{KanConfig, KanNetwork};
 
@@ -200,7 +200,7 @@ Installation via Cargo (git dependency):
 arkan = { git = "https://github.com/LutwigStack/ArKan" }
 ```
 
-Usage Example:
+Usage Example (see also `examples/basic.rs`):
 ```
 use arkan::{KanConfig, KanNetwork};
 
