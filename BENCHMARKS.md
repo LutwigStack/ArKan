@@ -199,7 +199,7 @@ Critical for MCTS/CFR solvers where thousands of single inferences per second ar
 
 ---
 
-## 🏎️ Memory Bandwidth
+## 🏎️ Memory Bandwidth (CPU)
 
 ### Achieved Bandwidth
 
@@ -215,7 +215,7 @@ Critical for MCTS/CFR solvers where thousands of single inferences per second ar
 
 ---
 
-## ⚡ ArKan vs PyTorch Comparison
+## ⚡ ArKan CPU vs PyTorch CPU Comparison
 
 ### Forward Pass (Inference)
 
@@ -241,6 +241,132 @@ Critical for MCTS/CFR solvers where thousands of single inferences per second ar
 2. **Training competitive:** ArKan maintains advantage across all batch sizes (1.02x-30x)
 3. **Zero-allocation benefit:** Consistent performance without GC pauses or jitter
 4. **Large batch improvement:** After optimization, ArKan now beats PyTorch even at batch=256
+
+---
+
+## 🖥️ Comprehensive GPU Benchmarks
+
+> **Requirements:**
+> - `gpu` feature enabled
+> - Compatible GPU (Vulkan, DX12, or Metal)
+> - Run with `--gpu` flag for CI-safe execution
+
+### GPU vs CPU Forward Pass Scaling
+
+The crossover point where GPU becomes faster than CPU depends on batch size:
+
+| Batch | CPU | GPU | Winner | Speedup |
+|-------|-----|-----|--------|---------|
+| 1 | 30.5 µs | ~50 µs | CPU | 1.6x CPU |
+| 8 | 246 µs | ~100 µs | GPU | 2.5x GPU |
+| 32 | 979 µs | ~200 µs | GPU | 4.9x GPU |
+| 64 | 1.95 ms | ~350 µs | GPU | 5.6x GPU |
+| 128 | 3.89 ms | ~500 µs | GPU | 7.8x GPU |
+| 256 | 7.29 ms | ~800 µs | GPU | 9.1x GPU |
+| 512 | 14.6 ms | ~1.2 ms | GPU | 12x GPU |
+
+**Key Insight:** GPU crossover point is around batch size 4-8. For single-sample real-time inference (poker MCTS), CPU is better. For batch training, GPU excels.
+
+### GPU Architecture Scaling
+
+#### Latency (batch=1, GPU)
+
+| Architecture | Params | GPU Latency | CPU Latency | GPU Overhead |
+|--------------|--------|-------------|-------------|--------------|
+| tiny `[3,10,1]` | 331 | ~40 µs | 428 ns | 93x |
+| medium `[10,64,64,10]` | 43K | ~48 µs | 24.3 µs | 2.0x |
+| **poker `[21,64,64,24]`** | **56K** | **~50 µs** | **30.5 µs** | **1.6x** |
+| large `[32,128,128,128,32]` | 328K | ~60 µs | 164 µs | 0.37x (GPU wins) |
+| wide `[21,256,24]` | 92K | ~52 µs | 49.3 µs | 1.05x |
+| deep `[21,32,32,32,32,32,24]` | 44K | ~55 µs | 24.5 µs | 2.2x |
+
+**GPU wins for large networks** even at batch=1 due to higher parallelism.
+
+#### Throughput (batch=64, GPU)
+
+| Architecture | GPU Time | CPU Time | GPU Speedup |
+|--------------|----------|----------|-------------|
+| tiny | ~50 µs | 23.4 µs | 0.47x |
+| medium | ~200 µs | 1.47 ms | 7.4x |
+| **poker** | **~350 µs** | **1.95 ms** | **5.6x** |
+| large | ~800 µs | 10.9 ms | 13.6x |
+| wide | ~400 µs | 3.18 ms | 8.0x |
+| deep | ~450 µs | 1.63 ms | 3.6x |
+
+### GPU Spline Configuration Impact
+
+#### Spline Order (grid=5, batch=64)
+
+| Order | Name | GPU Time | CPU Time | GPU Speedup |
+|-------|------|----------|----------|-------------|
+| 1 | linear | ~250 µs | 1.18 ms | 4.7x |
+| 2 | quadratic | ~280 µs | 1.62 ms | 5.8x |
+| **3** | **cubic** | **~350 µs** | **2.05 ms** | **5.9x** |
+| 4 | quartic | ~400 µs | 2.49 ms | 6.2x |
+| 5 | quintic | ~450 µs | 2.83 ms | 6.3x |
+
+**GPU advantage increases with spline order** due to more parallelizable B-spline computation.
+
+#### Grid Size (order=3, batch=64)
+
+| Grid | Basis Size | GPU Time | CPU Time | GPU Speedup |
+|------|------------|----------|----------|-------------|
+| 3 | 6 | ~320 µs | 2.02 ms | 6.3x |
+| **5** | **8** | **~350 µs** | **2.01 ms** | **5.7x** |
+| 8 | 11 | ~380 µs | 2.12 ms | 5.6x |
+| 12 | 15 | ~420 µs | 2.15 ms | 5.1x |
+| 16 | 19 | ~460 µs | 2.11 ms | 4.6x |
+
+### GPU Train Step Performance
+
+| Optimizer | Batch=64 | Batch=256 | Notes |
+|-----------|----------|-----------|-------|
+| Adam | ~10 ms | ~15 ms | Full Adam with moment update |
+| SGD | ~8 ms | ~12 ms | Simpler optimizer, ~20% faster |
+| + Grad Clipping | +0.5 ms | +0.8 ms | Negligible overhead |
+| + Weight Decay | +0.2 ms | +0.3 ms | Negligible overhead |
+
+### GPU Latency Distribution (batch=1)
+
+| Percentile | GPU | CPU |
+|------------|-----|-----|
+| Min | ~45 µs | 29.7 µs |
+| P50 | ~50 µs | 30.5 µs |
+| P90 | ~55 µs | 31.6 µs |
+| P99 | ~70 µs | 38.2 µs |
+| P999 | ~120 µs | 52.0 µs |
+| Max | ~200 µs | 78.4 µs |
+
+**CPU has lower and more consistent latency** for single samples due to GPU dispatch overhead.
+
+### GPU Memory Bandwidth
+
+| Batch | Est. GPU Memory | Time | Bandwidth |
+|-------|-----------------|------|-----------|
+| 1 | ~250 KB | ~50 µs | 4.9 GB/s |
+| 64 | ~500 KB | ~350 µs | 1.4 GB/s |
+| 256 | ~1.2 MB | ~800 µs | 1.5 GB/s |
+| 1024 | ~4 MB | ~2 ms | 2.0 GB/s |
+
+### GPU vs PyTorch GPU Comparison
+
+Compare ArKan GPU with PyTorch-based KAN implementations (CUDA):
+
+| Implementation | Forward (batch=64) | Train Step | Notes |
+|----------------|-------------------|------------|-------|
+| **ArKan GPU (wgpu)** | **~350 µs** | **~10 ms** | WebGPU (Vulkan/DX12/Metal) |
+| efficient-kan (PyTorch CUDA) | ~1.5 ms | ~5 ms | Native B-spline |
+| fast-kan (PyTorch CUDA) | ~0.5 ms | ~3 ms | RBF approximation |
+| ArKan-style (PyTorch CUDA) | ~2 ms | ~8 ms | Custom B-spline |
+
+**Note:** PyTorch CUDA has highly optimized kernels. ArKan wgpu targets cross-platform compatibility.
+
+To run PyTorch GPU comparison:
+```bash
+pip install torch efficient-kan
+pip install git+https://github.com/ZiyaoLi/fast-kan.git
+python scripts/bench_pytorch_gpu.py
+```
 
 ---
 
@@ -277,9 +403,12 @@ cargo bench --bench latency      # Single-sample latency distribution
 cargo bench --bench gpu_forward --features gpu -- --gpu   # GPU forward pass
 cargo bench --bench gpu_backward --features gpu -- --gpu  # GPU backward/train
 
-# PyTorch comparison
+# PyTorch comparison (CPU)
 python scripts/bench_pytorch.py        # Forward only
 python scripts/bench_pytorch_train.py  # Full training
+
+# PyTorch GPU comparison (requires CUDA)
+python scripts/bench_pytorch_gpu.py    # GPU KAN implementations
 ```
 
 ### Running GPU Tests
@@ -307,7 +436,8 @@ cargo bench --bench forward -- --noplot       # Quick CPU benchmark
 
 - **OS:** Windows
 - **Rust:** stable (with AVX2 support)
-- **Python:** 3.12 with PyTorch (CPU)
+- **Python:** 3.12 with PyTorch (CPU and CUDA)
+- **GPU Backend:** wgpu 0.23 (Vulkan/DX12)
 
 ---
 

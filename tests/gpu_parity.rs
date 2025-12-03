@@ -6,6 +6,7 @@
 //! Run with: cargo test --features gpu --test gpu_parity -- --ignored
 
 #![cfg(feature = "gpu")]
+#![allow(unused_imports)]
 
 use arkan::{KanConfig, KanNetwork, TrainOptions};
 use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork};
