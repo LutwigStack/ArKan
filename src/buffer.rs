@@ -1,4 +1,37 @@
 //! Aligned buffers and workspace for zero-allocation inference.
+//!
+//! This module provides two key types:
+//!
+//! - [`AlignedBuffer`] — 64-byte aligned buffer for SIMD operations
+//! - [`Workspace`] — Preallocated buffers for forward/backward passes
+//!
+//! # Zero-Allocation Pattern
+//!
+//! ArKan achieves zero-allocation inference by preallocating all buffers
+//! in the [`Workspace`]. Create it once and reuse:
+//!
+//! ```rust
+//! use arkan::{KanConfig, KanNetwork, Workspace};
+//!
+//! let config = KanConfig::default_poker();
+//! let network = KanNetwork::new(config.clone());
+//!
+//! // Allocate workspace once for max batch size
+//! let mut workspace = network.create_workspace(64);
+//!
+//! // All subsequent calls are zero-allocation
+//! let input = vec![0.5f32; config.input_dim];
+//! let mut output = vec![0.0f32; config.output_dim];
+//!
+//! for _ in 0..1000 {
+//!     network.forward_single(&input, &mut output, &mut workspace);
+//! }
+//! ```
+//!
+//! # Memory Alignment
+//!
+//! [`AlignedBuffer`] uses 64-byte alignment ([`CACHE_LINE`]) to ensure
+//! optimal performance with AVX-512 SIMD instructions.
 
 use crate::config::KanConfig;
 #[cfg(feature = "serde")]
@@ -6,10 +39,33 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
 
-/// Cache line size for alignment.
+/// Cache line size for memory alignment (64 bytes).
+///
+/// All [`AlignedBuffer`] allocations use this alignment for optimal
+/// SIMD performance and cache behavior.
 pub const CACHE_LINE: usize = 64;
 
 /// 64-byte aligned buffer for SIMD operations.
+///
+/// This buffer guarantees 64-byte alignment, making it suitable for
+/// AVX-512 instructions. It provides a `Vec<f32>`-like interface but
+/// with cache-friendly memory layout.
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::AlignedBuffer;
+///
+/// let mut buf = AlignedBuffer::with_capacity(1024);
+/// buf.resize(100);
+/// buf.as_mut_slice()[0] = 1.0;
+/// assert_eq!(buf[0], 1.0);
+/// ```
+///
+/// # Safety
+///
+/// The buffer uses raw allocation with proper alignment. All unsafe
+/// operations are encapsulated and the public API is safe.
 #[repr(C)]
 pub struct AlignedBuffer {
     ptr: NonNull<f32>,
@@ -258,36 +314,137 @@ impl<'de> Deserialize<'de> for AlignedBuffer {
     }
 }
 
-/// Preallocated workspace for zero-allocation forward/backward pass.
+/// Preallocated workspace for zero-allocation forward/backward passes.
+///
+/// The workspace holds all intermediate buffers needed during inference
+/// and training. By preallocating these buffers, ArKan avoids heap
+/// allocations in the hot path.
+///
+/// # Buffer Preparation
+///
+/// Before using the workspace, call the appropriate preparation method:
+///
+/// | Method | Use Case |
+/// |--------|----------|
+/// | [`reserve`](Self::reserve) | Ensure capacity for batch size |
+/// | [`prepare_forward`](Self::prepare_forward) | Inference: resize z_buffer, basis_values, etc. |
+/// | [`prepare_training`](Self::prepare_training) | Training: add history buffers for backward pass |
+/// | [`prepare_grad_buffers`](Self::prepare_grad_buffers) | Training: allocate per-layer gradient vectors |
+///
+/// Typical flow:
+/// ```text
+/// network.create_workspace(batch_size)   // calls reserve() internally
+///   \u2514\u2500> Inference: forward_batch()         // calls prepare_forward() automatically
+///   \u2514\u2500> Training:  train_step()            // calls prepare_training() + prepare_grad_buffers()
+/// ```
+///
+/// # Buffer Categories
+///
+/// **Forward buffers** (used during inference and training):
+/// - `z_buffer`: Normalized inputs `[batch, input_dim]`
+/// - `basis_values`: B-spline basis values `[batch, input_dim, basis_size]`
+/// - `layer_output`, `layer_input`: Ping-pong buffers for layer activations
+///
+/// **Backward buffers** (training only):
+/// - `layers_inputs`: Saved normalized inputs per layer for gradient computation
+/// - `layers_grid_indices`: Saved spline segment indices per layer
+/// - `staging_buffer`: Current layer's output gradient (ping-pong with `layer_grads`)
+/// - `layer_grads`: Accumulated input gradients during backprop
+///
+/// **Gradient buffers** (training only):
+/// - `weight_grads`: Per-layer weight gradients `[layer][weights.len()]`
+/// - `bias_grads`: Per-layer bias gradients `[layer][bias.len()]`
+/// - `grad_output`: Initial output gradient (dL/dy)
+/// - `predictions_buffer`: Forward pass outputs before loss computation
+///
+/// # Usage
+///
+/// Create a workspace using [`KanNetwork::create_workspace`](crate::KanNetwork::create_workspace):
+///
+/// ```rust
+/// use arkan::{KanConfig, KanNetwork};
+///
+/// let network = KanNetwork::new(KanConfig::default_poker());
+/// let mut workspace = network.create_workspace(64);
+///
+/// // Reuse workspace for all calls
+/// ```
+///
+/// # Thread Safety
+///
+/// Workspaces are NOT thread-safe. Each thread should have its own workspace.
+/// The network itself can be shared (it's read-only during inference).
 #[derive(Default)]
 pub struct Workspace {
-    /// Normalized inputs: [Batch, Input]
+    /// Normalized inputs: `[Batch, Input]`
     pub z_buffer: AlignedBuffer,
 
-    /// Basis function values: [Batch, Input, Basis]
+    /// Basis function values: `[Batch, Input, Basis]`
     pub basis_values: AlignedBuffer,
 
-    /// Basis function derivatives: [Batch, Input, Basis]
+    /// Basis function derivatives: `[Batch, Input, Basis]`
     pub basis_derivs: AlignedBuffer,
 
-    /// Grid indices: [Batch, Input]
+    /// Grid indices: `[Batch, Input]`
     pub grid_indices: Vec<u32>,
 
-    /// Intermediate layer outputs: [Batch, MaxHiddenDim]
+    /// Intermediate layer outputs: `[Batch, MaxHiddenDim]`
     pub layer_output: AlignedBuffer,
 
-    /// Previous layer output (for multi-layer): [Batch, MaxHiddenDim]
+    /// Previous layer output (for multi-layer): `[Batch, MaxHiddenDim]`
     pub layer_input: AlignedBuffer,
 
     // --- Backward pass history ---
-    /// Saved normalized inputs per layer: [Layer][Batch * in_dim_layer]
+    /// Saved normalized inputs per layer: `[Layer][Batch * in_dim_layer]`.
+    ///
+    /// Recorded during `forward_batch_training` and used in backward pass
+    /// to recompute B-spline basis derivatives. Each buffer holds the
+    /// z-normalized input values for one layer.
     pub layers_inputs: Vec<AlignedBuffer>,
 
-    /// Saved grid indices per layer: [Layer][Batch * in_dim_layer]
+    /// Saved grid indices per layer: `[Layer][Batch * in_dim_layer]`.
+    ///
+    /// The spline segment index for each input, recorded during forward.
+    /// Used in backward to index into the correct spline weights.
     pub layers_grid_indices: Vec<Vec<u32>>,
 
-    /// Gradient buffer passed between layers during backprop: [Batch, MaxDim]
+    /// Gradient buffer passed between layers during backprop: `[Batch, MaxDim]`.
+    ///
+    /// During backward pass, this buffer accumulates dL/d(layer_input) which
+    /// becomes dL/d(layer_output) for the previous layer.
     pub layer_grads: AlignedBuffer,
+
+    /// Staging buffer for ping-pong gradient propagation: `[Batch, MaxDim]`.
+    ///
+    /// Holds the current layer's output gradient (dL/dy). After each layer's
+    /// backward pass, `layer_grads` is copied here for the next iteration.
+    /// This enables zero-allocation backward without double-borrow issues.
+    pub staging_buffer: AlignedBuffer,
+
+    /// Predictions buffer for train_step: `[Batch, OutputDim]`.
+    ///
+    /// Stores forward pass outputs before loss computation. Used with
+    /// `std::mem::take` to avoid borrow conflicts with workspace during
+    /// forward_batch_training.
+    pub predictions_buffer: AlignedBuffer,
+
+    /// Weight gradients per layer: `[Layer][weights.len()]`.
+    ///
+    /// Accumulated during backward pass. Prepared by `prepare_grad_buffers()`
+    /// with sizes matching each layer's weight count.
+    pub weight_grads: Vec<Vec<f32>>,
+
+    /// Bias gradients per layer: `[Layer][bias.len()]`.
+    ///
+    /// Accumulated during backward pass. Prepared by `prepare_grad_buffers()`
+    /// with sizes matching each layer's bias count.
+    pub bias_grads: Vec<Vec<f32>>,
+
+    /// Output gradient buffer for backprop: `[Batch * output_dim]`.
+    ///
+    /// Initial gradient dL/d(network_output), computed from loss function.
+    /// Seeded by `compute_masked_mse_loss_into()` and propagated backward.
+    pub grad_output: AlignedBuffer,
 
     /// Tracking ---
     /// Current batch capacity
@@ -313,6 +470,11 @@ impl Workspace {
             layers_inputs: Vec::new(),
             layers_grid_indices: Vec::new(),
             layer_grads: AlignedBuffer::new(),
+            staging_buffer: AlignedBuffer::new(),
+            predictions_buffer: AlignedBuffer::new(),
+            weight_grads: Vec::new(),
+            bias_grads: Vec::new(),
+            grad_output: AlignedBuffer::new(),
             batch_capacity: 0,
             max_dim: 0,
             history_batch_size: 0,
@@ -335,6 +497,7 @@ impl Workspace {
         let max_dim = *dims.iter().max().unwrap_or(&1);
         let basis = config.basis_size_aligned();
         let input_dim = config.input_dim;
+        let output_dim = config.output_dim;
 
         // z_buffer: [batch, input]
         self.z_buffer.reserve(batch_size * input_dim);
@@ -356,6 +519,15 @@ impl Workspace {
         // layer_grads: [batch, max_dim]
         self.layer_grads.reserve(batch_size * max_dim);
 
+        // staging_buffer for ping-pong without alloc: [batch, max_dim]
+        self.staging_buffer.reserve(batch_size * max_dim);
+
+        // predictions_buffer for train_step: [batch, output_dim]
+        self.predictions_buffer.reserve(batch_size * output_dim);
+
+        // grad_output for backprop: [batch, output_dim]
+        self.grad_output.reserve(batch_size * output_dim);
+
         self.batch_capacity = batch_size;
         self.max_dim = max_dim;
     }
@@ -375,6 +547,25 @@ impl Workspace {
     }
 
     /// Prepares workspace for training with history tracking.
+    ///
+    /// Allocates/resizes buffers needed for backward pass:
+    /// - `layers_inputs`: one buffer per layer for saved normalized inputs
+    /// - `layers_grid_indices`: one vec per layer for saved spline indices
+    /// - `layer_grads`, `staging_buffer`: ping-pong gradient buffers
+    /// - `basis_derivs`: B-spline derivative values
+    /// - `predictions_buffer`, `grad_output`: loss computation buffers
+    ///
+    /// # Zero-Allocation Guarantee
+    ///
+    /// After the first call with a given batch size, subsequent calls with
+    /// the same or smaller batch size perform zero allocations. Buffers
+    /// grow monotonically and are reused.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch_size` - Number of samples in the batch
+    /// * `config` - Network configuration
+    /// * `layer_dims` - Dimensions of all layers `[input, hidden..., output]`
     #[inline]
     pub fn prepare_training(
         &mut self,
@@ -420,7 +611,54 @@ impl Workspace {
         self.basis_derivs.reserve(batch_size * max_in_dim * basis);
         self.basis_derivs.resize(batch_size * max_in_dim * basis);
 
+        // Training ping-pong buffers
+        let output_dim = config.output_dim;
+        self.predictions_buffer.reserve(batch_size * output_dim);
+        self.predictions_buffer.resize(batch_size * output_dim);
+
+        self.grad_output.reserve(batch_size * output_dim);
+        self.grad_output.resize(batch_size * output_dim);
+
         self.history_batch_size = batch_size;
+    }
+
+    /// Prepares gradient buffers for training with layer sizes.
+    ///
+    /// Allocates `weight_grads` and `bias_grads` vectors with correct sizes
+    /// for each layer. These buffers accumulate gradients during backward pass.
+    ///
+    /// # Arguments
+    ///
+    /// * `layer_sizes` - Tuples of `(weight_count, bias_count)` per layer.
+    ///   Obtained from `KanNetwork::layer_param_sizes`.
+    ///
+    /// # Zero-Allocation Note
+    ///
+    /// Buffers grow monotonically. After first call, subsequent calls with
+    /// same or smaller layer sizes perform zero allocations.
+    #[inline]
+    pub fn prepare_grad_buffers(&mut self, layer_sizes: &[(usize, usize)]) {
+        let num_layers = layer_sizes.len();
+        
+        // Resize gradient vectors if needed
+        if self.weight_grads.len() < num_layers {
+            self.weight_grads.resize_with(num_layers, Vec::new);
+        }
+        if self.bias_grads.len() < num_layers {
+            self.bias_grads.resize_with(num_layers, Vec::new);
+        }
+
+        // Ensure each layer's gradient buffer has correct capacity
+        for (i, (w_size, b_size)) in layer_sizes.iter().enumerate() {
+            let buf = &mut self.weight_grads[i];
+            if buf.len() < *w_size {
+                buf.resize(*w_size, 0.0);
+            }
+            let buf = &mut self.bias_grads[i];
+            if buf.len() < *b_size {
+                buf.resize(*b_size, 0.0);
+            }
+        }
     }
 
     /// Current batch capacity.
