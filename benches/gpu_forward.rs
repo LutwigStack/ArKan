@@ -767,6 +767,114 @@ fn bench_cpu_vs_gpu_scaling(c: &mut Criterion) {
 #[cfg(not(feature = "gpu"))]
 fn bench_cpu_vs_gpu_scaling(_c: &mut Criterion) {}
 
+// ============================================================================
+// GPU Softmax Benchmarks
+// ============================================================================
+
+#[cfg(feature = "gpu")]
+fn bench_gpu_softmax(c: &mut Criterion) {
+    if !gpu_flag_enabled() {
+        return;
+    }
+
+    let backend = match WgpuBackend::init(WgpuOptions::default()) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    let config = KanConfig::preset();
+    let cpu_network = KanNetwork::new(config.clone());
+    
+    let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+
+    let batch_sizes = [1_usize, 16, 64, 256];
+    let mut group = c.benchmark_group("gpu_softmax");
+
+    let max_batch = *batch_sizes.iter().max().unwrap();
+    let mut workspace = match gpu_network.create_workspace(max_batch) {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+
+    for &batch in &batch_sizes {
+        let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
+
+        group.throughput(Throughput::Elements((batch * config.output_dim) as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &batch_size| {
+            b.iter(|| {
+                let output = gpu_network
+                    .forward_batch_softmax(black_box(&inputs), batch_size, &mut workspace)
+                    .expect("GPU forward+softmax failed");
+                black_box(output);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+#[cfg(feature = "gpu")]
+fn bench_forward_vs_forward_softmax(c: &mut Criterion) {
+    if !gpu_flag_enabled() {
+        return;
+    }
+
+    let backend = match WgpuBackend::init(WgpuOptions::default()) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    let config = KanConfig::preset();
+    let cpu_network = KanNetwork::new(config.clone());
+    
+    let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+
+    let batch = 64_usize;
+    let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
+    
+    let mut workspace = match gpu_network.create_workspace(batch) {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+
+    let mut group = c.benchmark_group("gpu_softmax_overhead_batch64");
+    group.throughput(Throughput::Elements((batch * config.output_dim) as u64));
+
+    // Forward only
+    group.bench_function("forward_only", |b| {
+        b.iter(|| {
+            let output = gpu_network
+                .forward_batch(black_box(&inputs), batch, &mut workspace)
+                .expect("GPU forward failed");
+            black_box(output);
+        });
+    });
+
+    // Forward + softmax
+    group.bench_function("forward_softmax", |b| {
+        b.iter(|| {
+            let output = gpu_network
+                .forward_batch_softmax(black_box(&inputs), batch, &mut workspace)
+                .expect("GPU forward+softmax failed");
+            black_box(output);
+        });
+    });
+
+    group.finish();
+}
+
+#[cfg(not(feature = "gpu"))]
+fn bench_gpu_softmax(_c: &mut Criterion) {}
+
+#[cfg(not(feature = "gpu"))]
+fn bench_forward_vs_forward_softmax(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_gpu_forward,
@@ -778,5 +886,7 @@ criterion_group!(
     bench_gpu_latency_distribution,
     bench_gpu_memory_throughput,
     bench_cpu_vs_gpu_scaling,
+    bench_gpu_softmax,
+    bench_forward_vs_forward_softmax,
 );
 criterion_main!(benches);
