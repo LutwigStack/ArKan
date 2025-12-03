@@ -774,3 +774,107 @@ fn test_weight_sync_methods() {
     
     println!("Weight sync methods test passed");
 }
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_softmax() {
+    // Test that GPU softmax produces valid probability distribution
+    let backend = WgpuBackend::init(WgpuOptions::default())
+        .expect("Failed to initialize GPU backend");
+    
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    
+    // Create GPU network
+    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
+        .expect("Failed to create GPU network");
+    let mut workspace = gpu_network.create_workspace(4)
+        .expect("Failed to create workspace");
+    
+    // Test input (batch of 4)
+    let input: Vec<f32> = (0..config.input_dim * 4)
+        .map(|i| (i as f32 * 0.1) - 0.5)
+        .collect();
+    
+    // Forward with softmax
+    let probs = gpu_network.forward_batch_softmax(&input, 4, &mut workspace)
+        .expect("GPU forward_batch_softmax failed");
+    
+    println!("Softmax output (batch 4, dim {}): {:?}", config.output_dim, probs);
+    
+    // Verify each sample sums to ~1.0
+    for batch_idx in 0..4 {
+        let start = batch_idx * config.output_dim;
+        let end = start + config.output_dim;
+        let sample_probs = &probs[start..end];
+        
+        let sum: f32 = sample_probs.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 0.001,
+            "Sample {} probabilities sum to {} (expected ~1.0)",
+            batch_idx, sum
+        );
+        
+        // Verify all values are in [0, 1]
+        for (i, &p) in sample_probs.iter().enumerate() {
+            assert!(
+                p >= 0.0 && p <= 1.0,
+                "Sample {} probability[{}] = {} not in [0,1]",
+                batch_idx, i, p
+            );
+        }
+    }
+    
+    println!("GPU softmax test passed");
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_softmax_vs_cpu() {
+    // Compare GPU softmax with manual CPU softmax
+    let backend = WgpuBackend::init(WgpuOptions::default())
+        .expect("Failed to initialize GPU backend");
+    
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut cpu_workspace = cpu_network.create_workspace(2);
+    
+    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
+        .expect("Failed to create GPU network");
+    let mut gpu_workspace = gpu_network.create_workspace(2)
+        .expect("Failed to create workspace");
+    
+    // Test input
+    let input: Vec<f32> = vec![0.5, -0.3, 0.8, -0.1, 0.2, 0.4, -0.5, 0.6];
+    
+    // GPU forward with softmax
+    let gpu_probs = gpu_network.forward_batch_softmax(&input, 2, &mut gpu_workspace)
+        .expect("GPU forward_batch_softmax failed");
+    
+    // CPU forward without softmax
+    let mut cpu_logits = vec![0.0f32; config.output_dim * 2];
+    cpu_network.forward_batch(&input, &mut cpu_logits, &mut cpu_workspace);
+    
+    // Manual CPU softmax
+    fn softmax(logits: &[f32]) -> Vec<f32> {
+        let max = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let exp: Vec<f32> = logits.iter().map(|x| (x - max).exp()).collect();
+        let sum: f32 = exp.iter().sum();
+        exp.iter().map(|x| x / sum).collect()
+    }
+    
+    let mut cpu_probs = Vec::new();
+    for batch in 0..2 {
+        let start = batch * config.output_dim;
+        let end = start + config.output_dim;
+        cpu_probs.extend(softmax(&cpu_logits[start..end]));
+    }
+    
+    println!("GPU softmax: {:?}", gpu_probs);
+    println!("CPU softmax: {:?}", cpu_probs);
+    
+    // Compare with tolerance
+    assert_approx_eq(&gpu_probs, &cpu_probs, 1e-4);
+    
+    println!("GPU vs CPU softmax test passed");
+}

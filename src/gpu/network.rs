@@ -317,6 +317,124 @@ impl GpuNetwork {
         Ok(())
     }
     
+    // ==================== Softmax ====================
+    
+    /// Applies softmax normalization to the output buffer in-place.
+    ///
+    /// Softmax transforms logits into a probability distribution:
+    /// softmax(x_i) = exp(x_i) / sum(exp(x_j))
+    ///
+    /// # Arguments
+    ///
+    /// * `batch_size` - Number of samples in the batch.
+    /// * `workspace` - GPU workspace containing the output buffer to normalize.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Forward pass followed by softmax
+    /// let logits = gpu_network.forward_batch(&inputs, batch_size, &mut workspace)?;
+    /// gpu_network.apply_softmax(batch_size, &mut workspace)?;
+    /// let probabilities = workspace.download_output(&device, &queue, batch_size)?;
+    /// ```
+    pub fn apply_softmax(
+        &mut self,
+        batch_size: usize,
+        workspace: &mut GpuWorkspace,
+    ) -> ArkanResult<()> {
+        // Create uniform buffer for softmax config
+        // struct Uniforms { num_elements: u32, dim: u32, batch_size: u32, _padding: u32 }
+        let config_data = [
+            (batch_size * self.output_dim) as u32, // num_elements
+            self.output_dim as u32,                 // dim
+            batch_size as u32,                      // batch_size
+            0u32,                                   // padding
+        ];
+        
+        let config_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Softmax Config"),
+            contents: bytemuck::cast_slice(&config_data),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        
+        // Get output buffer reference
+        let output = workspace.output.as_ref()
+            .ok_or_else(|| ArkanError::validation("No output buffer in workspace"))?;
+        
+        // Get layout and create bind group before getting pipeline
+        let softmax_layout = self.pipeline_cache.get_softmax_layout();
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Softmax BindGroup"),
+            layout: softmax_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: config_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: output.buffer.as_entire_binding(),
+                },
+            ],
+        });
+        
+        // Get softmax pipeline (after layout usage is done)
+        let pipeline = self.pipeline_cache.get_softmax_pipeline()?;
+        
+        // Create command encoder and dispatch
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Softmax Encoder"),
+        });
+        
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Softmax Pass"),
+                timestamp_writes: None,
+            });
+            
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            
+            // One workgroup per batch sample
+            let num_workgroups = workgroup_count(batch_size, WORKGROUP_SIZE);
+            pass.dispatch_workgroups(num_workgroups, 1, 1);
+        }
+        
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        
+        Ok(())
+    }
+    
+    /// Performs forward pass with softmax on GPU.
+    ///
+    /// Combines forward_batch and apply_softmax into a single operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data [batch_size * input_dim].
+    /// * `batch_size` - Number of samples in the batch.
+    /// * `workspace` - GPU workspace for intermediate buffers.
+    ///
+    /// # Returns
+    ///
+    /// Output probabilities [batch_size * output_dim] summing to 1.0 per sample.
+    pub fn forward_batch_softmax(
+        &mut self,
+        input: &[f32],
+        batch_size: usize,
+        workspace: &mut GpuWorkspace,
+    ) -> ArkanResult<Vec<f32>> {
+        // Run forward pass
+        let _ = self.forward_batch(input, batch_size, workspace)?;
+        
+        // Apply softmax in-place
+        self.apply_softmax(batch_size, workspace)?;
+        
+        // Download output
+        workspace.download_output(&self.device, &self.queue, batch_size)
+    }
+    
     /// Syncs weights from CPU network to GPU.
     pub fn sync_weights(&mut self, cpu_network: &KanNetwork) -> ArkanResult<()> {
         if cpu_network.layers.len() != self.layers.len() {

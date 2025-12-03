@@ -18,6 +18,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::cell::RefCell;
 
 #[cfg(feature = "gpu")]
 use arkan::{KanConfig, KanNetwork, TrainOptions};
@@ -67,11 +68,13 @@ fn bench_gpu_train_step_adam(c: &mut Criterion) {
     };
 
     let config = KanConfig::preset();
-    let mut cpu_network = KanNetwork::new(config.clone());
     
-    // Create GPU network
-    let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
-        Ok(n) => n,
+    // Create base CPU network to clone from (for stable measurements)
+    let base_cpu_network = KanNetwork::new(config.clone());
+    
+    // Create GPU network wrapped in RefCell for interior mutability
+    let gpu_network = match GpuNetwork::from_cpu(&backend, &base_cpu_network) {
+        Ok(n) => RefCell::new(n),
         Err(e) => {
             eprintln!("Failed to create GPU network: {}. Skipping.", e);
             return;
@@ -83,15 +86,13 @@ fn bench_gpu_train_step_adam(c: &mut Criterion) {
 
     // Pre-create workspace for largest batch
     let max_batch = *batch_sizes.iter().max().unwrap();
-    let mut workspace = match gpu_network.create_workspace(max_batch) {
-        Ok(w) => w,
+    let workspace = match gpu_network.borrow_mut().create_workspace(max_batch) {
+        Ok(w) => RefCell::new(w),
         Err(e) => {
             eprintln!("Failed to create workspace: {}. Skipping.", e);
             return;
         }
     };
-    
-    let mut optimizer = Adam::new(&cpu_network, AdamConfig::with_lr(0.001));
 
     for &batch in &batch_sizes {
         let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
@@ -99,19 +100,31 @@ fn bench_gpu_train_step_adam(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
         group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &batch_size| {
-            b.iter(|| {
-                let loss = gpu_network
-                    .train_step_mse(
-                        black_box(&inputs),
-                        black_box(&targets),
-                        batch_size,
-                        &mut workspace,
-                        &mut optimizer,
-                        &mut cpu_network,
-                    )
-                    .expect("GPU train step failed");
-                black_box(loss)
-            });
+            // Use iter_batched to get fresh state each iteration
+            b.iter_batched(
+                || {
+                    // Setup: create fresh CPU network and optimizer
+                    let cpu_network = base_cpu_network.clone();
+                    let optimizer = Adam::new(&cpu_network, AdamConfig::with_lr(0.001));
+                    // Sync weights to GPU (reset to initial state)
+                    gpu_network.borrow_mut().sync_weights_cpu_to_gpu(&cpu_network).unwrap();
+                    (cpu_network, optimizer)
+                },
+                |(mut cpu_network, mut optimizer)| {
+                    let loss = gpu_network.borrow_mut()
+                        .train_step_mse(
+                            black_box(&inputs),
+                            black_box(&targets),
+                            batch_size,
+                            &mut workspace.borrow_mut(),
+                            &mut optimizer,
+                            &mut cpu_network,
+                        )
+                        .expect("GPU train step failed");
+                    black_box(loss)
+                },
+                criterion::BatchSize::SmallInput,
+            );
         });
     }
 
@@ -124,17 +137,16 @@ fn bench_gpu_train_step_sgd(c: &mut Criterion) {
         return;
     }
 
-    // Initialize GPU backend once
     let backend = match WgpuBackend::init(WgpuOptions::default()) {
         Ok(b) => b,
         Err(_) => return,
     };
 
     let config = KanConfig::preset();
-    let mut cpu_network = KanNetwork::new(config.clone());
+    let base_cpu_network = KanNetwork::new(config.clone());
     
-    let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
-        Ok(n) => n,
+    let gpu_network = match GpuNetwork::from_cpu(&backend, &base_cpu_network) {
+        Ok(n) => RefCell::new(n),
         Err(_) => return,
     };
 
@@ -142,12 +154,10 @@ fn bench_gpu_train_step_sgd(c: &mut Criterion) {
     let mut group = c.benchmark_group("gpu_train_step_sgd");
 
     let max_batch = *batch_sizes.iter().max().unwrap();
-    let mut workspace = match gpu_network.create_workspace(max_batch) {
-        Ok(w) => w,
+    let workspace = match gpu_network.borrow_mut().create_workspace(max_batch) {
+        Ok(w) => RefCell::new(w),
         Err(_) => return,
     };
-    
-    let mut optimizer = SGD::new(&cpu_network, 0.01, 0.9, 0.0);
 
     for &batch in &batch_sizes {
         let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
@@ -155,19 +165,28 @@ fn bench_gpu_train_step_sgd(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
         group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &batch_size| {
-            b.iter(|| {
-                let loss = gpu_network
-                    .train_step_sgd(
-                        black_box(&inputs),
-                        black_box(&targets),
-                        batch_size,
-                        &mut workspace,
-                        &mut optimizer,
-                        &mut cpu_network,
-                    )
-                    .expect("GPU train step failed");
-                black_box(loss)
-            });
+            b.iter_batched(
+                || {
+                    let cpu_network = base_cpu_network.clone();
+                    let optimizer = SGD::new(&cpu_network, 0.01, 0.9, 0.0);
+                    gpu_network.borrow_mut().sync_weights_cpu_to_gpu(&cpu_network).unwrap();
+                    (cpu_network, optimizer)
+                },
+                |(mut cpu_network, mut optimizer)| {
+                    let loss = gpu_network.borrow_mut()
+                        .train_step_sgd(
+                            black_box(&inputs),
+                            black_box(&targets),
+                            batch_size,
+                            &mut workspace.borrow_mut(),
+                            &mut optimizer,
+                            &mut cpu_network,
+                        )
+                        .expect("GPU train step failed");
+                    black_box(loss)
+                },
+                criterion::BatchSize::SmallInput,
+            );
         });
     }
 
@@ -206,6 +225,9 @@ fn bench_gpu_train_step_with_options(c: &mut Criterion) {
     let mut optimizer = Adam::new(&cpu_network, AdamConfig::with_lr(0.001));
 
     group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
+    
+    // Note: This benchmark measures relative overhead of options, so state drift is acceptable
+    // The comparison is between different options, not absolute performance
     
     // No options
     group.bench_function("no_options", |b| {
@@ -311,12 +333,10 @@ fn bench_cpu_vs_gpu_train(c: &mut Criterion) {
     };
 
     let config = KanConfig::preset();
-    let mut cpu_network = KanNetwork::new(config.clone());
-    let mut gpu_cpu_network = cpu_network.clone();
-    let mut cpu_workspace = cpu_network.create_workspace(64);
+    let base_cpu_network = KanNetwork::new(config.clone());
     
-    let mut gpu_network = match GpuNetwork::from_cpu(&backend, &gpu_cpu_network) {
-        Ok(n) => n,
+    let gpu_network = match GpuNetwork::from_cpu(&backend, &base_cpu_network) {
+        Ok(n) => RefCell::new(n),
         Err(_) => return,
     };
 
@@ -324,45 +344,60 @@ fn bench_cpu_vs_gpu_train(c: &mut Criterion) {
     let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
     let targets = make_targets(config.output_dim, batch, 42);
 
-    let mut gpu_workspace = match gpu_network.create_workspace(batch) {
-        Ok(w) => w,
+    let gpu_workspace = match gpu_network.borrow_mut().create_workspace(batch) {
+        Ok(w) => RefCell::new(w),
         Err(_) => return,
     };
-    
-    let mut optimizer = Adam::new(&gpu_cpu_network, AdamConfig::with_lr(0.001));
 
     let mut group = c.benchmark_group("cpu_vs_gpu_train_batch64");
     group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
 
-    // CPU benchmark
+    // CPU benchmark - reset network each iteration for stable measurements
     group.bench_function("cpu", |b| {
-        b.iter(|| {
-            let loss = cpu_network.train_step(
-                black_box(&inputs),
-                black_box(&targets),
-                None,
-                0.001,
-                &mut cpu_workspace,
-            );
-            black_box(loss)
-        });
-    });
-
-    // GPU benchmark
-    group.bench_function("gpu", |b| {
-        b.iter(|| {
-            let loss = gpu_network
-                .train_step_mse(
+        b.iter_batched(
+            || {
+                let cpu_network = base_cpu_network.clone();
+                let workspace = cpu_network.create_workspace(batch);
+                (cpu_network, workspace)
+            },
+            |(mut cpu_network, mut workspace)| {
+                let loss = cpu_network.train_step(
                     black_box(&inputs),
                     black_box(&targets),
-                    batch,
-                    &mut gpu_workspace,
-                    &mut optimizer,
-                    &mut gpu_cpu_network,
-                )
-                .expect("GPU train step failed");
-            black_box(loss)
-        });
+                    None,
+                    0.001,
+                    &mut workspace,
+                );
+                black_box(loss)
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    // GPU benchmark - reset network and optimizer each iteration
+    group.bench_function("gpu", |b| {
+        b.iter_batched(
+            || {
+                let gpu_cpu_network = base_cpu_network.clone();
+                let optimizer = Adam::new(&gpu_cpu_network, AdamConfig::with_lr(0.001));
+                gpu_network.borrow_mut().sync_weights_cpu_to_gpu(&gpu_cpu_network).unwrap();
+                (gpu_cpu_network, optimizer)
+            },
+            |(mut gpu_cpu_network, mut optimizer)| {
+                let loss = gpu_network.borrow_mut()
+                    .train_step_mse(
+                        black_box(&inputs),
+                        black_box(&targets),
+                        batch,
+                        &mut gpu_workspace.borrow_mut(),
+                        &mut optimizer,
+                        &mut gpu_cpu_network,
+                    )
+                    .expect("GPU train step failed");
+                black_box(loss)
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     group.finish();

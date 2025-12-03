@@ -16,6 +16,8 @@ pub struct PipelineCache {
     forward_simple_pipeline: Option<wgpu::ComputePipeline>,
     /// Softmax pipeline
     softmax_pipeline: Option<wgpu::ComputePipeline>,
+    /// Softmax bind group layout
+    softmax_layout: Option<wgpu::BindGroupLayout>,
     /// Pipeline layout for forward pass
     forward_layout: Option<wgpu::PipelineLayout>,
     /// Bind group layout for workspace (Group 1)
@@ -44,6 +46,7 @@ impl PipelineCache {
             forward_pipeline: None,
             forward_simple_pipeline: None,
             softmax_pipeline: None,
+            softmax_layout: None,
             forward_layout: None,
             workspace_layout: None,
             forward_training_pipeline: None,
@@ -163,6 +166,84 @@ impl PipelineCache {
     /// Returns the forward pipeline layout.
     pub fn forward_layout(&self) -> Option<&wgpu::PipelineLayout> {
         self.forward_layout.as_ref()
+    }
+    
+    // ==================== Softmax Pipeline ====================
+    
+    /// Gets the softmax bind group layout (creates if needed).
+    pub fn get_softmax_layout(&mut self) -> &wgpu::BindGroupLayout {
+        if self.softmax_layout.is_none() {
+            self.softmax_layout = Some(self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Softmax BindGroupLayout"),
+                entries: &[
+                    // binding 0: config (uniform)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // binding 1: data (read-write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            }));
+        }
+        self.softmax_layout.as_ref().unwrap()
+    }
+    
+    /// Gets or creates the softmax pipeline.
+    /// 
+    /// The softmax pipeline normalizes outputs to probability distribution:
+    /// softmax(x_i) = exp(x_i) / sum(exp(x_j))
+    /// 
+    /// Uses bind group layout with uniform config and read-write data buffer.
+    pub fn get_softmax_pipeline(&mut self) -> ArkanResult<&wgpu::ComputePipeline> {
+        if self.softmax_pipeline.is_none() {
+            self.create_softmax_pipeline()?;
+        }
+        Ok(self.softmax_pipeline.as_ref().unwrap())
+    }
+    
+    fn create_softmax_pipeline(&mut self) -> ArkanResult<()> {
+        // Ensure layout is created first
+        let _ = self.get_softmax_layout();
+        let softmax_layout = self.softmax_layout.as_ref().unwrap();
+        
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Softmax Shader"),
+            source: wgpu::ShaderSource::Wgsl(shaders::SOFTMAX_SHADER.into()),
+        });
+
+        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Softmax Pipeline Layout"),
+            bind_group_layouts: &[softmax_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Softmax Pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("softmax_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        self.softmax_pipeline = Some(pipeline);
+        Ok(())
     }
     
     // ==================== Training Pipelines ====================
