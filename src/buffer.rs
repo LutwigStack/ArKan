@@ -639,7 +639,7 @@ impl Workspace {
     #[inline]
     pub fn prepare_grad_buffers(&mut self, layer_sizes: &[(usize, usize)]) {
         let num_layers = layer_sizes.len();
-        
+
         // Resize gradient vectors if needed
         if self.weight_grads.len() < num_layers {
             self.weight_grads.resize_with(num_layers, Vec::new);

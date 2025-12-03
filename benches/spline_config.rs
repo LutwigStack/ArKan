@@ -92,7 +92,10 @@ fn bench_spline_orders(c: &mut Criterion) {
         };
         group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
         group.bench_with_input(
-            BenchmarkId::new("forward", format!("order{}_{}_basis{}", order, order_name, basis_size)),
+            BenchmarkId::new(
+                "forward",
+                format!("order{}_{}_basis{}", order, order_name, basis_size),
+            ),
             &order,
             |b, _| {
                 b.iter(|| {
@@ -127,7 +130,10 @@ fn bench_spline_matrix(c: &mut Criterion) {
             let basis_size = grid_size + order;
             group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
             group.bench_with_input(
-                BenchmarkId::new("forward", format!("g{}_o{}_b{}", grid_size, order, basis_size)),
+                BenchmarkId::new(
+                    "forward",
+                    format!("g{}_o{}_b{}", grid_size, order, basis_size),
+                ),
                 &(grid_size, order),
                 |b, _| {
                     b.iter(|| {
@@ -200,7 +206,10 @@ fn bench_spline_params(c: &mut Criterion) {
     // Print analysis
     println!("\n=== Spline Configuration Analysis ===");
     println!("Architecture: [21, 64, 64, 24]");
-    println!("{:<12} {:<12} {:<12} {:<12} {:<12}", "Grid", "Order", "Basis", "Params", "Memory");
+    println!(
+        "{:<12} {:<12} {:<12} {:<12} {:<12}",
+        "Grid", "Order", "Basis", "Params", "Memory"
+    );
     println!("{}", "-".repeat(60));
 
     for grid_size in [3_usize, 5, 8, 12, 16] {

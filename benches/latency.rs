@@ -98,7 +98,10 @@ fn bench_latency_distribution(c: &mut Criterion) {
     let max = latencies[iterations - 1];
     let avg: f64 = latencies.iter().sum::<f64>() / iterations as f64;
 
-    println!("\n=== Latency Distribution (forward_single, {} samples) ===", iterations);
+    println!(
+        "\n=== Latency Distribution (forward_single, {} samples) ===",
+        iterations
+    );
     println!("Min:  {:.2} µs", min / 1000.0);
     println!("Avg:  {:.2} µs", avg / 1000.0);
     println!("P50:  {:.2} µs", p50 / 1000.0);
@@ -106,7 +109,10 @@ fn bench_latency_distribution(c: &mut Criterion) {
     println!("P99:  {:.2} µs", p99 / 1000.0);
     println!("P999: {:.2} µs", p999 / 1000.0);
     println!("Max:  {:.2} µs", max / 1000.0);
-    println!("Throughput: {:.0} inferences/sec (at P50)", 1_000_000_000.0 / p50);
+    println!(
+        "Throughput: {:.0} inferences/sec (at P50)",
+        1_000_000_000.0 / p50
+    );
 
     // Criterion benchmark for comparison
     let mut group = c.benchmark_group("latency_distribution");
@@ -198,7 +204,10 @@ fn bench_poker_workload(c: &mut Criterion) {
         b.iter(|| {
             network.forward_single(black_box(&input), black_box(&mut output), &mut workspace);
             // Manual softmax on first 8 outputs (strategy)
-            let max = output[..8].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let max = output[..8]
+                .iter()
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
             let sum: f32 = output[..8].iter().map(|x| (x - max).exp()).sum();
             for i in 0..8 {
                 output[i] = (output[i] - max).exp() / sum;

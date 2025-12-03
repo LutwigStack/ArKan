@@ -134,7 +134,7 @@ pub mod spline;
 // Re-exports for convenience
 pub use baked::BakedModel;
 pub use buffer::{AlignedBuffer, Workspace, CACHE_LINE};
-pub use config::{KanConfig, LayerConfig, ConfigError, DEFAULT_GRID_SIZE, EPSILON};
+pub use config::{ConfigError, KanConfig, LayerConfig, DEFAULT_GRID_SIZE, EPSILON};
 pub use layer::KanLayer;
 pub use loss::{masked_cross_entropy, masked_mse, masked_softmax, poker_combined_loss, softmax};
 pub use network::{KanNetwork, TrainOptions};

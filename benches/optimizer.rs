@@ -192,17 +192,21 @@ fn bench_learning_rates(c: &mut Criterion) {
     group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
 
     for &lr in &lrs {
-        group.bench_with_input(BenchmarkId::from_parameter(format!("lr_{}", lr)), &lr, |b, &lr| {
-            b.iter(|| {
-                network.train_step(
-                    black_box(&inputs),
-                    black_box(&targets),
-                    None,
-                    lr,
-                    &mut workspace,
-                );
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("lr_{}", lr)),
+            &lr,
+            |b, &lr| {
+                b.iter(|| {
+                    network.train_step(
+                        black_box(&inputs),
+                        black_box(&targets),
+                        None,
+                        lr,
+                        &mut workspace,
+                    );
+                });
+            },
+        );
     }
 
     group.finish();

@@ -449,11 +449,7 @@ impl KanNetwork {
                 let layer = &self.layers[0];
                 let out_size = batch_size * layer.out_dim;
                 buffer_a.resize(out_size);
-                layer.forward_batch(
-                    input,
-                    &mut buffer_a.as_mut_slice()[..out_size],
-                    workspace,
-                );
+                layer.forward_batch(input, &mut buffer_a.as_mut_slice()[..out_size], workspace);
             }
 
             let mut current_is_a = true;
@@ -564,15 +560,9 @@ impl KanNetwork {
                     },
                 )
             } else if current_is_a {
-                (
-                    &buffer_a.as_slice()[..in_size],
-                    &mut buffer_b,
-                )
+                (&buffer_a.as_slice()[..in_size], &mut buffer_b)
             } else {
-                (
-                    &buffer_b.as_slice()[..in_size],
-                    &mut buffer_a,
-                )
+                (&buffer_b.as_slice()[..in_size], &mut buffer_a)
             };
 
             output_buf.resize(out_size);
@@ -583,12 +573,10 @@ impl KanNetwork {
             );
 
             // Save normalized inputs and grid indices for backward
-            let hist_in =
-                &mut workspace.layers_inputs[layer_idx].as_mut_slice()[..in_size];
+            let hist_in = &mut workspace.layers_inputs[layer_idx].as_mut_slice()[..in_size];
             hist_in.copy_from_slice(workspace.z_buffer.as_slice());
 
-            let hist_idx =
-                &mut workspace.layers_grid_indices[layer_idx][..in_size];
+            let hist_idx = &mut workspace.layers_grid_indices[layer_idx][..in_size];
             hist_idx.copy_from_slice(&workspace.grid_indices[..in_size]);
 
             if layer_idx == self.layers.len() - 1 {
@@ -735,7 +723,7 @@ impl KanNetwork {
         // It's initialized with grad_output and updated each iteration.
         let max_dim = self.layer_dims.iter().copied().max().unwrap_or(output_dim);
         workspace.staging_buffer.resize(batch_size * max_dim);
-        
+
         // Seed the backward pass with dL/d(network_output)
         let grad_out_size = batch_size * output_dim;
         workspace.staging_buffer.as_mut_slice()[..grad_out_size]
@@ -846,7 +834,11 @@ impl KanNetwork {
                 }
             }
 
-            for (w, g) in layer.weights.iter_mut().zip(workspace.weight_grads[i].iter()) {
+            for (w, g) in layer
+                .weights
+                .iter_mut()
+                .zip(workspace.weight_grads[i].iter())
+            {
                 *w -= learning_rate * g;
             }
             for (b, g) in layer.bias.iter_mut().zip(workspace.bias_grads[i].iter()) {

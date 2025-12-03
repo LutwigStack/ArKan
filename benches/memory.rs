@@ -117,7 +117,11 @@ fn bench_manual_bandwidth(c: &mut Criterion) {
     println!("\n=== Memory Bandwidth Analysis ===");
     println!("Config: {:?}", config.layer_dims());
     println!("Batch size: {}", batch);
-    println!("Estimated memory per forward: {} bytes ({:.2} KB)", mem_bytes, mem_bytes as f64 / 1024.0);
+    println!(
+        "Estimated memory per forward: {} bytes ({:.2} KB)",
+        mem_bytes,
+        mem_bytes as f64 / 1024.0
+    );
 
     // Warmup and measure
     for _ in 0..100 {
@@ -158,7 +162,10 @@ fn bench_cache_pressure(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
         group.bench_with_input(
-            BenchmarkId::new("forward", format!("batch{}_mem{}KB", batch, mem_bytes / 1024)),
+            BenchmarkId::new(
+                "forward",
+                format!("batch{}_mem{}KB", batch, mem_bytes / 1024),
+            ),
             &batch,
             |b, _| {
                 b.iter(|| {

@@ -184,10 +184,7 @@ fn bench_param_count(c: &mut Criterion) {
         let network = KanNetwork::new(config);
         let params = network.param_count();
         let memory_kb = (params * 4) as f64 / 1024.0; // f32 = 4 bytes
-        println!(
-            "{}: {} params ({:.1} KB)",
-            arch.name, params, memory_kb
-        );
+        println!("{}: {} params ({:.1} KB)", arch.name, params, memory_kb);
     }
 }
 
