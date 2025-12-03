@@ -25,6 +25,7 @@ pub struct KanNetwork {
 
 /// Настройки обучения для одного шага.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TrainOptions {
     /// Максимальная норма градиента (L2) для клиппинга. None — без клиппинга.
     pub max_grad_norm: Option<f32>,
