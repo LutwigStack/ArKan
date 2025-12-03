@@ -337,9 +337,6 @@ impl KanNetwork {
         }
     }
 
-    /// Multi-layer forward pass using ping-pong buffers.
-    ///
-
     /// Full training step: forward + backward + update.
     /// Returns the loss value.
     pub fn train_step(
