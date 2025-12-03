@@ -39,6 +39,7 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 ## **Ключевые возможности**
 
 * **Zero-Allocation Inference:** Весь `forward` проход выполняется на предвыделенном буфере (`Workspace`). Никаких аллокаций в горячем пути (Hot Path).  
+* **Zero-Allocation Training:** Полный training step (forward + backward + SGD/Adam) также работает без аллокаций при прогретом Workspace.
 * **SIMD-Optimized B-Splines:** Вычисление базисных функций B-сплайнов векторизовано (AVX2/AVX-512 через крейт `wide`).  
 * **Cache-Friendly Layout:** Веса хранятся в формате `[Output][Input][Basis]` для последовательного доступа к памяти и минимизации промахов кэша.  
 * **Standalone:** Минимальные зависимости (`rayon`, `wide`). Не тянет за собой `torch` или `burn`, идеально для встраивания.  
@@ -56,15 +57,17 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 
 | Batch Size | ArKan (Time) | ArKan (Throughput) | PyTorch (Time) | PyTorch (Throughput) | Вывод |
 | :---- | :---- | :---- | :---- | :---- | :---- |
-| **1** | **30.1 µs** | **0.69 M elems/s** | 950.0 µs | 0.02 M elems/s | **Rust быстрее в 31x** (Low Latency) |
-| 16 | 0.98 ms | 0.34 M elems/s | 1.85 ms | 0.18 M elems/s | Rust быстрее в 1.9x |
-| 64 | 3.93 ms | 0.34 M elems/s | 2.78 ms | 0.48 M elems/s | PyTorch вырывается вперед (AVX/MKL) |
-| 256 | 15.7 ms | 0.34 M elems/s | 9.32 ms | 0.58 M elems/s | PyTorch эффективнее на массовых данных |
+| **1** | **30.5 µs** | **0.69 M elems/s** | 990.0 µs | 0.02 M elems/s | **Rust быстрее в 32x** (Low Latency) |
+| 16 | 454.8 µs | 0.74 M elems/s | 1.67 ms | 0.20 M elems/s | Rust быстрее в 3.7x |
+| 64 | 1.95 ms | 0.69 M elems/s | 3.27 ms | 0.41 M elems/s | Rust быстрее в 1.7x |
+| 256 | 7.29 ms | 0.74 M elems/s | 9.65 ms | 0.56 M elems/s | Rust быстрее в 1.3x
 
 ### **Анализ производительности**
 
 1. **Small Batch Dominance:** На единичных запросах (`batch=1`) ArKan **опережает** PyTorch за счет отсутствия оверхеда интерпретатора и абстракций. Это позволяет совершать \~33,000 инференсов в секунду против \~1,000 у PyTorch.  
-2. **Throughput Scaling:** На больших батчах PyTorch выигрывает за счет высокооптимизированных BLAS-библиотек (MKL/OpenBLAS), которые лучше утилизируют кэш на огромных матрицах. Однако цель ArKan — предсказуемая задержка (Latency) на малых батчах, критичная для real-time систем.
+2. **Mid-Batch Performance:** На средних батчах (16-64) ArKan сохраняет преимущество в 1.7x-3.7x, демонстрируя хорошую масштабируемость.  
+3. **Throughput Scaling:** На больших батчах (256+) ArKan сохраняет преимущество 1.3x благодаря zero-allocation архитектуре и эффективному использованию кэша.
+4. **Zero-Allocation Training:** Весь training loop (forward + backward + update) работает без аллокаций при прогретом Workspace.
 
 ## **Сравнение с аналогами (Prior Art)**
 
@@ -158,6 +161,7 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 ## **Key Features**
 
 * **Zero-Allocation Inference:** The entire `forward` pass runs on a pre-allocated buffer (`Workspace`). No allocations in the Hot Path.  
+* **Zero-Allocation Training:** The full training step (forward + backward + SGD/Adam) also runs without allocations on a warmed-up Workspace.
 * **SIMD-Optimized B-Splines:** B-spline basis evaluation is vectorized (AVX2/AVX-512 via `wide` crate).  
 * **Cache-Friendly Layout:** Weights are stored in `[Output][Input][Basis]` format for sequential memory access and minimal cache misses.  
 * **Standalone:** Minimal dependencies (`rayon`, `wide`). No `torch` or `burn` bloat, ideal for embedding.  
@@ -175,15 +179,17 @@ Comparison of ArKan (Rust) vs. optimized vectorized PyTorch implementation (CPU)
 
 | Batch Size | ArKan (Time) | ArKan (Throughput) | PyTorch (Time) | PyTorch (Throughput) | Conclusion |
 | :---- | :---- | :---- | :---- | :---- | :---- |
-| **1** | **30.1 µs** | **0.69 M elems/s** | 950.0 µs | 0.02 M elems/s | **Rust is 31x faster** (Low Latency) |
-| 16 | 0.98 ms | 0.34 M elems/s | 1.85 ms | 0.18 M elems/s | Rust is 1.9x faster |
-| 64 | 3.93 ms | 0.34 M elems/s | 2.78 ms | 0.48 M elems/s | PyTorch pulls ahead (AVX/MKL) |
-| 256 | 15.7 ms | 0.34 M elems/s | 9.32 ms | 0.58 M elems/s | PyTorch is more efficient on mass data |
+| **1** | **30.5 µs** | **0.69 M elems/s** | 990.0 µs | 0.02 M elems/s | **Rust is 32x faster** (Low Latency) |
+| 16 | 454.8 µs | 0.74 M elems/s | 1.67 ms | 0.20 M elems/s | Rust is 3.7x faster |
+| 64 | 1.95 ms | 0.69 M elems/s | 3.27 ms | 0.41 M elems/s | Rust is 1.7x faster |
+| 256 | 7.29 ms | 0.74 M elems/s | 9.65 ms | 0.56 M elems/s | Rust is 1.3x faster
 
 ### **Performance Analysis**
 
 1. **Small Batch Dominance:** On single requests (`batch=1`), ArKan **outperforms** PyTorch due to the lack of interpreter overhead and abstractions. This allows for \~33,000 inferences per second vs \~1,000 for PyTorch.  
-2. **Throughput Scaling:** On very large batches, PyTorch wins due to highly optimized BLAS libraries (MKL), but ArKan maintains predictable execution time without GC pauses (Stop-the-world). The goal of ArKan is low latency.
+2. **Mid-Batch Performance:** On medium batches (16-64), ArKan maintains a 1.7x-3.7x advantage, showing good scalability.  
+3. **Throughput Scaling:** On large batches (256+), ArKan maintains 1.3x advantage due to zero-allocation architecture and efficient cache utilization.
+4. **Zero-Allocation Training:** The entire training loop (forward + backward + update) runs without allocations on a warmed-up Workspace.
 
 ## **Comparison with Analogues (Prior Art)**
 

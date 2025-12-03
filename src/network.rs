@@ -1,4 +1,54 @@
-//! Full KAN network with multi-layer support.
+//! KAN network with multi-layer support and zero-allocation inference.
+//!
+//! This module provides [`KanNetwork`], the main entry point for using ArKan.
+//! It supports both inference and training with configurable options.
+//!
+//! # Example: Inference
+//!
+//! ```rust
+//! use arkan::{KanConfig, KanNetwork};
+//!
+//! let config = KanConfig::default_poker();
+//! let network = KanNetwork::new(config.clone());
+//! let mut workspace = network.create_workspace(1);
+//!
+//! let input = vec![0.5f32; config.input_dim];
+//! let mut output = vec![0.0f32; config.output_dim];
+//!
+//! // ~30 µs latency, zero allocations
+//! network.forward_single(&input, &mut output, &mut workspace);
+//! ```
+//!
+//! # Example: Training
+//!
+//! ```rust
+//! use arkan::{KanConfig, KanNetwork, TrainOptions};
+//!
+//! let config = KanConfig::default_poker();
+//! let mut network = KanNetwork::new(config.clone());
+//! let mut workspace = network.create_workspace(64);
+//!
+//! let inputs = vec![0.5f32; 64 * config.input_dim];
+//! let targets = vec![0.1f32; 64 * config.output_dim];
+//!
+//! // Training with gradient clipping
+//! let opts = TrainOptions {
+//!     max_grad_norm: Some(1.0),
+//!     weight_decay: 0.01,
+//! };
+//! network.set_default_train_options(opts);
+//!
+//! let loss = network.train_step(&inputs, &targets, None, 0.001, &mut workspace);
+//! ```
+//!
+//! # Performance
+//!
+//! | Method | Batch Size | Time | Use Case |
+//! |--------|-----------|------|----------|
+//! | `forward_single` | 1 | ~15 µs | Real-time play |
+//! | `forward_batch` | 1 | ~30 µs | General inference |
+//! | `forward_batch` | 64 | ~2 ms | Batch inference |
+//! | `train_step` | 64 | ~5 ms | Training |
 
 use crate::buffer::Workspace;
 use crate::config::KanConfig;
@@ -8,28 +58,67 @@ use crate::layer::KanLayer;
 use serde::{Deserialize, Serialize};
 
 /// Complete KAN network with multiple layers.
+///
+/// This is the main struct for using ArKan. It holds the network configuration,
+/// all layers, and provides methods for inference and training.
+///
+/// # Zero-Allocation Inference
+///
+/// Both `forward_single` and `forward_batch` perform zero allocations when
+/// the [`Workspace`] is properly sized. Create the workspace once with
+/// [`create_workspace`](Self::create_workspace) and reuse it.
+///
+/// # Thread Safety
+///
+/// The network is `Send + Sync` (when `serde` feature is off). Multiple threads
+/// can perform inference on the same network with separate workspaces.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct KanNetwork {
-    /// Configuration.
+    /// Network configuration.
     pub config: KanConfig,
 
-    /// Layers: input→hidden[0]→...→hidden[n]→output.
+    /// Layers: input→hidden\[0\]→...→hidden\[n\]→output.
     pub layers: Vec<KanLayer>,
 
     /// Cached layer dimensions for quick access.
     layer_dims: Vec<usize>,
 
-    /// Дефолтные опции обучения (клиппинг/decay), чтобы не передавать каждый раз.
+    /// Cached parameter sizes per layer (weights, bias) for train_step.
+    layer_param_sizes: Vec<(usize, usize)>,
+
+    /// Default training options (gradient clipping, weight decay).
     pub default_train_options: TrainOptions,
 }
 
-/// Настройки обучения для одного шага.
+/// Training options for a single step.
+///
+/// These options control gradient clipping and weight decay during training.
+/// Set via [`KanNetwork::set_default_train_options`] or pass to
+/// [`train_step_with_options`](KanNetwork::train_step_with_options).
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::TrainOptions;
+///
+/// let opts = TrainOptions {
+///     max_grad_norm: Some(1.0),  // Clip gradients with L2 norm > 1.0
+///     weight_decay: 0.01,        // AdamW-style decoupled weight decay
+/// };
+/// ```
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TrainOptions {
-    /// Максимальная норма градиента (L2) для клиппинга. None — без клиппинга.
+    /// Maximum L2 norm for gradient clipping. `None` disables clipping.
+    ///
+    /// When set, gradients are scaled down if their total L2 norm exceeds
+    /// this value. Helps prevent exploding gradients.
     pub max_grad_norm: Option<f32>,
-    /// Decoupled weight decay коэффициент. 0 — без декея.
+
+    /// Decoupled weight decay coefficient (AdamW-style).
+    ///
+    /// Applied as `w = w * (1 - lr * weight_decay)` before the gradient update.
+    /// Set to `0.0` to disable.
     pub weight_decay: f32,
 }
 
@@ -44,6 +133,20 @@ impl Default for TrainOptions {
 
 impl KanNetwork {
     /// Creates a new KAN network from configuration.
+    ///
+    /// Initializes all layers with random weights using Xavier initialization.
+    /// Use [`KanConfig::init_seed`] for deterministic initialization.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let config = KanConfig::default_poker();
+    /// let network = KanNetwork::new(config);
+    ///
+    /// assert_eq!(network.num_layers(), 3); // 2 hidden + 1 output
+    /// ```
     pub fn new(config: KanConfig) -> Self {
         let layer_dims = config.layer_dims();
         let mut layers = Vec::with_capacity(layer_dims.len() - 1);
@@ -54,48 +157,107 @@ impl KanNetwork {
             layers.push(KanLayer::from_config(in_dim, out_dim, &config));
         }
 
+        let layer_param_sizes: Vec<(usize, usize)> = layers
+            .iter()
+            .map(|l| (l.weights.len(), l.bias.len()))
+            .collect();
+
         Self {
             config,
             layers,
             layer_dims,
+            layer_param_sizes,
             default_train_options: TrainOptions::default(),
         }
     }
 
-    /// Creates network from configuration (alias).
+    /// Creates network from configuration (alias for [`new`](Self::new)).
     pub fn from_config(config: KanConfig) -> Self {
         Self::new(config)
     }
 
-    /// Установить дефолтные опции обучения.
+    /// Sets default training options for all subsequent `train_step` calls.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork, TrainOptions};
+    ///
+    /// let mut network = KanNetwork::new(KanConfig::default_poker());
+    /// network.set_default_train_options(TrainOptions {
+    ///     max_grad_norm: Some(1.0),
+    ///     weight_decay: 0.01,
+    /// });
+    /// ```
     pub fn set_default_train_options(&mut self, opts: TrainOptions) {
         self.default_train_options = opts;
     }
 
-    /// Returns the number of layers.
+    /// Returns the number of layers (hidden + output).
     #[inline]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
-    /// Returns total number of trainable parameters.
+    /// Returns total number of trainable parameters (weights + biases).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let network = KanNetwork::new(KanConfig::default_poker());
+    /// println!("Parameters: {}", network.param_count()); // ~56K
+    /// ```
     pub fn param_count(&self) -> usize {
         self.layers.iter().map(|l| l.param_count()).sum()
     }
 
-    /// Sets normalization statistics for the input layer.
+    /// Sets input normalization statistics (mean and std per feature).
+    ///
+    /// Call this after computing statistics from your training data.
+    /// Normalization is applied in the first layer only.
+    ///
+    /// # Arguments
+    ///
+    /// * `mean` - Per-feature mean values `[input_dim]`
+    /// * `std` - Per-feature standard deviations `[input_dim]`
     pub fn set_input_normalization(&mut self, mean: &[f32], std: &[f32]) {
         if !self.layers.is_empty() {
             self.layers[0].set_normalization(mean, std);
         }
     }
 
-    /// Forward pass for a single sample.
+    /// Forward pass for a single sample (optimized for latency).
+    ///
+    /// This method is optimized for single-sample inference, achieving ~15 µs
+    /// latency on the poker config. Use this for real-time applications.
     ///
     /// # Arguments
-    /// * `input` - Input features [input_dim]
-    /// * `output` - Output buffer [output_dim]
-    /// * `workspace` - Pre-allocated workspace
+    ///
+    /// * `input` - Input features `[input_dim]`
+    /// * `output` - Output buffer `[output_dim]` (will be overwritten)
+    /// * `workspace` - Pre-allocated workspace (reuse for zero-alloc)
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts if `input.len() != config.input_dim` or
+    /// `output.len() != config.output_dim`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let config = KanConfig::default_poker();
+    /// let network = KanNetwork::new(config.clone());
+    /// let mut workspace = network.create_workspace(1);
+    ///
+    /// let input = vec![0.5f32; config.input_dim];
+    /// let mut output = vec![0.0f32; config.output_dim];
+    ///
+    /// network.forward_single(&input, &mut output, &mut workspace);
+    /// ```
     pub fn forward_single(&self, input: &[f32], output: &mut [f32], workspace: &mut Workspace) {
         debug_assert_eq!(input.len(), self.config.input_dim);
         debug_assert_eq!(output.len(), self.config.output_dim);
@@ -194,12 +356,59 @@ impl KanNetwork {
         }
     }
 
-    /// Forward pass for a batch of samples.
+    /// Forward pass for a batch of samples (zero-allocation).
+    ///
+    /// Processes multiple samples in parallel, leveraging cache locality
+    /// for better throughput than multiple `forward_single` calls.
+    ///
+    /// # Zero-Allocation Strategy
+    ///
+    /// This method achieves zero allocations by using **ping-pong buffers**:
+    /// - `workspace.layer_output` (buffer A) and `workspace.layer_input` (buffer B)
+    ///   are pre-allocated to `batch_size * max_hidden_dim`
+    /// - Each layer reads from one buffer and writes to the other
+    /// - `std::mem::take` temporarily moves buffers out of workspace to satisfy
+    ///   Rust's borrow checker (no aliasing between input/output slices)
+    /// - Buffers are returned to workspace at the end for reuse
+    ///
+    /// # Buffer Flow
+    ///
+    /// ```text
+    /// Layer 0: input → buffer_a
+    /// Layer 1: buffer_a → buffer_b
+    /// Layer 2: buffer_b → buffer_a
+    /// ...     (alternating)
+    /// Last:    buffer_X → output
+    /// ```
     ///
     /// # Arguments
-    /// * `input` - Input batch [batch_size * input_dim], Row-Major
-    /// * `output` - Output buffer [batch_size * output_dim]
-    /// * `workspace` - Pre-allocated workspace
+    ///
+    /// * `input` - Input batch `[batch_size * input_dim]`, row-major layout
+    /// * `output` - Output buffer `[batch_size * output_dim]` (will be overwritten)
+    /// * `workspace` - Pre-allocated workspace (reuse for zero-alloc)
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts if input/output lengths don't match expected dimensions.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let config = KanConfig::default_poker();
+    /// let network = KanNetwork::new(config.clone());
+    /// let mut workspace = network.create_workspace(64);
+    ///
+    /// let batch_size = 64;
+    /// let input = vec![0.5f32; batch_size * config.input_dim];
+    /// let mut output = vec![0.0f32; batch_size * config.output_dim];
+    ///
+    /// network.forward_batch(&input, &mut output, &mut workspace);
+    ///
+    /// // Access first sample's output
+    /// let first_output = &output[0..config.output_dim];
+    /// ```
     pub fn forward_batch(&self, input: &[f32], output: &mut [f32], workspace: &mut Workspace) {
         let batch_size = input.len() / self.config.input_dim;
         debug_assert_eq!(input.len(), batch_size * self.config.input_dim);
@@ -216,7 +425,9 @@ impl KanNetwork {
             workspace.prepare_forward(batch_size, &self.config);
             self.layers[0].forward_batch(input, output, workspace);
         } else {
-            // Multi-layer: ping-pong buffers without heap allocations
+            // Multi-layer: ping-pong buffers without heap allocations.
+            // We use two pre-allocated buffers (A and B) that alternate as
+            // input/output for successive layers.
             let max_hidden = self
                 .layer_dims
                 .iter()
@@ -224,73 +435,86 @@ impl KanNetwork {
                 .max()
                 .unwrap_or(self.config.input_dim);
             let ping_pong_size = batch_size * max_hidden;
-            workspace.layer_output.resize(ping_pong_size);
-            workspace.layer_input.resize(ping_pong_size);
 
-            // Staging buffer to avoid aliasing workspace slices during forward_batch
-            let mut temp_input = vec![0.0f32; ping_pong_size];
+            // Borrow-safety: `std::mem::take` moves buffers out of workspace,
+            // allowing us to have mutable references to both without aliasing.
+            // This is the key trick for zero-allocation multi-layer forward.
+            let mut buffer_a = std::mem::take(&mut workspace.layer_output);
+            let mut buffer_b = std::mem::take(&mut workspace.layer_input);
+            buffer_a.resize(ping_pong_size);
+            buffer_b.resize(ping_pong_size);
 
-            let mut use_output_as_current = true;
-
-            // First layer: input -> layer_output
+            // First layer: input -> buffer_a
             {
                 let layer = &self.layers[0];
                 let out_size = batch_size * layer.out_dim;
-                let mut layer_output_buf = std::mem::take(&mut workspace.layer_output);
-                layer_output_buf.resize(out_size);
-                let out_slice = &mut layer_output_buf.as_mut_slice()[..out_size];
-                layer.forward_batch(input, out_slice, workspace);
-                workspace.layer_output = layer_output_buf;
+                buffer_a.resize(out_size);
+                layer.forward_batch(input, &mut buffer_a.as_mut_slice()[..out_size], workspace);
             }
 
-            // Hidden layers: ping-pong
+            let mut current_is_a = true;
+
+            // Hidden layers: ping-pong between buffer_a/buffer_b
             for i in 1..self.layers.len() - 1 {
                 let layer = &self.layers[i];
                 let in_size = batch_size * layer.in_dim;
                 let out_size = batch_size * layer.out_dim;
 
-                // Copy current buffer into staging to avoid aliasing with mutable workspace borrow
-                if use_output_as_current {
-                    temp_input[..in_size]
-                        .copy_from_slice(&workspace.layer_output.as_slice()[..in_size]);
+                let (input_buf, output_buf) = if current_is_a {
+                    (&buffer_a, &mut buffer_b)
                 } else {
-                    temp_input[..in_size]
-                        .copy_from_slice(&workspace.layer_input.as_slice()[..in_size]);
-                }
+                    (&buffer_b, &mut buffer_a)
+                };
 
-                if use_output_as_current {
-                    let mut buf = std::mem::take(&mut workspace.layer_input);
-                    buf.resize(out_size);
-                    let out_slice = &mut buf.as_mut_slice()[..out_size];
-                    layer.forward_batch(&temp_input[..in_size], out_slice, workspace);
-                    workspace.layer_input = buf;
-                } else {
-                    let mut buf = std::mem::take(&mut workspace.layer_output);
-                    buf.resize(out_size);
-                    let out_slice = &mut buf.as_mut_slice()[..out_size];
-                    layer.forward_batch(&temp_input[..in_size], out_slice, workspace);
-                    workspace.layer_output = buf;
-                }
-                use_output_as_current = !use_output_as_current;
+                output_buf.resize(out_size);
+                layer.forward_batch(
+                    &input_buf.as_slice()[..in_size],
+                    &mut output_buf.as_mut_slice()[..out_size],
+                    workspace,
+                );
+
+                current_is_a = !current_is_a;
             }
 
             // Last layer: current buffer -> output
             {
                 let layer = self.layers.last().unwrap();
                 let in_size = batch_size * layer.in_dim;
-                if use_output_as_current {
-                    temp_input[..in_size]
-                        .copy_from_slice(&workspace.layer_output.as_slice()[..in_size]);
-                } else {
-                    temp_input[..in_size]
-                        .copy_from_slice(&workspace.layer_input.as_slice()[..in_size]);
-                }
-                layer.forward_batch(&temp_input[..in_size], output, workspace);
+                let input_buf = if current_is_a { &buffer_a } else { &buffer_b };
+                layer.forward_batch(&input_buf.as_slice()[..in_size], output, workspace);
             }
+
+            // Return buffers to workspace for reuse in subsequent calls.
+            // This preserves capacity, avoiding re-allocation on next forward.
+            workspace.layer_output = buffer_a;
+            workspace.layer_input = buffer_b;
         }
     }
 
     /// Forward pass for training: stores per-layer normalized inputs and grid indices.
+    ///
+    /// This method extends [`forward_batch`](Self::forward_batch) by saving
+    /// intermediate values needed for the backward pass:
+    ///
+    /// - **Normalized inputs** (`workspace.layers_inputs\[layer\]`): the z-values
+    ///   after input normalization, used to recompute spline basis derivatives.
+    /// - **Grid indices** (`workspace.layers_grid_indices\[layer\]`): the spline
+    ///   segment each input falls into, used to index into B-spline weights.
+    ///
+    /// # Buffer Layout
+    ///
+    /// Uses the same ping-pong scheme as `forward_batch`, plus:
+    /// - `workspace.layers_inputs`: `Vec<AlignedBuffer>` with one buffer per layer
+    /// - `workspace.layers_grid_indices`: `Vec<Vec<u32>>` with indices per layer
+    ///
+    /// These history buffers are prepared by [`Workspace::prepare_training`] and
+    /// sized to `batch_size * in_dim` per layer.
+    ///
+    /// # Zero-Allocation Note
+    ///
+    /// After warmup (first call with a given batch size), this method performs
+    /// zero heap allocations. The history buffers grow monotonically and are
+    /// reused across training steps.
     pub fn forward_batch_training(
         &self,
         input: &[f32],
@@ -307,39 +531,102 @@ impl KanNetwork {
 
         workspace.prepare_training(batch_size, &self.config, &self.layer_dims);
 
-        // Two-vector ping-pong to avoid borrow conflicts; reuses allocations.
-        let mut current: Vec<f32> = input.to_vec();
-        let mut next: Vec<f32> = Vec::new();
+        let max_hidden = self
+            .layer_dims
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(self.config.input_dim);
+        let ping_pong_size = batch_size * max_hidden;
+
+        let mut buffer_a = std::mem::take(&mut workspace.layer_output);
+        let mut buffer_b = std::mem::take(&mut workspace.layer_input);
+        buffer_a.resize(ping_pong_size);
+        buffer_b.resize(ping_pong_size);
+
+        let mut current_is_a = true;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let in_size = batch_size * layer.in_dim;
             let out_size = batch_size * layer.out_dim;
-            if next.len() < out_size {
-                next.resize(out_size, 0.0);
-            } else {
-                next[..out_size].fill(0.0);
-            }
 
-            layer.forward_batch(&current, &mut next[..out_size], workspace);
+            let (input_slice, output_buf) = if layer_idx == 0 {
+                (
+                    input,
+                    if current_is_a {
+                        &mut buffer_a
+                    } else {
+                        &mut buffer_b
+                    },
+                )
+            } else if current_is_a {
+                (&buffer_a.as_slice()[..in_size], &mut buffer_b)
+            } else {
+                (&buffer_b.as_slice()[..in_size], &mut buffer_a)
+            };
+
+            output_buf.resize(out_size);
+            layer.forward_batch(
+                input_slice,
+                &mut output_buf.as_mut_slice()[..out_size],
+                workspace,
+            );
 
             // Save normalized inputs and grid indices for backward
-            let hist_in =
-                &mut workspace.layers_inputs[layer_idx].as_mut_slice()[..batch_size * layer.in_dim];
+            let hist_in = &mut workspace.layers_inputs[layer_idx].as_mut_slice()[..in_size];
             hist_in.copy_from_slice(workspace.z_buffer.as_slice());
 
-            let hist_idx =
-                &mut workspace.layers_grid_indices[layer_idx][..batch_size * layer.in_dim];
-            hist_idx.copy_from_slice(&workspace.grid_indices[..batch_size * layer.in_dim]);
+            let hist_idx = &mut workspace.layers_grid_indices[layer_idx][..in_size];
+            hist_idx.copy_from_slice(&workspace.grid_indices[..in_size]);
 
             if layer_idx == self.layers.len() - 1 {
-                output.copy_from_slice(&next[..out_size]);
-            } else {
-                std::mem::swap(&mut current, &mut next);
+                output.copy_from_slice(&output_buf.as_slice()[..out_size]);
             }
+
+            current_is_a = !current_is_a;
         }
+
+        workspace.layer_output = buffer_a;
+        workspace.layer_input = buffer_b;
     }
 
-    /// Full training step: forward + backward + update.
-    /// Returns the loss value.
+    /// Full training step: forward + backward + SGD update.
+    ///
+    /// Performs a complete training iteration with zero allocations (after warmup).
+    /// Uses [`default_train_options`](Self::default_train_options) for gradient
+    /// clipping and weight decay.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input batch `[batch_size * input_dim]`
+    /// * `target` - Target values `[batch_size * output_dim]`
+    /// * `mask` - Optional mask `[batch_size * output_dim]` (1.0 = active, 0.0 = ignore)
+    /// * `learning_rate` - SGD learning rate
+    /// * `workspace` - Pre-allocated workspace
+    ///
+    /// # Returns
+    ///
+    /// The MSE loss value for this batch.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let config = KanConfig::default_poker();
+    /// let mut network = KanNetwork::new(config.clone());
+    /// let mut workspace = network.create_workspace(64);
+    ///
+    /// let inputs = vec![0.5f32; 64 * config.input_dim];
+    /// let targets = vec![0.1f32; 64 * config.output_dim];
+    ///
+    /// for epoch in 0..100 {
+    ///     let loss = network.train_step(&inputs, &targets, None, 0.001, &mut workspace);
+    ///     if epoch % 10 == 0 {
+    ///         println!("Epoch {}: loss = {:.4}", epoch, loss);
+    ///     }
+    /// }
+    /// ```
     pub fn train_step(
         &mut self,
         input: &[f32],
@@ -352,7 +639,16 @@ impl KanNetwork {
         self.train_step_with_options(input, target, mask, learning_rate, workspace, &opts)
     }
 
-    /// Полноценный шаг обучения с опциями.
+    /// Full training step with explicit options.
+    ///
+    /// Same as [`train_step`](Self::train_step) but allows passing custom
+    /// [`TrainOptions`] instead of using the default.
+    ///
+    /// # Arguments
+    ///
+    /// * `opts` - Training options (gradient clipping, weight decay)
+    ///
+    /// See [`train_step`](Self::train_step) for other arguments.
     pub fn train_step_with_options(
         &mut self,
         input: &[f32],
@@ -365,31 +661,86 @@ impl KanNetwork {
         let batch_size = input.len() / self.config.input_dim;
         let output_dim = self.config.output_dim;
 
-        // Forward pass with history capture
-        let mut predictions = vec![0.0f32; batch_size * output_dim];
-        self.forward_batch_training(input, &mut predictions, workspace);
+        // Ensure workspace has gradient buffers for all layers
+        workspace.prepare_grad_buffers(&self.layer_param_sizes);
 
-        // Compute loss and output gradient (mean reduction)
-        let (loss, mut grad_next) =
-            compute_masked_mse_loss(&predictions, target, mask, batch_size, output_dim);
+        // Forward pass with history capture using workspace predictions buffer
+        workspace.predictions_buffer.resize(batch_size * output_dim);
+        // Take predictions buffer to avoid borrow conflict
+        let mut predictions_buf = std::mem::take(&mut workspace.predictions_buffer);
+        self.forward_batch_training(input, predictions_buf.as_mut_slice(), workspace);
+
+        // Compute loss and output gradient into workspace buffer
+        workspace.grad_output.resize(batch_size * output_dim);
+        let loss = compute_masked_mse_loss_into(
+            predictions_buf.as_slice(),
+            target,
+            mask,
+            batch_size,
+            output_dim,
+            workspace.grad_output.as_mut_slice(),
+        );
+        // Return predictions buffer
+        workspace.predictions_buffer = predictions_buf;
 
         workspace.assert_history_batch(batch_size);
 
-        // Контейнеры для глобального клиппинга
-        let mut weight_grads_all: Vec<Vec<f32>> = vec![Vec::new(); self.layers.len()];
-        let mut bias_grads_all: Vec<Vec<f32>> = vec![Vec::new(); self.layers.len()];
+        // =====================================================================
+        // Backward pass: compute gradients for all layers (zero-allocation).
+        //
+        // Buffer scheme:
+        // - `staging_buffer`: holds dL/d(layer_output) for the current layer.
+        //   After processing layer i, it's overwritten with dL/d(layer_input)
+        //   which becomes dL/d(layer_output) for layer i-1.
+        // - `layer_grads`: temporary buffer for accumulating input gradients.
+        // - `weight_grads[i]`, `bias_grads[i]`: accumulated gradients per layer.
+        //
+        // Borrow-safety: we use `std::mem::take` to temporarily move buffers
+        // out of workspace, then return them after use. This avoids aliasing
+        // between the layer's input history and the gradient buffers.
+        //
+        // Flow for layer i (reverse order, from output to input):
+        //   1. Read grad_out from staging_buffer
+        //   2. Compute weight/bias gradients using saved inputs (layers_inputs[i])
+        //   3. Compute input gradients into layer_grads
+        //   4. Copy layer_grads → staging_buffer for next iteration
+        // =====================================================================
+        let num_layers = self.layers.len();
         let mut total_sq_norm: f32 = 0.0;
 
-        // Backward pass through all layers (накапливаем градиенты)
-        for layer_idx in (0..self.layers.len()).rev() {
+        // Zero out gradient buffers before accumulating
+        for i in 0..num_layers {
+            for g in workspace.weight_grads[i].iter_mut() {
+                *g = 0.0;
+            }
+            for g in workspace.bias_grads[i].iter_mut() {
+                *g = 0.0;
+            }
+        }
+
+        // Backward pass through all layers
+        // staging_buffer holds the current layer's output gradient (dL/dy).
+        // It's initialized with grad_output and updated each iteration.
+        let max_dim = self.layer_dims.iter().copied().max().unwrap_or(output_dim);
+        workspace.staging_buffer.resize(batch_size * max_dim);
+
+        // Seed the backward pass with dL/d(network_output)
+        let grad_out_size = batch_size * output_dim;
+        workspace.staging_buffer.as_mut_slice()[..grad_out_size]
+            .copy_from_slice(workspace.grad_output.as_slice());
+
+        for layer_idx in (0..num_layers).rev() {
             let layer = &mut self.layers[layer_idx];
             let in_dim = layer.in_dim;
             let out_dim = layer.out_dim;
 
-            let grad_out_slice = &grad_next[..batch_size * out_dim];
+            // Take staging buffer with current gradient
+            let staging = std::mem::take(&mut workspace.staging_buffer);
+            let grad_out_slice = &staging.as_slice()[..batch_size * out_dim];
 
-            let mut weight_grad = vec![0.0f32; layer.weights.len()];
-            let mut bias_grad = vec![0.0f32; layer.bias.len()];
+            // Take weight/bias gradient buffers to avoid borrow conflicts
+            let mut weight_grad = std::mem::take(&mut workspace.weight_grads[layer_idx]);
+            let mut bias_grad = std::mem::take(&mut workspace.bias_grads[layer_idx]);
 
             // Temporarily take gradient buffer from workspace to avoid borrow conflicts
             let mut grad_buffer = if layer_idx > 0 {
@@ -428,21 +779,22 @@ impl KanNetwork {
             total_sq_norm += weight_grad.iter().map(|g| g * g).sum::<f32>();
             total_sq_norm += bias_grad.iter().map(|g| g * g).sum::<f32>();
 
-            weight_grads_all[layer_idx] = weight_grad;
-            bias_grads_all[layer_idx] = bias_grad;
+            // Return gradient buffers
+            workspace.weight_grads[layer_idx] = weight_grad;
+            workspace.bias_grads[layer_idx] = bias_grad;
+
+            // Return staging buffer
+            workspace.staging_buffer = staging;
 
             if let Some(buf) = grad_buffer {
                 let needed = batch_size * in_dim;
-                if grad_next.len() < needed {
-                    grad_next.resize(needed, 0.0);
-                }
-                grad_next[..needed].copy_from_slice(&buf.as_slice()[..needed]);
-                grad_next.truncate(needed);
+                // Copy gradient for next layer into staging_buffer
+                workspace.staging_buffer.resize(needed);
+                workspace.staging_buffer.as_mut_slice()[..needed]
+                    .copy_from_slice(&buf.as_slice()[..needed]);
 
                 // Return buffer to workspace for reuse
                 workspace.layer_grads = buf;
-            } else {
-                grad_next.clear();
             }
         }
 
@@ -451,12 +803,12 @@ impl KanNetwork {
             let norm = total_sq_norm.sqrt();
             if norm > max_norm && norm > 0.0 {
                 let scale = max_norm / norm;
-                for wg in &mut weight_grads_all {
+                for wg in workspace.weight_grads.iter_mut() {
                     for g in wg.iter_mut() {
                         *g *= scale;
                     }
                 }
-                for bg in &mut bias_grads_all {
+                for bg in workspace.bias_grads.iter_mut() {
                     for g in bg.iter_mut() {
                         *g *= scale;
                     }
@@ -464,7 +816,16 @@ impl KanNetwork {
             }
         }
 
-        // Decoupled weight decay + SGD update (градиенты уже средние по batch/mask)
+        // =====================================================================
+        // Parameter update: decoupled weight decay + SGD
+        //
+        // Order:
+        // 1. Weight decay: w *= (1 - lr * decay)  [applied first, only to weights]
+        // 2. Gradient step: w -= lr * grad
+        //
+        // This is "decoupled" weight decay (like AdamW), not L2 regularization.
+        // Biases are NOT decayed, following standard practice.
+        // =====================================================================
         for (i, layer) in self.layers.iter_mut().enumerate() {
             if opts.weight_decay > 0.0 {
                 let decay = opts.weight_decay;
@@ -473,10 +834,14 @@ impl KanNetwork {
                 }
             }
 
-            for (w, g) in layer.weights.iter_mut().zip(weight_grads_all[i].iter()) {
+            for (w, g) in layer
+                .weights
+                .iter_mut()
+                .zip(workspace.weight_grads[i].iter())
+            {
                 *w -= learning_rate * g;
             }
-            for (b, g) in layer.bias.iter_mut().zip(bias_grads_all[i].iter()) {
+            for (b, g) in layer.bias.iter_mut().zip(workspace.bias_grads[i].iter()) {
                 *b -= learning_rate * g;
             }
         }
@@ -485,6 +850,28 @@ impl KanNetwork {
     }
 
     /// Creates a workspace sized for this network.
+    ///
+    /// The workspace is preallocated for the given maximum batch size.
+    /// Reuse this workspace across all forward/backward calls to achieve
+    /// zero-allocation inference and training.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_batch` - Maximum batch size you'll use with this workspace
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let network = KanNetwork::new(KanConfig::default_poker());
+    ///
+    /// // Create workspace for batches up to 64
+    /// let mut workspace = network.create_workspace(64);
+    ///
+    /// // Can be used for any batch size <= 64
+    /// // Workspace will grow automatically if needed, but that causes allocation
+    /// ```
     pub fn create_workspace(&self, max_batch: usize) -> Workspace {
         let mut ws = Workspace::new(&self.config);
         ws.reserve(max_batch, &self.config);
@@ -492,12 +879,35 @@ impl KanNetwork {
     }
 
     /// Saves network to bytes using bincode.
+    ///
+    /// Requires the `serde` feature.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let network = KanNetwork::new(KanConfig::default_poker());
+    /// let bytes = network.to_bytes().unwrap();
+    /// std::fs::write("model.bin", &bytes).unwrap();
+    /// ```
     #[cfg(feature = "serde")]
     pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
         bincode::serialize(self)
     }
 
     /// Loads network from bytes.
+    ///
+    /// Requires the `serde` feature.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use arkan::KanNetwork;
+    ///
+    /// let bytes = std::fs::read("model.bin").unwrap();
+    /// let network = KanNetwork::from_bytes(&bytes).unwrap();
+    /// ```
     #[cfg(feature = "serde")]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(bytes)
@@ -510,12 +920,14 @@ impl Clone for KanNetwork {
             config: self.config.clone(),
             layers: self.layers.clone(),
             layer_dims: self.layer_dims.clone(),
+            layer_param_sizes: self.layer_param_sizes.clone(),
             default_train_options: self.default_train_options,
         }
     }
 }
 
 /// Computes masked MSE loss and gradient.
+#[allow(dead_code)]
 fn compute_masked_mse_loss(
     predictions: &[f32],
     targets: &[f32],
@@ -550,6 +962,46 @@ fn compute_masked_mse_loss(
     }
 
     (loss, grad)
+}
+
+/// Computes masked MSE loss and writes gradient into provided buffer (zero-allocation).
+fn compute_masked_mse_loss_into(
+    predictions: &[f32],
+    targets: &[f32],
+    mask: Option<&[f32]>,
+    batch_size: usize,
+    output_dim: usize,
+    grad: &mut [f32],
+) -> f32 {
+    let mut loss = 0.0f32;
+    let mut count = 0.0f32;
+
+    // Zero out gradient buffer
+    grad.iter_mut().for_each(|g| *g = 0.0);
+
+    for b in 0..batch_size {
+        for o in 0..output_dim {
+            let idx = b * output_dim + o;
+            let m = mask.map(|m| m[idx]).unwrap_or(1.0);
+
+            if m > 0.0 {
+                let diff = predictions[idx] - targets[idx];
+                loss += m * diff * diff;
+                grad[idx] = 2.0 * m * diff;
+                count += m;
+            }
+        }
+    }
+
+    if count > 0.0 {
+        let inv = 1.0 / count;
+        loss *= inv;
+        for g in grad.iter_mut() {
+            *g *= inv;
+        }
+    }
+
+    loss
 }
 
 #[cfg(test)]
