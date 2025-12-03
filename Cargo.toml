@@ -75,3 +75,8 @@ harness = false
 [[bench]]
 name = "latency"
 harness = false
+
+[[bench]]
+name = "gpu_forward"
+harness = false
+required-features = ["gpu"]
