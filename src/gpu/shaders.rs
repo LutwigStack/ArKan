@@ -3,14 +3,14 @@
 //! This module contains shader source code as string constants that are
 //! compiled at runtime by wgpu.
 
-/// Forward pass shader for KAN layer.
+/// Forward pass shader for KAN layer (cubic B-spline, order=3).
 ///
 /// Computes: y[j] = Σᵢ Σₖ weights[j,i,k] · B_k(x[i]) + bias[j]
 ///
 /// # Bind Groups
 ///
 /// - Group 0 (Static):
-///   - Binding 0: weights (storage, read) - [out_dim, in_dim, basis_padded]
+///   - Binding 0: weights (storage, read) - array<vec4<f32>>, layout [out_dim, in_dim, basis_vec4s]
 ///   - Binding 1: bias (storage, read) - [out_dim]
 ///   - Binding 2: config (uniform) - LayerUniforms
 ///
@@ -21,6 +21,13 @@
 /// # Workgroup Size
 ///
 /// [64, 1, 1] - each thread processes one (batch, output) pair.
+///
+/// # Weight Layout
+///
+/// Weights are stored as `array<vec4<f32>>` where basis_vec4s = ceil(basis_padded / 4).
+/// Each vec4 contains 4 consecutive basis weights. Access pattern:
+/// - vec4_idx = basis_idx / 4
+/// - component = basis_idx % 4 (use indexing: v[0], v[1], v[2], v[3])
 pub const FORWARD_SHADER: &str = r#"
 // Uniform buffer layout (must match LayerUniforms in Rust)
 struct Uniforms {
@@ -36,7 +43,8 @@ struct Uniforms {
 }
 
 // Group 0: Static layer resources
-@group(0) @binding(0) var<storage, read> weights: array<f32>;
+// Weights stored as vec4 for efficient GPU access
+@group(0) @binding(0) var<storage, read> weights: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> bias: array<f32>;
 @group(0) @binding(2) var<uniform> config: Uniforms;
 
@@ -44,139 +52,35 @@ struct Uniforms {
 @group(1) @binding(0) var<storage, read> input: array<f32>;
 @group(1) @binding(1) var<storage, read_write> output: array<f32>;
 
-// Constants
-const WORKGROUP_SIZE: u32 = 64u;
-const MAX_ORDER: u32 = 4u;  // Maximum supported spline order
-const MAX_BASIS: u32 = 5u;  // MAX_ORDER + 1
-
-// Compute B-spline basis functions using Cox-de Boor recursion
-// Returns basis values in a local array
-fn compute_basis_order3(t_norm: f32, span: u32) -> array<f32, 4> {
-    // Hardcoded for order=3 (cubic B-splines)
-    // t_norm is in [0, 1], span is the knot span index
+// Cubic B-spline basis functions (hardcoded order=3)
+// Input: t_local in [0, 1) - local parameter within span
+// Output: vec4 with 4 basis values B_{i-1}, B_i, B_{i+1}, B_{i+2}
+fn cubic_basis(t: f32) -> vec4<f32> {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let omt = 1.0 - t;
+    let omt2 = omt * omt;
+    let omt3 = omt2 * omt;
     
-    var basis: array<f32, 4>;
-    
-    // Cox-de Boor for order 3
-    // Level 0: basis functions of order 0
-    var N0: array<f32, 4>;
-    let grid_size_f = f32(config.grid_size);
-    let t = t_norm * grid_size_f;
-    let span_f = f32(span);
-    
-    // Initialize level 0
-    for (var k = 0u; k < 4u; k++) {
-        let knot_k = span_f - 2.0 + f32(k);
-        let knot_k1 = knot_k + 1.0;
-        if (t >= knot_k && t < knot_k1) {
-            N0[k] = 1.0;
-        } else {
-            N0[k] = 0.0;
-        }
-    }
-    
-    // Handle edge case at t = grid_size
-    if (t >= grid_size_f) {
-        N0[3] = 1.0;
-    }
-    
-    // Level 1
-    var N1: array<f32, 3>;
-    for (var k = 0u; k < 3u; k++) {
-        let knot_k = span_f - 2.0 + f32(k);
-        let knot_k1 = knot_k + 1.0;
-        let knot_k2 = knot_k + 2.0;
-        
-        var left = 0.0;
-        var right = 0.0;
-        
-        let denom_left = knot_k1 - knot_k;
-        if (abs(denom_left) > 1e-10) {
-            left = (t - knot_k) / denom_left * N0[k];
-        }
-        
-        let denom_right = knot_k2 - knot_k1;
-        if (abs(denom_right) > 1e-10) {
-            right = (knot_k2 - t) / denom_right * N0[k + 1u];
-        }
-        
-        N1[k] = left + right;
-    }
-    
-    // Level 2
-    var N2: array<f32, 2>;
-    for (var k = 0u; k < 2u; k++) {
-        let knot_k = span_f - 2.0 + f32(k);
-        let knot_k2 = knot_k + 2.0;
-        let knot_k3 = knot_k + 3.0;
-        
-        var left = 0.0;
-        var right = 0.0;
-        
-        let denom_left = knot_k2 - knot_k;
-        if (abs(denom_left) > 1e-10) {
-            left = (t - knot_k) / denom_left * N1[k];
-        }
-        
-        let denom_right = knot_k3 - knot_k2;
-        if (abs(denom_right) > 1e-10) {
-            right = (knot_k3 - t) / denom_right * N1[k + 1u];
-        }
-        
-        N2[k] = left + right;
-    }
-    
-    // Level 3 (final)
-    for (var k = 0u; k < 1u; k++) {
-        let knot_k = span_f - 2.0 + f32(k);
-        let knot_k3 = knot_k + 3.0;
-        let knot_k4 = knot_k + 4.0;
-        
-        var left = 0.0;
-        var right = 0.0;
-        
-        let denom_left = knot_k3 - knot_k;
-        if (abs(denom_left) > 1e-10) {
-            left = (t - knot_k) / denom_left * N2[k];
-        }
-        
-        let denom_right = knot_k4 - knot_k3;
-        if (abs(denom_right) > 1e-10) {
-            right = (knot_k4 - t) / denom_right * N2[k + 1u];
-        }
-        
-        basis[0] = left + right;
-    }
-    
-    // For order 3, we have 4 active basis functions
-    // Simplified: return uniform basis for now
-    // TODO: Full Cox-de Boor implementation
-    let u = t - floor(t);
-    let u2 = u * u;
-    let u3 = u2 * u;
-    
-    // Cubic B-spline basis (uniform knots)
-    basis[0] = (1.0 - u) * (1.0 - u) * (1.0 - u) / 6.0;
-    basis[1] = (3.0 * u3 - 6.0 * u2 + 4.0) / 6.0;
-    basis[2] = (-3.0 * u3 + 3.0 * u2 + 3.0 * u + 1.0) / 6.0;
-    basis[3] = u3 / 6.0;
-    
-    return basis;
+    return vec4<f32>(
+        omt3 / 6.0,                                    // B_{i-1}
+        (3.0 * t3 - 6.0 * t2 + 4.0) / 6.0,            // B_i
+        (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) / 6.0, // B_{i+1}
+        t3 / 6.0                                       // B_{i+2}
+    );
 }
 
-// Find the span index for a normalized value t in [0, 1]
-fn find_span(t_norm: f32) -> u32 {
-    let grid_size = config.grid_size;
-    let order = config.order;
+// Get weight at specific basis index from vec4 array
+fn get_weight(base_vec4: u32, basis_idx: u32) -> f32 {
+    let vec4_idx = base_vec4 + basis_idx / 4u;
+    let component = basis_idx % 4u;
+    let w = weights[vec4_idx];
     
-    // Map t from [0,1] to grid position
-    let t_grid = t_norm * f32(grid_size);
-    
-    // Clamp span to valid range [order, grid_size + order - 1]
-    var span = u32(floor(t_grid));
-    span = clamp(span + order, order, grid_size + order - 1u);
-    
-    return span;
+    // Component selection (WGSL doesn't support dynamic indexing on vec4)
+    if (component == 0u) { return w.x; }
+    else if (component == 1u) { return w.y; }
+    else if (component == 2u) { return w.z; }
+    else { return w.w; }
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -190,6 +94,8 @@ fn forward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
     
     var sum = 0.0;
+    let grid_size_f = f32(config.grid_size);
+    let basis_vec4s = (config.basis_padded + 3u) / 4u;
     
     // Process each input dimension
     for (var in_idx = 0u; in_idx < config.in_dim; in_idx++) {
@@ -201,21 +107,27 @@ fn forward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         x = clamp(x, config.grid_min, config.grid_max);
         let t_norm = (x - config.grid_min) / (config.grid_max - config.grid_min);
         
-        // Find span and compute basis
-        let span = find_span(t_norm);
-        let basis = compute_basis_order3(t_norm, span);
+        // Scale to grid coordinates
+        let t_grid = t_norm * grid_size_f;
+        let span = clamp(u32(floor(t_grid)), 0u, config.grid_size - 1u);
+        let t_local = t_grid - f32(span);
         
-        // Compute weighted sum for this input
-        let weight_base = (out_idx * config.in_dim + in_idx) * config.basis_padded;
+        // Compute cubic basis values
+        let basis = cubic_basis(t_local);
         
-        // Active basis functions start at (span - order)
-        let basis_start = span - config.order;
+        // Weight base in vec4 units for this (out, in) pair
+        let weight_base_vec4 = (out_idx * config.in_dim + in_idx) * basis_vec4s;
         
-        for (var k = 0u; k < 4u; k++) {  // order + 1 = 4 for cubic splines
-            let weight_idx = weight_base + basis_start + k;
-            if (basis_start + k < config.basis_padded) {
-                sum += weights[weight_idx] * basis[k];
-            }
+        // Accumulate weighted basis (4 active basis functions for cubic)
+        sum += get_weight(weight_base_vec4, span) * basis.x;
+        if (span + 1u < config.basis_padded) {
+            sum += get_weight(weight_base_vec4, span + 1u) * basis.y;
+        }
+        if (span + 2u < config.basis_padded) {
+            sum += get_weight(weight_base_vec4, span + 2u) * basis.z;
+        }
+        if (span + 3u < config.basis_padded) {
+            sum += get_weight(weight_base_vec4, span + 3u) * basis.w;
         }
     }
     
@@ -227,9 +139,10 @@ fn forward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
-/// Simple forward shader with scalar basis computation.
+/// Simple forward shader with vec4 weight access (cubic B-spline, order=3).
 ///
 /// This is a simpler version that processes each output element independently.
+/// Weights are stored as `array<vec4<f32>>` for efficient memory access.
 pub const FORWARD_SIMPLE_SHADER: &str = r#"
 struct Uniforms {
     grid_min: f32,
@@ -243,7 +156,8 @@ struct Uniforms {
     batch_size: u32,
 }
 
-@group(0) @binding(0) var<storage, read> weights: array<f32>;
+// Weights stored as vec4 for efficient GPU access
+@group(0) @binding(0) var<storage, read> weights: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> bias: array<f32>;
 @group(0) @binding(2) var<uniform> config: Uniforms;
 
@@ -266,6 +180,18 @@ fn cubic_basis(t: f32) -> vec4<f32> {
     );
 }
 
+// Get weight at specific basis index from vec4 array
+fn get_weight(base_vec4: u32, basis_idx: u32) -> f32 {
+    let vec4_idx = base_vec4 + basis_idx / 4u;
+    let component = basis_idx % 4u;
+    let w = weights[vec4_idx];
+    
+    if (component == 0u) { return w.x; }
+    else if (component == 1u) { return w.y; }
+    else if (component == 2u) { return w.z; }
+    else { return w.w; }
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn forward_simple(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let idx = global_id.x;
@@ -278,6 +204,7 @@ fn forward_simple(@builtin(global_invocation_id) global_id: vec3<u32>) {
     
     var sum = 0.0;
     let grid_size_f = f32(config.grid_size);
+    let basis_vec4s = (config.basis_padded + 3u) / 4u;
     
     for (var in_idx = 0u; in_idx < config.in_dim; in_idx++) {
         let input_idx = batch_idx * config.in_dim + in_idx;
@@ -295,19 +222,19 @@ fn forward_simple(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // Get basis values
         let basis = cubic_basis(t_local);
         
-        // Weight base index
-        let weight_base = (out_idx * config.in_dim + in_idx) * config.basis_padded + span;
+        // Weight base in vec4 units
+        let weight_base_vec4 = (out_idx * config.in_dim + in_idx) * basis_vec4s;
         
-        // Accumulate weighted basis
-        sum += weights[weight_base] * basis.x;
+        // Accumulate weighted basis using vec4 access
+        sum += get_weight(weight_base_vec4, span) * basis.x;
         if (span + 1u < config.basis_padded) {
-            sum += weights[weight_base + 1u] * basis.y;
+            sum += get_weight(weight_base_vec4, span + 1u) * basis.y;
         }
         if (span + 2u < config.basis_padded) {
-            sum += weights[weight_base + 2u] * basis.z;
+            sum += get_weight(weight_base_vec4, span + 2u) * basis.z;
         }
         if (span + 3u < config.basis_padded) {
-            sum += weights[weight_base + 3u] * basis.w;
+            sum += get_weight(weight_base_vec4, span + 3u) * basis.w;
         }
     }
     

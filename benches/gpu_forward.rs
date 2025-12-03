@@ -1,11 +1,20 @@
 //! GPU Forward pass benchmarks.
 //!
-//! Run with: cargo bench --bench gpu_forward --features gpu
+//! Run with: cargo bench --bench gpu_forward --features gpu -- --gpu
 //!
 //! # Notes
 //!
 //! These benchmarks measure GPU forward pass performance. For fair comparison
 //! with CPU, both include data transfer time (upload/download).
+//!
+//! # GPU Flag
+//!
+//! To enable GPU benchmarks in CI-safe mode, pass `--gpu` flag:
+//! ```bash
+//! cargo bench --bench gpu_forward --features gpu -- --gpu
+//! ```
+//!
+//! Without `--gpu` flag, benchmarks will be skipped gracefully (CI-safe default).
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -14,6 +23,11 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use arkan::{KanConfig, KanNetwork};
 #[cfg(feature = "gpu")]
 use arkan::gpu::{GpuNetwork, WgpuBackend, WgpuOptions};
+
+/// Check if --gpu flag was passed to criterion.
+fn gpu_flag_enabled() -> bool {
+    std::env::args().any(|arg| arg == "--gpu")
+}
 
 fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -24,6 +38,13 @@ fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> V
 
 #[cfg(feature = "gpu")]
 fn bench_gpu_forward(c: &mut Criterion) {
+    // Check if --gpu flag is enabled (CI-safe: skip if not)
+    if !gpu_flag_enabled() {
+        eprintln!("GPU benchmarks skipped (--gpu flag not provided).");
+        eprintln!("Run with: cargo bench --bench gpu_forward --features gpu -- --gpu");
+        return;
+    }
+
     // Initialize GPU backend once
     let backend = match WgpuBackend::init(WgpuOptions::default()) {
         Ok(b) => {
@@ -80,6 +101,11 @@ fn bench_gpu_forward(c: &mut Criterion) {
 
 #[cfg(feature = "gpu")]
 fn bench_cpu_vs_gpu(c: &mut Criterion) {
+    // Check if --gpu flag is enabled
+    if !gpu_flag_enabled() {
+        return;
+    }
+
     // Initialize GPU backend
     let backend = match WgpuBackend::init(WgpuOptions::default()) {
         Ok(b) => b,

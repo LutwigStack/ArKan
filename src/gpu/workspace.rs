@@ -17,6 +17,12 @@ use crate::gpu::{exceeds_vram_limit, GpuTensor, MAX_VRAM_ALLOC};
 /// - Buffers grow when needed but never shrink (to avoid reallocation overhead)
 /// - Cached bind groups are invalidated when buffers resize
 ///
+/// # Bind Group Caching
+///
+/// The workspace caches bind groups (Group 1) to avoid recreation overhead:
+/// - `cached_bind_group`: For single-layer or input/output only
+/// - `cached_layer_bind_groups`: For multi-layer, maps (input_buf_idx, output_buf_idx) -> BindGroup
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -46,8 +52,11 @@ pub struct GpuWorkspace {
 
     /// Bind group layout for dynamic resources (Group 1).
     pub bind_group_layout: Option<wgpu::BindGroupLayout>,
-    /// Cached bind group (invalidated on resize).
+    /// Cached bind group for single-layer (input -> output).
     cached_bind_group: Option<wgpu::BindGroup>,
+    /// Cached bind groups for multi-layer, indexed by (in_buffer_type, out_buffer_type).
+    /// Types: 0 = input, 1 = output, 2+ = intermediate[idx-2]
+    cached_layer_bind_groups: Vec<Option<wgpu::BindGroup>>,
 
     /// Generation counter for cache invalidation.
     generation: u64,
@@ -99,6 +108,7 @@ impl GpuWorkspace {
             max_batch,
             bind_group_layout: None,
             cached_bind_group: None,
+            cached_layer_bind_groups: Vec::new(),
             generation: 0,
         })
     }
@@ -114,6 +124,7 @@ impl GpuWorkspace {
             max_batch: 0,
             bind_group_layout: None,
             cached_bind_group: None,
+            cached_layer_bind_groups: Vec::new(),
             generation: 0,
         }
     }
@@ -207,6 +218,7 @@ impl GpuWorkspace {
     /// Invalidates cached bind groups.
     fn invalidate_cache(&mut self) {
         self.cached_bind_group = None;
+        self.cached_layer_bind_groups.clear();
         self.generation += 1;
     }
 
@@ -250,6 +262,90 @@ impl GpuWorkspace {
         }
 
         Ok(self.cached_bind_group.as_ref().unwrap())
+    }
+
+    /// Gets or creates the bind group for a specific layer in multi-layer forward.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - The wgpu device.
+    /// * `layout` - The bind group layout.
+    /// * `layer_idx` - Index of the current layer.
+    /// * `num_layers` - Total number of layers.
+    ///
+    /// # Buffer Routing
+    ///
+    /// - Layer 0: input -> intermediate[0]
+    /// - Layer i (middle): intermediate[i-1] -> intermediate[i]
+    /// - Layer n-1: intermediate[n-2] -> output
+    pub fn get_or_create_layer_bind_group(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        layer_idx: usize,
+        num_layers: usize,
+    ) -> ArkanResult<&wgpu::BindGroup> {
+        // Ensure cache vector is large enough
+        if self.cached_layer_bind_groups.len() < num_layers {
+            self.cached_layer_bind_groups.resize_with(num_layers, || None);
+        }
+
+        // Check if already cached
+        if self.cached_layer_bind_groups[layer_idx].is_some() {
+            return Ok(self.cached_layer_bind_groups[layer_idx].as_ref().unwrap());
+        }
+
+        // Determine input and output buffers
+        let (input_buffer, output_buffer) = if layer_idx == 0 {
+            // First layer: input from workspace.input, output to intermediate[0]
+            (
+                self.input.as_ref()
+                    .ok_or_else(|| ArkanError::buffer("No input buffer"))?
+                    .buffer.as_entire_binding(),
+                self.intermediates.get(0)
+                    .ok_or_else(|| ArkanError::buffer("No intermediate buffer 0"))?
+                    .buffer.as_entire_binding(),
+            )
+        } else if layer_idx == num_layers - 1 {
+            // Last layer: input from intermediate[n-2], output to workspace.output
+            (
+                self.intermediates.get(layer_idx - 1)
+                    .ok_or_else(|| ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1)))?
+                    .buffer.as_entire_binding(),
+                self.output.as_ref()
+                    .ok_or_else(|| ArkanError::buffer("No output buffer"))?
+                    .buffer.as_entire_binding(),
+            )
+        } else {
+            // Middle layer: intermediate[i-1] -> intermediate[i]
+            (
+                self.intermediates.get(layer_idx - 1)
+                    .ok_or_else(|| ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1)))?
+                    .buffer.as_entire_binding(),
+                self.intermediates.get(layer_idx)
+                    .ok_or_else(|| ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx)))?
+                    .buffer.as_entire_binding(),
+            )
+        };
+
+        // Create bind group
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("Layer {} I/O BindGroup", layer_idx)),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buffer,
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: output_buffer,
+                },
+            ],
+        });
+
+        self.cached_layer_bind_groups[layer_idx] = Some(bind_group);
+        Ok(self.cached_layer_bind_groups[layer_idx].as_ref().unwrap())
     }
 
     /// Uploads input data to the GPU.

@@ -127,7 +127,7 @@ impl WgpuBackend {
     /// # Errors
     ///
     /// - `ArkanError::AdapterNotFound` - No suitable GPU adapter found.
-    /// - `ArkanError::DeviceCreationFailed` - Failed to create device with requested limits.
+    /// - `ArkanError::DeviceRequestFailed` - Failed to create device with requested limits.
     pub fn init(options: WgpuOptions) -> ArkanResult<Self> {
         // Create instance
         let backends = options.backend.unwrap_or(wgpu::Backends::all());
@@ -223,7 +223,7 @@ impl WgpuBackend {
         adapter: &wgpu::Adapter,
         options: &WgpuOptions,
     ) -> ArkanResult<(wgpu::Device, wgpu::Queue)> {
-        let result = adapter
+        let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("ArKan GPU Device"),
@@ -233,14 +233,9 @@ impl WgpuBackend {
                 },
                 None,
             )
-            .await;
+            .await?;
 
-        result.map_err(|e| {
-            ArkanError::device_creation_failed(format!(
-                "Failed to create device: {}. Try lowering required_limits.",
-                e
-            ))
-        })
+        Ok((device, queue))
     }
 
     fn check_limits(adapter: &wgpu::Limits, required: &wgpu::Limits) -> ArkanResult<()> {

@@ -221,6 +221,8 @@ impl GpuNetwork {
     }
     
     /// Executes forward pass for one layer in a multi-layer network.
+    ///
+    /// Uses cached bind groups from workspace to avoid recreation overhead.
     fn execute_layer_forward_multi(
         &mut self,
         layer_idx: usize,
@@ -234,40 +236,13 @@ impl GpuNetwork {
         // Get layer info we need before borrowing
         let out_dim = self.layers[layer_idx].out_dim;
         
-        // Determine input and output buffers
-        let (input_buffer, output_buffer) = if layer_idx == 0 {
-            // First layer: input from workspace.input, output to intermediate[0]
-            (
-                workspace.input.as_ref().ok_or_else(|| ArkanError::buffer("No input buffer"))?,
-                &workspace.intermediates[0],
-            )
-        } else if layer_idx == num_layers - 1 {
-            // Last layer: input from intermediate[n-2], output to workspace.output
-            (
-                &workspace.intermediates[layer_idx - 1],
-                workspace.output.as_ref().ok_or_else(|| ArkanError::buffer("No output buffer"))?,
-            )
-        } else {
-            // Middle layer: intermediate[i-1] -> intermediate[i]
-            let (left, right) = workspace.intermediates.split_at(layer_idx);
-            (&left[layer_idx - 1], &right[0])
-        };
-        
-        // Create temporary bind group for this layer's I/O
-        let io_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Layer I/O BindGroup"),
-            layout: &self.workspace_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buffer.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output_buffer.buffer.as_entire_binding(),
-                },
-            ],
-        });
+        // Get or create cached bind group for this layer's I/O
+        let io_bind_group = workspace.get_or_create_layer_bind_group(
+            &self.device,
+            &self.workspace_layout,
+            layer_idx,
+            num_layers,
+        )?;
         
         // Get bind group layout reference for pipeline creation
         let bind_group_layout = &self.layers[layer_idx].bind_group_layout;
@@ -290,7 +265,7 @@ impl GpuNetwork {
             
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.layers[layer_idx].bind_group, &[]);
-            pass.set_bind_group(1, &io_bind_group, &[]);
+            pass.set_bind_group(1, io_bind_group, &[]);
             
             let total_outputs = batch_size * out_dim;
             let num_workgroups = workgroup_count(total_outputs, WORKGROUP_SIZE);

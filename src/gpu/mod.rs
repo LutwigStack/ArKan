@@ -20,7 +20,7 @@
 //!
 //! // Upload data to GPU
 //! let data = vec![1.0f32; 1024];
-//! let tensor = GpuTensor::upload(&backend.device, &backend.queue, &data, vec![1024]);
+//! let tensor = GpuTensor::upload(&backend.device, &backend.queue, &data, vec![1024])?;
 //!
 //! // Download data from GPU
 //! let result = tensor.download(&backend.device, &backend.queue)?;

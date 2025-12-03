@@ -12,7 +12,7 @@ use wgpu::util::DeviceExt;
 /// GPU representation of a KAN layer.
 ///
 /// Holds all GPU resources needed for forward pass computation:
-/// - Weight buffer (padded for vec4 access)
+/// - Weight buffer (packed as vec4 for efficient access)
 /// - Bias buffer
 /// - Uniform buffer
 /// - Static bind group (Group 0)
@@ -20,11 +20,18 @@ use wgpu::util::DeviceExt;
 /// # Bind Group Layout
 ///
 /// Group 0 (Static - per layer):
-/// - Binding 0: Weights (storage, read)
+/// - Binding 0: Weights (storage, read) - array<vec4<f32>>
 /// - Binding 1: Bias (storage, read)
 /// - Binding 2: Uniforms (uniform)
+///
+/// # Weight Layout
+///
+/// Weights are stored as `array<vec4<f32>>` where:
+/// - Total vec4 count = out_dim * in_dim * basis_vec4s
+/// - basis_vec4s = ceil(basis_padded / 4)
+/// - Each vec4 contains 4 consecutive basis weights
 pub struct GpuLayer {
-    /// Weight tensor [out_dim, in_dim, basis_padded].
+    /// Weight tensor [out_dim, in_dim, basis_vec4s] stored as vec4.
     pub weights: GpuTensor,
     /// Bias tensor [out_dim].
     pub bias: GpuTensor,
@@ -45,6 +52,8 @@ pub struct GpuLayer {
     pub global_basis_size: usize,
     /// Padded basis size (aligned to 4).
     pub basis_padded: usize,
+    /// Number of vec4s per (out, in) pair: ceil(basis_padded / 4).
+    pub basis_vec4s: usize,
 
     /// Static bind group (weights, bias, uniforms).
     pub bind_group: wgpu::BindGroup,
@@ -63,6 +72,13 @@ impl GpuLayer {
     /// # Returns
     ///
     /// A new `GpuLayer` with uploaded weights and bias.
+    ///
+    /// # Weight Packing
+    ///
+    /// Weights are packed into vec4 format for efficient GPU access:
+    /// - Original: [out_dim, in_dim, global_basis_size]
+    /// - Padded: [out_dim, in_dim, basis_padded] (basis_padded = align4(global_basis_size))
+    /// - GPU: [out_dim * in_dim * basis_vec4s] vec4s (basis_vec4s = ceil(basis_padded/4))
     pub fn from_cpu_layer(device: &wgpu::Device, cpu_layer: &KanLayer) -> ArkanResult<Self> {
         let in_dim = cpu_layer.in_dim;
         let out_dim = cpu_layer.out_dim;
@@ -70,25 +86,26 @@ impl GpuLayer {
         let order = cpu_layer.order;
         let global_basis_size = cpu_layer.global_basis_size;
         let basis_padded = pad_to_vec4(global_basis_size);
+        let basis_vec4s = (basis_padded + 3) / 4; // ceil division
 
-        // Pad weights for vec4 access
-        // Original layout: [out_dim, in_dim, global_basis_size]
-        // Padded layout: [out_dim, in_dim, basis_padded]
-        let padded_weights = Self::pad_weights(
+        // Pack weights into vec4 format
+        // Each vec4 contains 4 consecutive basis weights
+        let packed_weights = Self::pack_weights_vec4(
             cpu_layer.weights.as_slice(),
             out_dim,
             in_dim,
             global_basis_size,
             basis_padded,
+            basis_vec4s,
         );
 
         let weights = GpuTensor::storage_read(
             device,
-            &padded_weights,
-            vec![out_dim, in_dim, basis_padded],
-        );
+            &packed_weights,
+            vec![out_dim * in_dim * basis_vec4s * 4], // Total floats in vec4 array
+        )?;
 
-        let bias = GpuTensor::storage_read(device, cpu_layer.bias.as_slice(), vec![out_dim]);
+        let bias = GpuTensor::storage_read(device, cpu_layer.bias.as_slice(), vec![out_dim])?;
 
         // Create uniforms
         let uniforms = LayerUniforms::from_layer_config(
@@ -141,6 +158,7 @@ impl GpuLayer {
             order,
             global_basis_size,
             basis_padded,
+            basis_vec4s,
             bind_group,
             bind_group_layout,
         })
@@ -219,30 +237,38 @@ impl GpuLayer {
         })
     }
 
-    /// Pads weights for vec4 access in shaders.
-    fn pad_weights(
+    /// Packs weights into vec4 format for efficient GPU access.
+    ///
+    /// Input layout: [out_dim, in_dim, global_basis]
+    /// Output layout: [out_dim * in_dim * basis_vec4s] vec4s (flattened as f32 array)
+    ///
+    /// Each vec4 contains 4 consecutive basis weights, padded with zeros if needed.
+    fn pack_weights_vec4(
         weights: &[f32],
         out_dim: usize,
         in_dim: usize,
         global_basis: usize,
-        basis_padded: usize,
+        _basis_padded: usize, // Used for documentation, actual padding uses basis_vec4s * 4
+        basis_vec4s: usize,
     ) -> Vec<f32> {
-        if global_basis == basis_padded {
-            return weights.to_vec();
-        }
-
-        let mut padded = vec![0.0f32; out_dim * in_dim * basis_padded];
+        let total_vec4s = out_dim * in_dim * basis_vec4s;
+        let mut packed = vec![0.0f32; total_vec4s * 4];
 
         for o in 0..out_dim {
             for i in 0..in_dim {
                 let src_offset = (o * in_dim + i) * global_basis;
-                let dst_offset = (o * in_dim + i) * basis_padded;
-                padded[dst_offset..dst_offset + global_basis]
-                    .copy_from_slice(&weights[src_offset..src_offset + global_basis]);
+                let dst_vec4_base = (o * in_dim + i) * basis_vec4s;
+
+                // Copy weights into vec4 positions
+                for k in 0..global_basis {
+                    let dst_offset = dst_vec4_base * 4 + k;
+                    packed[dst_offset] = weights[src_offset + k];
+                }
+                // Remaining positions (from global_basis to basis_padded) are already zero
             }
         }
 
-        padded
+        packed
     }
 
     /// Updates the batch size in uniforms.
@@ -253,14 +279,15 @@ impl GpuLayer {
 
     /// Updates weights from CPU layer.
     pub fn update_weights(&mut self, queue: &wgpu::Queue, cpu_layer: &KanLayer) {
-        let padded_weights = Self::pad_weights(
+        let packed_weights = Self::pack_weights_vec4(
             cpu_layer.weights.as_slice(),
             self.out_dim,
             self.in_dim,
             self.global_basis_size,
             self.basis_padded,
+            self.basis_vec4s,
         );
-        self.weights.update(queue, &padded_weights);
+        self.weights.update(queue, &packed_weights);
     }
 
     /// Updates bias from CPU layer.
@@ -268,9 +295,9 @@ impl GpuLayer {
         self.bias.update(queue, cpu_layer.bias.as_slice());
     }
 
-    /// Returns the total weight count (padded).
+    /// Returns the total weight count (vec4 aligned).
     pub fn weight_count(&self) -> usize {
-        self.out_dim * self.in_dim * self.basis_padded
+        self.out_dim * self.in_dim * self.basis_vec4s * 4
     }
 
     /// Returns the bias count.
@@ -293,6 +320,7 @@ impl std::fmt::Debug for GpuLayer {
             .field("order", &self.order)
             .field("global_basis_size", &self.global_basis_size)
             .field("basis_padded", &self.basis_padded)
+            .field("basis_vec4s", &self.basis_vec4s)
             .field("weight_count", &self.weight_count())
             .finish()
     }
@@ -303,8 +331,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pad_weights() {
-        // 2x2x3 weights -> 2x2x4 padded
+    fn test_pack_weights_vec4() {
+        // 2x2x3 weights -> packed into vec4 format
+        // basis_padded = 4, basis_vec4s = 1
         let weights = vec![
             1.0, 2.0, 3.0, // [0,0,:]
             4.0, 5.0, 6.0, // [0,1,:]
@@ -312,19 +341,32 @@ mod tests {
             10.0, 11.0, 12.0, // [1,1,:]
         ];
 
-        let padded = GpuLayer::pad_weights(&weights, 2, 2, 3, 4);
+        let packed = GpuLayer::pack_weights_vec4(&weights, 2, 2, 3, 4, 1);
 
-        assert_eq!(padded.len(), 2 * 2 * 4);
-        assert_eq!(padded[0..4], [1.0, 2.0, 3.0, 0.0]);
-        assert_eq!(padded[4..8], [4.0, 5.0, 6.0, 0.0]);
-        assert_eq!(padded[8..12], [7.0, 8.0, 9.0, 0.0]);
-        assert_eq!(padded[12..16], [10.0, 11.0, 12.0, 0.0]);
+        // 2*2*1 = 4 vec4s = 16 floats
+        assert_eq!(packed.len(), 16);
+        // First vec4: weights[0,0,:] = [1,2,3,0]
+        assert_eq!(packed[0..4], [1.0, 2.0, 3.0, 0.0]);
+        // Second vec4: weights[0,1,:] = [4,5,6,0]
+        assert_eq!(packed[4..8], [4.0, 5.0, 6.0, 0.0]);
+        // Third vec4: weights[1,0,:] = [7,8,9,0]
+        assert_eq!(packed[8..12], [7.0, 8.0, 9.0, 0.0]);
+        // Fourth vec4: weights[1,1,:] = [10,11,12,0]
+        assert_eq!(packed[12..16], [10.0, 11.0, 12.0, 0.0]);
     }
 
     #[test]
-    fn test_pad_weights_no_padding_needed() {
-        let weights = vec![1.0, 2.0, 3.0, 4.0];
-        let padded = GpuLayer::pad_weights(&weights, 1, 1, 4, 4);
-        assert_eq!(padded, weights);
+    fn test_pack_weights_vec4_multiple_vec4s() {
+        // 1x1x5 weights -> basis_padded = 8, basis_vec4s = 2
+        let weights = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+
+        let packed = GpuLayer::pack_weights_vec4(&weights, 1, 1, 5, 8, 2);
+
+        // 1*1*2 = 2 vec4s = 8 floats
+        assert_eq!(packed.len(), 8);
+        // First vec4: [1,2,3,4]
+        assert_eq!(packed[0..4], [1.0, 2.0, 3.0, 4.0]);
+        // Second vec4: [5,0,0,0]
+        assert_eq!(packed[4..8], [5.0, 0.0, 0.0, 0.0]);
     }
 }

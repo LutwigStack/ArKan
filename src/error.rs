@@ -38,7 +38,14 @@ pub enum ArkanError {
     /// This typically occurs when the GPU driver crashes or the device is removed.
     #[cfg(feature = "gpu")]
     #[error("GPU device error: {0}")]
-    DeviceError(String),
+    DeviceError(#[from] wgpu::Error),
+
+    /// GPU device request failed.
+    ///
+    /// Could not create a device with the requested features/limits.
+    #[cfg(feature = "gpu")]
+    #[error("Failed to create GPU device: {0}")]
+    DeviceRequestFailed(#[from] wgpu::RequestDeviceError),
 
     /// GPU buffer or resource validation error.
     ///
@@ -54,13 +61,6 @@ pub enum ArkanError {
     #[cfg(feature = "gpu")]
     #[error("Failed to find suitable GPU adapter: {0}")]
     AdapterNotFound(String),
-
-    /// GPU device request failed.
-    ///
-    /// Could not create a device with the requested features/limits.
-    #[cfg(feature = "gpu")]
-    #[error("Failed to create GPU device: {0}")]
-    DeviceCreationFailed(String),
 
     /// Shape mismatch between expected and actual tensor shapes.
     ///
@@ -165,12 +165,6 @@ impl ArkanError {
     #[cfg(feature = "gpu")]
     pub fn adapter_not_found<S: Into<String>>(msg: S) -> Self {
         ArkanError::AdapterNotFound(msg.into())
-    }
-
-    /// Creates a device creation failed error.
-    #[cfg(feature = "gpu")]
-    pub fn device_creation_failed<S: Into<String>>(msg: S) -> Self {
-        ArkanError::DeviceCreationFailed(msg.into())
     }
 }
 
