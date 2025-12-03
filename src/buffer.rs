@@ -341,8 +341,7 @@ impl Workspace {
 
         // basis_values: [batch, input, basis]
         self.basis_values.reserve(batch_size * input_dim * basis);
-        self.basis_derivs
-            .reserve(batch_size * input_dim * basis);
+        self.basis_derivs.reserve(batch_size * input_dim * basis);
 
         // grid_indices: [batch, input]
         self.grid_indices.reserve(batch_size * input_dim);
@@ -391,8 +390,7 @@ impl Workspace {
                 .resize_with(num_layers, AlignedBuffer::new);
         }
         if self.layers_grid_indices.len() < num_layers {
-            self.layers_grid_indices
-                .resize_with(num_layers, Vec::new);
+            self.layers_grid_indices.resize_with(num_layers, Vec::new);
         }
 
         let basis = config.basis_size_aligned();
@@ -419,10 +417,8 @@ impl Workspace {
         self.layer_grads.resize(batch_size * max_in_dim);
 
         // Derivatives buffer (same layout as basis_values)
-        self.basis_derivs
-            .reserve(batch_size * max_in_dim * basis);
-        self.basis_derivs
-            .resize(batch_size * max_in_dim * basis);
+        self.basis_derivs.reserve(batch_size * max_in_dim * basis);
+        self.basis_derivs.resize(batch_size * max_in_dim * basis);
 
         self.history_batch_size = batch_size;
     }
