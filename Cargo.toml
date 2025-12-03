@@ -44,3 +44,27 @@ nightly = []  # For SIMD intrinsics that require nightly
 [[bench]]
 name = "forward"
 harness = false
+
+[[bench]]
+name = "backward"
+harness = false
+
+[[bench]]
+name = "scaling"
+harness = false
+
+[[bench]]
+name = "spline_config"
+harness = false
+
+[[bench]]
+name = "memory"
+harness = false
+
+[[bench]]
+name = "optimizer"
+harness = false
+
+[[bench]]
+name = "latency"
+harness = false
