@@ -38,7 +38,7 @@ impl AlignedBuffer {
         }
 
         let layout = Self::layout(capacity);
-        // SAFETY: Layout is valid and non-zero sized
+        // SAFETY: layout is derived from a positive `capacity`, allocation handled via handle_alloc_error
         let ptr = unsafe {
             let raw = alloc_zeroed(layout);
             if raw.is_null() {
@@ -64,6 +64,7 @@ impl AlignedBuffer {
 
         // Allocate new buffer
         let new_layout = Self::layout(new_cap);
+        // SAFETY: new_layout is valid for `new_cap`, allocation failure handled
         let new_ptr = unsafe {
             let raw = alloc_zeroed(new_layout);
             if raw.is_null() {
@@ -74,6 +75,7 @@ impl AlignedBuffer {
 
         // Copy old data if any
         if self.capacity > 0 && self.len > 0 {
+            // SAFETY: source and destination are valid, non-overlapping, len=self.len
             unsafe {
                 std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
             }
@@ -82,6 +84,7 @@ impl AlignedBuffer {
         // Deallocate old buffer
         if self.capacity > 0 {
             let old_layout = Self::layout(self.capacity);
+            // SAFETY: layout matches original allocation
             unsafe {
                 dealloc(self.ptr.as_ptr() as *mut u8, old_layout);
             }
@@ -96,7 +99,7 @@ impl AlignedBuffer {
     pub fn resize(&mut self, new_len: usize) {
         self.reserve(new_len);
         if new_len > self.len {
-            // Zero new elements
+            // SAFETY: destination is within allocated region; zero the tail
             unsafe {
                 std::ptr::write_bytes(self.ptr.as_ptr().add(self.len), 0, new_len - self.len);
             }
@@ -114,6 +117,7 @@ impl AlignedBuffer {
     #[inline]
     pub fn zero(&mut self) {
         if self.len > 0 {
+            // SAFETY: buffer is allocated and len > 0
             unsafe {
                 std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len);
             }
@@ -144,6 +148,7 @@ impl AlignedBuffer {
         if self.len == 0 {
             &[]
         } else {
+            // SAFETY: ptr is valid for `len` contiguous elements
             unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
         }
     }
@@ -154,6 +159,7 @@ impl AlignedBuffer {
         if self.len == 0 {
             &mut []
         } else {
+            // SAFETY: ptr uniquely owned, valid for `len` contiguous elements
             unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
         }
     }
@@ -186,6 +192,7 @@ impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         if self.capacity > 0 {
             let layout = Self::layout(self.capacity);
+            // SAFETY: layout matches allocation, ptr is valid
             unsafe {
                 dealloc(self.ptr.as_ptr() as *mut u8, layout);
             }
@@ -198,6 +205,7 @@ impl Clone for AlignedBuffer {
         let mut new = Self::with_capacity(self.capacity);
         new.len = self.len;
         if self.len > 0 {
+            // SAFETY: source/dest are distinct allocations, len is within both
             unsafe {
                 std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new.ptr.as_ptr(), self.len);
             }
@@ -212,6 +220,7 @@ impl std::ops::Index<usize> for AlignedBuffer {
     #[inline]
     fn index(&self, index: usize) -> &Self::Output {
         assert!(index < self.len, "Index out of bounds");
+        // SAFETY: bounds checked above
         unsafe { &*self.ptr.as_ptr().add(index) }
     }
 }
@@ -220,6 +229,7 @@ impl std::ops::IndexMut<usize> for AlignedBuffer {
     #[inline]
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         assert!(index < self.len, "Index out of bounds");
+        // SAFETY: bounds checked above, unique access
         unsafe { &mut *self.ptr.as_ptr().add(index) }
     }
 }
@@ -257,6 +267,9 @@ pub struct Workspace {
     /// Basis function values: [Batch, Input, Basis]
     pub basis_values: AlignedBuffer,
 
+    /// Basis function derivatives: [Batch, Input, Basis]
+    pub basis_derivs: AlignedBuffer,
+
     /// Grid indices: [Batch, Input]
     pub grid_indices: Vec<u32>,
 
@@ -266,22 +279,25 @@ pub struct Workspace {
     /// Previous layer output (for multi-layer): [Batch, MaxHiddenDim]
     pub layer_input: AlignedBuffer,
 
-    // --- Backward pass buffers ---
-    /// Basis gradients: [Batch, Input, Basis]
-    pub basis_grads: AlignedBuffer,
+    // --- Backward pass history ---
+    /// Saved normalized inputs per layer: [Layer][Batch * in_dim_layer]
+    pub layers_inputs: Vec<AlignedBuffer>,
 
-    /// Output gradients: [Batch, Output]
-    pub output_grads: AlignedBuffer,
+    /// Saved grid indices per layer: [Layer][Batch * in_dim_layer]
+    pub layers_grid_indices: Vec<Vec<u32>>,
 
-    /// Weight gradients accumulator: [MaxWeights]
-    pub weight_grads: AlignedBuffer,
+    /// Gradient buffer passed between layers during backprop: [Batch, MaxDim]
+    pub layer_grads: AlignedBuffer,
 
-    // --- Tracking ---
+    /// Tracking ---
     /// Current batch capacity
     batch_capacity: usize,
 
     /// Max dimension across all layers
     max_dim: usize,
+
+    /// Batch size of the last recorded history (for assertions)
+    history_batch_size: usize,
 }
 
 impl Workspace {
@@ -290,14 +306,16 @@ impl Workspace {
         let mut ws = Self {
             z_buffer: AlignedBuffer::new(),
             basis_values: AlignedBuffer::new(),
+            basis_derivs: AlignedBuffer::new(),
             grid_indices: Vec::new(),
             layer_output: AlignedBuffer::new(),
             layer_input: AlignedBuffer::new(),
-            basis_grads: AlignedBuffer::new(),
-            output_grads: AlignedBuffer::new(),
-            weight_grads: AlignedBuffer::new(),
+            layers_inputs: Vec::new(),
+            layers_grid_indices: Vec::new(),
+            layer_grads: AlignedBuffer::new(),
             batch_capacity: 0,
             max_dim: 0,
+            history_batch_size: 0,
         };
 
         // Pre-allocate for typical batch size
@@ -323,6 +341,8 @@ impl Workspace {
 
         // basis_values: [batch, input, basis]
         self.basis_values.reserve(batch_size * input_dim * basis);
+        self.basis_derivs
+            .reserve(batch_size * input_dim * basis);
 
         // grid_indices: [batch, input]
         self.grid_indices.reserve(batch_size * input_dim);
@@ -334,19 +354,8 @@ impl Workspace {
         self.layer_output.reserve(batch_size * max_dim);
         self.layer_input.reserve(batch_size * max_dim);
 
-        // basis_grads: same as basis_values
-        self.basis_grads.reserve(batch_size * input_dim * basis);
-
-        // output_grads: [batch, output]
-        self.output_grads.reserve(batch_size * config.output_dim);
-
-        // weight_grads: max layer weights
-        let max_weights = dims
-            .windows(2)
-            .map(|w| w[0] * w[1] * basis)
-            .max()
-            .unwrap_or(0);
-        self.weight_grads.reserve(max_weights);
+        // layer_grads: [batch, max_dim]
+        self.layer_grads.reserve(batch_size * max_dim);
 
         self.batch_capacity = batch_size;
         self.max_dim = max_dim;
@@ -362,13 +371,77 @@ impl Workspace {
 
         self.z_buffer.resize(batch_size * input_dim);
         self.basis_values.resize(batch_size * input_dim * basis);
+        self.basis_derivs.resize(batch_size * input_dim * basis);
         self.grid_indices.resize(batch_size * input_dim, 0);
+    }
+
+    /// Prepares workspace for training with history tracking.
+    #[inline]
+    pub fn prepare_training(
+        &mut self,
+        batch_size: usize,
+        config: &KanConfig,
+        layer_dims: &[usize],
+    ) {
+        self.reserve(batch_size, config);
+
+        let num_layers = layer_dims.len().saturating_sub(1);
+        if self.layers_inputs.len() < num_layers {
+            self.layers_inputs
+                .resize_with(num_layers, AlignedBuffer::new);
+        }
+        if self.layers_grid_indices.len() < num_layers {
+            self.layers_grid_indices
+                .resize_with(num_layers, Vec::new);
+        }
+
+        let basis = config.basis_size_aligned();
+        let max_in_dim = *layer_dims.iter().max().unwrap_or(&config.input_dim);
+
+        // Ensure history buffers sized per layer
+        for (layer_idx, in_dim) in layer_dims.iter().copied().enumerate().take(num_layers) {
+            let needed = batch_size * in_dim;
+
+            let buf = &mut self.layers_inputs[layer_idx];
+            buf.reserve(needed);
+            buf.resize(needed);
+
+            let indices = &mut self.layers_grid_indices[layer_idx];
+            if indices.len() < needed {
+                indices.resize(needed, 0);
+            } else {
+                indices.truncate(needed);
+            }
+        }
+
+        // Gradient ping-pong buffer
+        self.layer_grads.reserve(batch_size * max_in_dim);
+        self.layer_grads.resize(batch_size * max_in_dim);
+
+        // Derivatives buffer (same layout as basis_values)
+        self.basis_derivs
+            .reserve(batch_size * max_in_dim * basis);
+        self.basis_derivs
+            .resize(batch_size * max_in_dim * basis);
+
+        self.history_batch_size = batch_size;
     }
 
     /// Current batch capacity.
     #[inline]
     pub fn batch_capacity(&self) -> usize {
         self.batch_capacity
+    }
+
+    /// Asserts that workspace is properly sized for the batch.
+    #[inline]
+    pub fn assert_history_batch(&self, batch_size: usize) {
+        assert!(
+            self.history_batch_size == batch_size,
+            "Workspace history batch {} != requested {}",
+            self.history_batch_size,
+            batch_size
+        );
     }
 
     /// Asserts that workspace is properly sized for the batch.
