@@ -52,6 +52,9 @@ pub struct KanConfig {
 
     /// SIMD vector width for basis alignment (8 for AVX2, 16 for AVX-512).
     pub simd_width: usize,
+
+    /// Optional seed for deterministic initialization (None => random).
+    pub init_seed: Option<u64>,
 }
 
 impl Default for KanConfig {
@@ -67,6 +70,7 @@ impl Default for KanConfig {
             input_std: vec![1.0; 21],
             multithreading_threshold: 128,
             simd_width: 8, // AVX2
+            init_seed: None,
         }
     }
 }
@@ -89,6 +93,7 @@ impl KanConfig {
             input_std: vec![0.3; 21],  // Will be computed from data
             multithreading_threshold: 128,
             simd_width: 8,
+            init_seed: None,
         }
     }
 
@@ -143,6 +148,7 @@ impl KanConfig {
         if self.input_std.len() != self.input_dim {
             return Err(ConfigError::MismatchedNormalization("input_std"));
         }
+        // init_seed: any value is acceptable, None => random
         // SIMD width must be a power of 2 (4, 8, 16)
         if !matches!(self.simd_width, 4 | 8 | 16) {
             return Err(ConfigError::InvalidSimdWidth(self.simd_width));
@@ -159,8 +165,8 @@ impl KanConfig {
 
     /// Updates normalization parameters from data statistics.
     pub fn set_normalization(&mut self, mean: Vec<f32>, std: Vec<f32>) {
-        assert_eq!(mean.len(), self.input_dim);
-        assert_eq!(std.len(), self.input_dim);
+        debug_assert_eq!(mean.len(), self.input_dim);
+        debug_assert_eq!(std.len(), self.input_dim);
         self.input_mean = mean;
         self.input_std = std.into_iter().map(|s| s.max(EPSILON)).collect();
     }

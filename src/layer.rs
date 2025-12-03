@@ -20,6 +20,8 @@
 use crate::buffer::Workspace;
 use crate::config::{KanConfig, EPSILON};
 use crate::spline::{compute_basis, compute_basis_and_deriv, compute_knots, find_span};
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use wide::{f32x4, f32x8};
 
 #[cfg(feature = "serde")]
@@ -96,12 +98,13 @@ impl KanLayer {
         // Initialize weights with small random values (Xavier-like)
         let total_weights = out_dim * in_dim * global_basis_size;
         let scale = (2.0 / (in_dim + out_dim) as f32).sqrt() * 0.1;
+        let mut rng: SmallRng = if let Some(seed) = config.init_seed {
+            SmallRng::seed_from_u64(seed)
+        } else {
+            SmallRng::from_entropy()
+        };
         let weights = (0..total_weights)
-            .map(|i| {
-                // Simple deterministic "random" for reproducibility
-                let hash = ((i as u64 * 2654435761) % 1000) as f32 / 1000.0 - 0.5;
-                hash * scale
-            })
+            .map(|_| rng.gen_range(-0.5f32..0.5f32) * scale)
             .collect();
 
         let bias = vec![0.0; out_dim];
@@ -445,6 +448,7 @@ impl KanLayer {
     }
 
     /// Backward pass: computes gradients for weights and bias.
+    #[allow(clippy::too_many_arguments)]
     pub fn backward(
         &self,
         normalized_input: &[f32],
@@ -534,7 +538,8 @@ impl KanLayer {
                         if let Some(ref mut gi) = grad_input {
                             let deriv = deriv_slice[basis_start + k];
                             let std_inv = 1.0 / self.std[i].max(EPSILON);
-                            gi[span_batch_start + i] += g_out * self.weights[weight_idx] * deriv * std_inv;
+                            gi[span_batch_start + i] +=
+                                g_out * self.weights[weight_idx] * deriv * std_inv;
                         }
                     }
                 }
@@ -559,6 +564,7 @@ mod tests {
             input_std: vec![1.0; 4],
             multithreading_threshold: 128,
             simd_width: 8,
+            init_seed: None,
         }
     }
 

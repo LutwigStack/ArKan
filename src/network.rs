@@ -25,6 +25,7 @@ pub struct KanNetwork {
 
 /// Настройки обучения для одного шага.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TrainOptions {
     /// Максимальная норма градиента (L2) для клиппинга. None — без клиппинга.
     pub max_grad_norm: Option<f32>,
@@ -337,88 +338,7 @@ impl KanNetwork {
         }
     }
 
-    /// Multi-layer forward pass using ping-pong buffers.
-    ///
-    /// Uses layer_output and layer_input as alternating buffers.
-    /// Minimal allocations after initial reserve().
-    fn forward_batch_multilayer(
-        &self,
-        input: &[f32],
-        output: &mut [f32],
-        workspace: &mut Workspace,
-        batch_size: usize,
-    ) {
-        // Calculate max dimension for ping-pong buffers
-        let max_hidden = self
-            .layer_dims
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(self.config.input_dim);
-
-        // Ensure ping-pong buffers are sized
-        let ping_pong_size = batch_size * max_hidden;
-        workspace.layer_output.resize(ping_pong_size);
-        workspace.layer_input.resize(ping_pong_size);
-
-        // Track which buffer currently holds the latest output
-        let mut use_output_as_current = true;
-
-        // First layer: external input → layer_output
-        {
-            let layer = &self.layers[0];
-            let out_size = batch_size * layer.out_dim;
-
-            // Use temporary vec for output to avoid borrow conflict
-            let mut temp_out = vec![0.0f32; out_size];
-            layer.forward_batch(input, &mut temp_out, workspace);
-            workspace.layer_output.as_mut_slice()[..out_size].copy_from_slice(&temp_out);
-        }
-
-        // Hidden layers: ping-pong between layer_output and layer_input
-        for i in 1..self.layers.len() - 1 {
-            let layer = &self.layers[i];
-            let in_size = batch_size * layer.in_dim;
-            let out_size = batch_size * layer.out_dim;
-
-            // Copy input to owned vec to avoid borrow issues
-            let input_copy: Vec<f32> = if use_output_as_current {
-                workspace.layer_output.as_slice()[..in_size].to_vec()
-            } else {
-                workspace.layer_input.as_slice()[..in_size].to_vec()
-            };
-
-            // Forward to temp, then copy to target buffer
-            let mut temp_out = vec![0.0f32; out_size];
-            layer.forward_batch(&input_copy, &mut temp_out, workspace);
-
-            if use_output_as_current {
-                workspace.layer_input.as_mut_slice()[..out_size].copy_from_slice(&temp_out);
-            } else {
-                workspace.layer_output.as_mut_slice()[..out_size].copy_from_slice(&temp_out);
-            }
-
-            use_output_as_current = !use_output_as_current;
-        }
-
-        // Last layer: current buffer → external output
-        {
-            let layer = self.layers.last().unwrap();
-            let in_size = batch_size * layer.in_dim;
-
-            // Copy to owned vec
-            let input_copy: Vec<f32> = if use_output_as_current {
-                workspace.layer_output.as_slice()[..in_size].to_vec()
-            } else {
-                workspace.layer_input.as_slice()[..in_size].to_vec()
-            };
-
-            layer.forward_batch(&input_copy, output, workspace);
-        }
-    }
-
     /// Full training step: forward + backward + update.
-    ///
     /// Returns the loss value.
     pub fn train_step(
         &mut self,
@@ -429,14 +349,7 @@ impl KanNetwork {
         workspace: &mut Workspace,
     ) -> f32 {
         let opts = self.default_train_options;
-        self.train_step_with_options(
-            input,
-            target,
-            mask,
-            learning_rate,
-            workspace,
-            &opts,
-        )
+        self.train_step_with_options(input, target, mask, learning_rate, workspace, &opts)
     }
 
     /// Полноценный шаг обучения с опциями.
@@ -560,11 +473,7 @@ impl KanNetwork {
                 }
             }
 
-            for (w, g) in layer
-                .weights
-                .iter_mut()
-                .zip(weight_grads_all[i].iter())
-            {
+            for (w, g) in layer.weights.iter_mut().zip(weight_grads_all[i].iter()) {
                 *w -= learning_rate * g;
             }
             for (b, g) in layer.bias.iter_mut().zip(bias_grads_all[i].iter()) {
@@ -607,7 +516,7 @@ impl Clone for KanNetwork {
 }
 
 /// Computes masked MSE loss and gradient.
-    fn compute_masked_mse_loss(
+fn compute_masked_mse_loss(
     predictions: &[f32],
     targets: &[f32],
     mask: Option<&[f32]>,
@@ -725,6 +634,7 @@ mod tests {
             input_std: vec![1.0; 4],
             multithreading_threshold: 1024,
             simd_width: 8,
+            init_seed: None,
         };
 
         let network = KanNetwork::new(config);
@@ -753,6 +663,7 @@ mod tests {
             input_std: vec![1.0; 4],
             multithreading_threshold: 1024,
             simd_width: 8,
+            init_seed: None,
         };
 
         let network = KanNetwork::new(config.clone());
@@ -781,6 +692,7 @@ mod tests {
             input_std: vec![1.0; 2],
             multithreading_threshold: 16,
             simd_width: 4,
+            init_seed: None,
         };
 
         let mut network = KanNetwork::new(config.clone());
@@ -867,6 +779,7 @@ mod tests {
             input_std: vec![1.0; 2],
             multithreading_threshold: 16,
             simd_width: 4,
+            init_seed: None,
         };
 
         let mut network = KanNetwork::new(config.clone());
