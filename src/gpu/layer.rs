@@ -309,6 +309,72 @@ impl GpuLayer {
     pub fn param_count(&self) -> usize {
         self.weight_count() + self.bias_count()
     }
+    
+    // ==================== Backward Pass Support ====================
+    
+    /// Creates the bind group layout for backward pass.
+    ///
+    /// Group 0 (backward):
+    /// - Binding 0: Weights (storage, read)
+    /// - Binding 1: BackwardUniforms (uniform)
+    pub fn create_backward_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("GpuLayer Backward BindGroupLayout"),
+            entries: &[
+                // Weights (storage, read-only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // BackwardUniforms (uniform)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        })
+    }
+    
+    /// Creates a backward bind group for this layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - The wgpu device.
+    /// * `layout` - The backward bind group layout.
+    /// * `backward_uniforms_buffer` - Buffer containing BackwardUniforms.
+    pub fn create_backward_bind_group(
+        &self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        backward_uniforms_buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("GpuLayer Backward BindGroup"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.weights.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: backward_uniforms_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
 }
 
 impl std::fmt::Debug for GpuLayer {

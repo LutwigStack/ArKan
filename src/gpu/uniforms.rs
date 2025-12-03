@@ -228,6 +228,104 @@ impl SimpleUniforms {
     }
 }
 
+/// Backward pass uniform buffer.
+///
+/// Used for gradient computation in backward pass.
+///
+/// # Layout
+///
+/// Total size: 48 bytes (3 × vec4), aligned to 16 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct BackwardUniforms {
+    // First vec4 (16 bytes)
+    /// Minimum value of the spline grid.
+    pub grid_min: f32,
+    /// Maximum value of the spline grid.
+    pub grid_max: f32,
+    /// Number of grid intervals.
+    pub grid_size: u32,
+    /// Spline order (degree).
+    pub order: u32,
+
+    // Second vec4 (16 bytes)
+    /// Input dimension.
+    pub in_dim: u32,
+    /// Output dimension.
+    pub out_dim: u32,
+    /// Padded basis size.
+    pub basis_padded: u32,
+    /// Current batch size.
+    pub batch_size: u32,
+
+    // Third vec4 (16 bytes) - backward specific
+    /// Whether to compute input gradients (1 = yes, 0 = no).
+    pub compute_input_grad: u32,
+    /// Padding for alignment.
+    pub _pad1: u32,
+    pub _pad2: u32,
+    pub _pad3: u32,
+}
+
+impl BackwardUniforms {
+    /// Creates backward uniforms from layer uniforms.
+    pub fn new(base: &LayerUniforms, compute_input_grad: bool) -> Self {
+        Self {
+            grid_min: base.grid_min,
+            grid_max: base.grid_max,
+            grid_size: base.grid_size,
+            order: base.order,
+            in_dim: base.in_dim,
+            out_dim: base.out_dim,
+            basis_padded: base.basis_padded,
+            batch_size: base.batch_size,
+            compute_input_grad: if compute_input_grad { 1 } else { 0 },
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        }
+    }
+
+    /// Returns the size in bytes.
+    pub const fn size_bytes() -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// Bias gradient reduction uniform buffer.
+///
+/// # Layout
+///
+/// Total size: 16 bytes (1 × vec4), aligned to 16 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct BiasUniforms {
+    /// Output dimension.
+    pub out_dim: u32,
+    /// Batch size.
+    pub batch_size: u32,
+    /// Padding.
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+impl BiasUniforms {
+    /// Creates bias uniforms.
+    pub fn new(out_dim: u32, batch_size: u32) -> Self {
+        Self {
+            out_dim,
+            batch_size,
+            _pad1: 0,
+            _pad2: 0,
+        }
+    }
+
+    /// Returns the size in bytes.
+    pub const fn size_bytes() -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +346,18 @@ mod tests {
     fn test_simple_uniforms_size() {
         // Must be 16 bytes (1 vec4)
         assert_eq!(SimpleUniforms::size_bytes(), 16);
+    }
+
+    #[test]
+    fn test_backward_uniforms_size() {
+        // Must be 48 bytes (3 vec4)
+        assert_eq!(BackwardUniforms::size_bytes(), 48);
+    }
+
+    #[test]
+    fn test_bias_uniforms_size() {
+        // Must be 16 bytes (1 vec4)
+        assert_eq!(BiasUniforms::size_bytes(), 16);
     }
 
     #[test]

@@ -44,6 +44,68 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 * **Cache-Friendly Layout:** Веса хранятся в формате `[Output][Input][Basis]` для последовательного доступа к памяти и минимизации промахов кэша.  
 * **Standalone:** Минимальные зависимости (`rayon`, `wide`). Не тянет за собой `torch` или `burn`, идеально для встраивания.  
 * **Quantization Ready:** Архитектура подготовлена для работы с квантованными весами (baked models) для дальнейшего ускорения.
+* **GPU-ускорение (wgpu):** Опциональный GPU бэкенд с WGSL compute шейдерами для параллельного forward/backward.
+
+## **GPU Backend (Опционально)**
+
+ArKan включает опциональный GPU бэкенд на основе `wgpu` для WebGPU/Vulkan/Metal/DX12 ускорения.
+
+### **Установка**
+
+```toml
+[dependencies]
+arkan = { version = "0.1.1", features = ["gpu"] }
+```
+
+### **Использование**
+
+```rust
+use arkan::{KanConfig, KanNetwork};
+use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork};
+use arkan::optimizer::{Adam, AdamConfig};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Инициализация GPU бэкенда
+    let backend = WgpuBackend::init(WgpuOptions::default())?;
+    println!("GPU: {}", backend.adapter_name());
+
+    // Создание CPU сети
+    let config = KanConfig::preset();
+    let mut cpu_network = KanNetwork::new(config.clone());
+
+    // Создание GPU сети из CPU сети
+    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)?;
+    let mut workspace = gpu_network.create_workspace(64)?;
+
+    // Forward инференс
+    let input = vec![0.5f32; config.input_dim];
+    let output = gpu_network.forward_single(&input, &mut workspace)?;
+
+    // Обучение с Adam оптимизатором
+    let mut optimizer = Adam::new(&cpu_network, AdamConfig::with_lr(0.001));
+    let target = vec![1.0f32; config.output_dim];
+
+    let loss = gpu_network.train_step_mse(
+        &input, &target, 1,
+        &mut workspace, &mut optimizer, &mut cpu_network
+    )?;
+
+    println!("Loss: {}", loss);
+    Ok(())
+}
+```
+
+### **GPU возможности**
+
+| Функция | Статус |
+|---------|--------|
+| Forward инференс | ✅ |
+| Forward training (сохранение активаций) | ✅ |
+| Backward pass | ✅ (CPU fallback) |
+| Adam/SGD оптимизатор | ✅ |
+| Синхронизация весов CPU↔GPU | ✅ |
+| Многослойные сети | ✅ |
+| Batch обработка | ✅ |
 
 ## **Бенчмарки (CPU)**
 
@@ -166,6 +228,68 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 * **Cache-Friendly Layout:** Weights are stored in `[Output][Input][Basis]` format for sequential memory access and minimal cache misses.  
 * **Standalone:** Minimal dependencies (`rayon`, `wide`). No `torch` or `burn` bloat, ideal for embedding.  
 * **Quantization Ready:** Architecture is ready for quantized weights (baked models) for further acceleration.
+* **GPU Acceleration (wgpu):** Optional GPU backend with WGSL compute shaders for parallel forward/backward passes.
+
+## **GPU Backend (Optional)**
+
+ArKan includes an optional GPU backend using `wgpu` for WebGPU/Vulkan/Metal/DX12 acceleration.
+
+### **Installation**
+
+```toml
+[dependencies]
+arkan = { version = "0.1.1", features = ["gpu"] }
+```
+
+### **Usage**
+
+```rust
+use arkan::{KanConfig, KanNetwork};
+use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork};
+use arkan::optimizer::{Adam, AdamConfig};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize GPU backend
+    let backend = WgpuBackend::init(WgpuOptions::default())?;
+    println!("GPU: {}", backend.adapter_name());
+
+    // Create CPU network
+    let config = KanConfig::preset();
+    let mut cpu_network = KanNetwork::new(config.clone());
+
+    // Create GPU network from CPU network
+    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)?;
+    let mut workspace = gpu_network.create_workspace(64)?;
+
+    // Forward inference
+    let input = vec![0.5f32; config.input_dim];
+    let output = gpu_network.forward_single(&input, &mut workspace)?;
+
+    // Training with Adam optimizer
+    let mut optimizer = Adam::new(&cpu_network, AdamConfig::with_lr(0.001));
+    let target = vec![1.0f32; config.output_dim];
+
+    let loss = gpu_network.train_step_mse(
+        &input, &target, 1, 
+        &mut workspace, &mut optimizer, &mut cpu_network
+    )?;
+
+    println!("Loss: {}", loss);
+    Ok(())
+}
+```
+
+### **GPU Features**
+
+| Feature | Status |
+|---------|--------|
+| Forward inference | ✅ |
+| Forward training (saves activations) | ✅ |
+| Backward pass | ✅ (CPU fallback) |
+| Adam/SGD optimizer | ✅ |
+| Weight sync CPU↔GPU | ✅ |
+| Multi-layer networks | ✅ |
+| Batch processing | ✅ |
 
 ## **Benchmarks (CPU)**
 
