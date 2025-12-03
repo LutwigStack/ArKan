@@ -36,7 +36,7 @@ fn bench_gpu_forward(c: &mut Criterion) {
         }
     };
 
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let cpu_network = KanNetwork::new(config.clone());
     
     // Create GPU network
@@ -86,7 +86,7 @@ fn bench_cpu_vs_gpu(c: &mut Criterion) {
         Err(_) => return,
     };
 
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let cpu_network = KanNetwork::new(config.clone());
     
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {

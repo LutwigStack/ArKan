@@ -22,7 +22,7 @@
 //! use arkan::{KanConfig, KanNetwork};
 //!
 //! // Create a network with poker-optimized architecture
-//! let config = KanConfig::default_poker(); // [21, 64, 64, 24]
+//! let config = KanConfig::preset(); // [21, 64, 64, 24]
 //! let network = KanNetwork::new(config.clone());
 //!
 //! // Preallocate workspace (reuse across calls for zero-alloc)
@@ -45,7 +45,7 @@
 //! ```rust
 //! use arkan::{KanConfig, KanNetwork};
 //!
-//! let config = KanConfig::default_poker();
+//! let config = KanConfig::preset();
 //! let mut network = KanNetwork::new(config.clone());
 //! let mut workspace = network.create_workspace(64);
 //!
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn test_quick_start_example() {
         // This test ensures the Quick Start example in docs compiles
-        let config = KanConfig::default_poker();
+        let config = KanConfig::preset();
         let network = KanNetwork::new(config.clone());
         let mut workspace = network.create_workspace(1);
 

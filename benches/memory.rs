@@ -61,7 +61,7 @@ fn estimate_memory_bytes(config: &KanConfig, batch_size: usize) -> usize {
 
 /// Benchmark with explicit memory throughput measurement
 fn bench_memory_throughput(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256, 1024];
@@ -88,7 +88,7 @@ fn bench_memory_throughput(c: &mut Criterion) {
 
 /// Manual timing to compute GB/s
 fn bench_manual_bandwidth(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let network = KanNetwork::new(config.clone());
 
     let batch = 256_usize;
@@ -145,7 +145,7 @@ fn bench_manual_bandwidth(c: &mut Criterion) {
 
 /// Cache pressure analysis - vary batch size to see cache effects
 fn bench_cache_pressure(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let network = KanNetwork::new(config.clone());
 
     // Batch sizes designed to stress different cache levels
@@ -184,7 +184,7 @@ fn bench_cache_pressure(c: &mut Criterion) {
 
 /// Workspace allocation vs reuse comparison
 fn bench_workspace_reuse(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let network = KanNetwork::new(config.clone());
 
     let batch = 64_usize;

@@ -34,7 +34,7 @@ fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> V
 /// Benchmark forward pass only (for comparison with backward).
 /// Measures pure inference without saving history for backward pass.
 fn bench_forward_only(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256];
@@ -58,7 +58,7 @@ fn bench_forward_only(c: &mut Criterion) {
 
 /// Benchmark forward_batch_training (stores intermediate values for backward)
 fn bench_forward_training(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256];
@@ -87,7 +87,7 @@ fn bench_forward_training(c: &mut Criterion) {
 /// Benchmark full train_step (forward + backward + SGD update)
 /// Compare with forward_only to understand backward overhead
 fn bench_full_train_step(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let mut network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256];
@@ -118,7 +118,7 @@ fn bench_full_train_step(c: &mut Criterion) {
 /// Compute backward overhead by comparing train_step vs forward_training
 /// backward_time ≈ train_step_time - forward_training_time
 fn bench_backward_overhead(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let mut network = KanNetwork::new(config.clone());
 
     // Fixed batch for detailed analysis

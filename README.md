@@ -93,7 +93,7 @@ use arkan::{KanConfig, KanNetwork};
 
 fn main() {
     // 1. Конфигурация (Poker Solver preset)
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
 
     // 2. Инициализация сети
     let network = KanNetwork::new(config.clone());
@@ -216,7 +216,7 @@ use arkan::{KanConfig, KanNetwork};
 
 fn main() {
     // 1. Configuration (Poker Solver preset)
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
 
     // 2. Network initialization
     let network = KanNetwork::new(config.clone());

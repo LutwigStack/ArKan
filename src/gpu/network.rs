@@ -24,7 +24,7 @@ use std::sync::Arc;
 /// use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork};
 ///
 /// // Create CPU network
-/// let config = KanConfig::default_poker();
+/// let config = KanConfig::preset();
 /// let cpu_network = KanNetwork::new(config);
 ///
 /// // Initialize GPU backend

@@ -27,7 +27,7 @@
 //! ```rust
 //! use arkan::{KanConfig, KanLayer};
 //!
-//! let config = KanConfig::default_poker();
+//! let config = KanConfig::preset();
 //! let layer = KanLayer::new(4, 8, &config);
 //!
 //! // Single sample forward pass
@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 /// ```rust
 /// use arkan::{KanConfig, KanLayer};
 ///
-/// let config = KanConfig::default_poker();
+/// let config = KanConfig::preset();
 /// let layer = KanLayer::new(4, 8, &config);
 ///
 /// assert_eq!(layer.in_dim, 4);
@@ -140,7 +140,7 @@ impl KanLayer {
     /// ```rust
     /// use arkan::{KanConfig, KanLayer};
     ///
-    /// let config = KanConfig::default_poker();
+    /// let config = KanConfig::preset();
     /// let layer = KanLayer::new(10, 20, &config);
     /// ```
     pub fn new(in_dim: usize, out_dim: usize, config: &KanConfig) -> Self {
@@ -265,7 +265,7 @@ impl KanLayer {
     /// ```rust
     /// use arkan::{KanConfig, KanLayer};
     ///
-    /// let config = KanConfig::default_poker();
+    /// let config = KanConfig::preset();
     /// let layer = KanLayer::new(4, 8, &config);
     ///
     /// let input = vec![0.1, 0.2, 0.3, 0.4];

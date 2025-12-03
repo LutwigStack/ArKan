@@ -9,7 +9,7 @@
 //! use arkan::KanConfig;
 //!
 //! // Use preset for poker solver
-//! let config = KanConfig::default_poker();
+//! let config = KanConfig::preset();
 //! assert_eq!(config.layer_dims(), vec![21, 64, 64, 24]);
 //!
 //! // Or customize
@@ -83,7 +83,7 @@ pub const fn basis_size(grid_size: usize, spline_order: usize) -> usize {
 /// use arkan::KanConfig;
 ///
 /// // Preset for poker solver (recommended starting point)
-/// let config = KanConfig::default_poker();
+/// let config = KanConfig::preset();
 ///
 /// // Custom configuration
 /// let config = KanConfig {
@@ -175,10 +175,10 @@ impl KanConfig {
     /// ```rust
     /// use arkan::KanConfig;
     ///
-    /// let config = KanConfig::default_poker();
+    /// let config = KanConfig::preset();
     /// assert_eq!(config.layer_dims(), vec![21, 64, 64, 24]);
     /// ```
-    pub fn default_poker() -> Self {
+    pub fn preset() -> Self {
         Self {
             input_dim: 21,
             output_dim: 24,
@@ -210,7 +210,7 @@ impl KanConfig {
     /// ```rust
     /// use arkan::KanConfig;
     ///
-    /// let config = KanConfig::default_poker();
+    /// let config = KanConfig::preset();
     /// // basis_size=8 is already aligned to simd_width=8
     /// assert_eq!(config.basis_size_aligned(), 8);
     /// ```
@@ -235,7 +235,7 @@ impl KanConfig {
     /// ```rust
     /// use arkan::KanConfig;
     ///
-    /// let config = KanConfig::default_poker();
+    /// let config = KanConfig::preset();
     /// assert_eq!(config.layer_dims(), vec![21, 64, 64, 24]);
     /// ```
     pub fn layer_dims(&self) -> Vec<usize> {
@@ -265,7 +265,7 @@ impl KanConfig {
     /// ```rust
     /// use arkan::KanConfig;
     ///
-    /// let config = KanConfig::default_poker();
+    /// let config = KanConfig::preset();
     /// assert!(config.validate().is_ok());
     ///
     /// let bad_config = KanConfig {
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_poker_config() {
-        let config = KanConfig::default_poker();
+        let config = KanConfig::preset();
         assert!(config.validate().is_ok());
         assert_eq!(config.input_dim, 21);
         assert_eq!(config.output_dim, 24);
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_layer_dims() {
-        let config = KanConfig::default_poker();
+        let config = KanConfig::preset();
         let dims = config.layer_dims();
         assert_eq!(dims, vec![21, 64, 64, 24]);
     }

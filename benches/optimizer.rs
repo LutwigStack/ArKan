@@ -23,7 +23,7 @@ fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> V
 
 /// Benchmark raw train_step (inline SGD, no momentum)
 fn bench_raw_train_step(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let mut network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256];
@@ -53,7 +53,7 @@ fn bench_raw_train_step(c: &mut Criterion) {
 
 /// Benchmark train_step with gradient clipping
 fn bench_train_step_clipping(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let mut network = KanNetwork::new(config.clone());
 
     let batch = 64_usize;
@@ -138,7 +138,7 @@ fn bench_train_step_clipping(c: &mut Criterion) {
 
 /// Optimizer initialization cost
 fn bench_optimizer_init(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let network = KanNetwork::new(config.clone());
 
     let mut group = c.benchmark_group("optimizer_init");
@@ -179,7 +179,7 @@ fn bench_optimizer_init(c: &mut Criterion) {
 
 /// Compare different learning rates overhead (should be negligible)
 fn bench_learning_rates(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let mut network = KanNetwork::new(config.clone());
 
     let batch = 64_usize;

@@ -8,7 +8,7 @@
 //! ```rust
 //! use arkan::{KanConfig, KanNetwork};
 //!
-//! let config = KanConfig::default_poker();
+//! let config = KanConfig::preset();
 //! let network = KanNetwork::new(config.clone());
 //! let mut workspace = network.create_workspace(1);
 //!
@@ -24,7 +24,7 @@
 //! ```rust
 //! use arkan::{KanConfig, KanNetwork, TrainOptions};
 //!
-//! let config = KanConfig::default_poker();
+//! let config = KanConfig::preset();
 //! let mut network = KanNetwork::new(config.clone());
 //! let mut workspace = network.create_workspace(64);
 //!
@@ -142,7 +142,7 @@ impl KanNetwork {
     /// ```rust
     /// use arkan::{KanConfig, KanNetwork};
     ///
-    /// let config = KanConfig::default_poker();
+    /// let config = KanConfig::preset();
     /// let network = KanNetwork::new(config);
     ///
     /// assert_eq!(network.num_layers(), 3); // 2 hidden + 1 output
@@ -183,7 +183,7 @@ impl KanNetwork {
     /// ```rust
     /// use arkan::{KanConfig, KanNetwork, TrainOptions};
     ///
-    /// let mut network = KanNetwork::new(KanConfig::default_poker());
+    /// let mut network = KanNetwork::new(KanConfig::preset());
     /// network.set_default_train_options(TrainOptions {
     ///     max_grad_norm: Some(1.0),
     ///     weight_decay: 0.01,
@@ -206,7 +206,7 @@ impl KanNetwork {
     /// ```rust
     /// use arkan::{KanConfig, KanNetwork};
     ///
-    /// let network = KanNetwork::new(KanConfig::default_poker());
+    /// let network = KanNetwork::new(KanConfig::preset());
     /// println!("Parameters: {}", network.param_count()); // ~56K
     /// ```
     pub fn param_count(&self) -> usize {
@@ -249,7 +249,7 @@ impl KanNetwork {
     /// ```rust
     /// use arkan::{KanConfig, KanNetwork};
     ///
-    /// let config = KanConfig::default_poker();
+    /// let config = KanConfig::preset();
     /// let network = KanNetwork::new(config.clone());
     /// let mut workspace = network.create_workspace(1);
     ///
@@ -396,7 +396,7 @@ impl KanNetwork {
     /// ```rust
     /// use arkan::{KanConfig, KanNetwork};
     ///
-    /// let config = KanConfig::default_poker();
+    /// let config = KanConfig::preset();
     /// let network = KanNetwork::new(config.clone());
     /// let mut workspace = network.create_workspace(64);
     ///
@@ -613,7 +613,7 @@ impl KanNetwork {
     /// ```rust
     /// use arkan::{KanConfig, KanNetwork};
     ///
-    /// let config = KanConfig::default_poker();
+    /// let config = KanConfig::preset();
     /// let mut network = KanNetwork::new(config.clone());
     /// let mut workspace = network.create_workspace(64);
     ///
@@ -864,7 +864,7 @@ impl KanNetwork {
     /// ```rust
     /// use arkan::{KanConfig, KanNetwork};
     ///
-    /// let network = KanNetwork::new(KanConfig::default_poker());
+    /// let network = KanNetwork::new(KanConfig::preset());
     ///
     /// // Create workspace for batches up to 64
     /// let mut workspace = network.create_workspace(64);
@@ -887,7 +887,7 @@ impl KanNetwork {
     /// ```rust,ignore
     /// use arkan::{KanConfig, KanNetwork};
     ///
-    /// let network = KanNetwork::new(KanConfig::default_poker());
+    /// let network = KanNetwork::new(KanConfig::preset());
     /// let bytes = network.to_bytes().unwrap();
     /// std::fs::write("model.bin", &bytes).unwrap();
     /// ```
@@ -1010,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_network_creation() {
-        let config = KanConfig::default_poker();
+        let config = KanConfig::preset();
         let network = KanNetwork::new(config);
 
         // 21 → 64 → 64 → 24: 3 layers
@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn test_network_forward_single() {
-        let config = KanConfig::default_poker();
+        let config = KanConfig::preset();
         let network = KanNetwork::new(config.clone());
         let mut workspace = network.create_workspace(1);
 
@@ -1036,7 +1036,7 @@ mod tests {
 
     #[test]
     fn test_network_forward_batch() {
-        let config = KanConfig::default_poker();
+        let config = KanConfig::preset();
         let network = KanNetwork::new(config.clone());
         let mut workspace = network.create_workspace(32);
 
@@ -1053,7 +1053,7 @@ mod tests {
 
     #[test]
     fn test_network_train_step() {
-        let config = KanConfig::default_poker();
+        let config = KanConfig::preset();
         let mut network = KanNetwork::new(config.clone());
         let mut workspace = network.create_workspace(16);
 

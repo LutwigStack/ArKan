@@ -26,7 +26,7 @@ fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> V
 }
 
 fn bench_forward(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
 
     let batch_sizes = [1_usize, 8, 16, 64, 256];
     let mut group = c.benchmark_group("forward_batch");
@@ -52,7 +52,7 @@ fn bench_forward(c: &mut Criterion) {
 }
 
 fn bench_train_step(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
 
     let batch_sizes = [1_usize, 8, 16, 64, 256];
     let mut group = c.benchmark_group("train_step");

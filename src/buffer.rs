@@ -13,7 +13,7 @@
 //! ```rust
 //! use arkan::{KanConfig, KanNetwork, Workspace};
 //!
-//! let config = KanConfig::default_poker();
+//! let config = KanConfig::preset();
 //! let network = KanNetwork::new(config.clone());
 //!
 //! // Allocate workspace once for max batch size
@@ -364,7 +364,7 @@ impl<'de> Deserialize<'de> for AlignedBuffer {
 /// ```rust
 /// use arkan::{KanConfig, KanNetwork};
 ///
-/// let network = KanNetwork::new(KanConfig::default_poker());
+/// let network = KanNetwork::new(KanConfig::preset());
 /// let mut workspace = network.create_workspace(64);
 ///
 /// // Reuse workspace for all calls
@@ -727,7 +727,7 @@ mod tests {
 
     #[test]
     fn test_workspace_reserve() {
-        let config = KanConfig::default_poker();
+        let config = KanConfig::preset();
         let mut ws = Workspace::new(&config);
 
         // Initial capacity
@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_workspace_prepare_forward() {
-        let config = KanConfig::default_poker();
+        let config = KanConfig::preset();
         let mut ws = Workspace::new(&config);
 
         ws.prepare_forward(64, &config);

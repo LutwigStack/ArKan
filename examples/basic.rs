@@ -2,7 +2,7 @@ use arkan::{KanConfig, KanNetwork};
 
 fn main() {
     // Build a default config (poker preset) and network.
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let network = KanNetwork::new(config.clone());
 
     // Preallocate workspace for the maximum batch we expect (here: 8).
