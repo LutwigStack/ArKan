@@ -53,7 +53,7 @@ fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> V
 
 #[cfg(feature = "gpu")]
 fn bench_gpu_forward(c: &mut Criterion) {
-    // Check if --gpu flag is enabled (CI-safe: skip if not)
+    // Check if ARKAN_GPU_BENCH=1 is set (CI-safe: skip if not)
     if !gpu_flag_enabled() {
         eprintln!("GPU benchmarks skipped (ARKAN_GPU_BENCH not set).");
         eprintln!("Run with: $env:ARKAN_GPU_BENCH=\"1\"; cargo bench --bench gpu_forward --features gpu");
@@ -116,7 +116,7 @@ fn bench_gpu_forward(c: &mut Criterion) {
 
 #[cfg(feature = "gpu")]
 fn bench_cpu_vs_gpu(c: &mut Criterion) {
-    // Check if --gpu flag is enabled
+    // Check if ARKAN_GPU_BENCH=1 is set
     if !gpu_flag_enabled() {
         return;
     }

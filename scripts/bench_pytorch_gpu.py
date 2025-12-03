@@ -641,7 +641,10 @@ def main():
     
     print("\n" + "=" * 70)
     print("Compare with ArKan GPU:")
-    print("  cargo bench --bench gpu_forward --bench gpu_backward --features gpu -- --gpu")
+    print("  # Windows PowerShell:")
+    print("  $env:ARKAN_GPU_BENCH='1'; cargo bench --bench gpu_forward --bench gpu_backward --features gpu")
+    print("  # Linux/macOS:")
+    print("  ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --bench gpu_backward --features gpu")
     print("=" * 70)
 
 

@@ -54,10 +54,10 @@ fn make_targets(dim: usize, batch: usize, seed: u64) -> Vec<f32> {
 
 #[cfg(feature = "gpu")]
 fn bench_gpu_train_step_adam(c: &mut Criterion) {
-    // Check if --gpu flag is enabled (CI-safe: skip if not)
+    // Check if ARKAN_GPU_BENCH=1 is set (CI-safe: skip if not)
     if !gpu_flag_enabled() {
-        eprintln!("GPU benchmarks skipped (--gpu flag not provided).");
-        eprintln!("Run with: cargo bench --bench gpu_backward --features gpu -- --gpu");
+        eprintln!("GPU benchmarks skipped (ARKAN_GPU_BENCH not set).");
+        eprintln!("Run with: ARKAN_GPU_BENCH=1 cargo bench --bench gpu_backward --features gpu");
         return;
     }
 

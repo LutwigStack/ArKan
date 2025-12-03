@@ -121,7 +121,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
-#![doc(html_root_url = "https://docs.rs/arkan/0.1.0")]
+#![doc(html_root_url = "https://docs.rs/arkan/0.2.0")]
 
 pub mod baked;
 pub mod buffer;
