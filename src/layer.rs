@@ -448,6 +448,7 @@ impl KanLayer {
     }
 
     /// Backward pass: computes gradients for weights and bias.
+    #[allow(clippy::too_many_arguments)]
     pub fn backward(
         &self,
         normalized_input: &[f32],
