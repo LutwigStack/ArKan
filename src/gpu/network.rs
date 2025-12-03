@@ -90,9 +90,11 @@ impl GpuNetwork {
         // Get dimensions
         let input_dim = cpu_network.config.input_dim;
         let output_dim = cpu_network.config.output_dim;
-        let layer_dims: Vec<_> = cpu_network.layers.iter()
-            .map(|l| l.out_dim)
-            .collect();
+        
+        // layer_dims: [input_dim, hidden_0, hidden_1, ..., output_dim]
+        // Used for intermediate buffer sizing
+        let mut layer_dims = vec![input_dim];
+        layer_dims.extend(cpu_network.layers.iter().map(|l| l.out_dim));
         
         // Create workspace layout
         let workspace_layout = GpuLayer::create_workspace_bind_group_layout(&device);

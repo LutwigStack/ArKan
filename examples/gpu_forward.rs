@@ -4,6 +4,7 @@
 //!
 //! Run with: cargo run --example gpu_forward --features gpu
 
+#[cfg(feature = "gpu")]
 use arkan::{KanConfig, KanNetwork};
 
 #[cfg(feature = "gpu")]

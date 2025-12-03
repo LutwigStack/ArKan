@@ -318,18 +318,22 @@ impl GpuWorkspace {
             self.invalidate_cache();
         }
         
-        // Allocate grad_output if needed
-        let out_dim = *layer_dims.last().unwrap_or(&self.out_dim);
-        if self.grad_output.is_none() || self.grad_output.as_ref().unwrap().shape[0] < batch_size {
+        // Max dim across all layers for gradient buffer reuse during backward pass
+        // Backward pass uses grad_output to propagate gradients between layers,
+        // so it needs to hold gradients of any intermediate layer size
+        let max_dim = layer_dims.iter().max().copied().unwrap_or(self.in_dim);
+        
+        // Allocate grad_output if needed (uses max_dim for intermediate gradient propagation)
+        if self.grad_output.is_none() || self.grad_output.as_ref().unwrap().shape[0] < batch_size 
+            || self.grad_output.as_ref().unwrap().shape[1] < max_dim {
             self.grad_output = Some(GpuTensor::storage_read_write(
                 device,
-                vec![batch_size, out_dim],
+                vec![batch_size, max_dim],
             )?);
             self.invalidate_cache();
         }
         
         // Allocate grad_input (max dim across layers for reuse)
-        let max_dim = layer_dims.iter().max().copied().unwrap_or(self.in_dim);
         if self.grad_input.is_none() || self.grad_input.as_ref().unwrap().shape[0] < batch_size {
             self.grad_input = Some(GpuTensor::storage_read_write(
                 device,

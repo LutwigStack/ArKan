@@ -179,7 +179,7 @@ impl GpuTensor {
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("GpuTensor (storage read)"),
             contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         });
 
         Ok(Self {
@@ -299,14 +299,19 @@ impl GpuTensor {
     /// # Arguments
     ///
     /// * `queue` - The wgpu queue for data upload.
-    /// * `data` - New data to upload.
+    /// * `data` - New data to upload. Can be smaller than tensor capacity.
     ///
     /// # Panics
     ///
-    /// Panics if the data size doesn't match the tensor shape.
+    /// Panics if the data size exceeds the tensor capacity.
     pub fn update(&self, queue: &wgpu::Queue, data: &[f32]) {
-        let expected_len: usize = self.shape.iter().product();
-        assert_eq!(data.len(), expected_len);
+        let capacity = self.capacity_bytes as usize / std::mem::size_of::<f32>();
+        assert!(
+            data.len() <= capacity,
+            "Data size {} exceeds tensor capacity {}",
+            data.len(),
+            capacity
+        );
         queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(data));
     }
 
