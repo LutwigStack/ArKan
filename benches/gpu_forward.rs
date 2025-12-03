@@ -33,15 +33,17 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::time::Instant;
 
 #[cfg(feature = "gpu")]
-use arkan::{KanConfig, KanNetwork};
-#[cfg(feature = "gpu")]
 use arkan::gpu::{GpuNetwork, WgpuBackend, WgpuOptions};
+#[cfg(feature = "gpu")]
+use arkan::{KanConfig, KanNetwork};
 
 /// Check if GPU benchmarks are enabled via environment variable.
-/// 
+///
 /// Set `ARKAN_GPU_BENCH=1` to enable GPU benchmarks.
 fn gpu_flag_enabled() -> bool {
-    std::env::var("ARKAN_GPU_BENCH").map(|v| v == "1").unwrap_or(false)
+    std::env::var("ARKAN_GPU_BENCH")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> Vec<f32> {
@@ -56,14 +58,20 @@ fn bench_gpu_forward(c: &mut Criterion) {
     // Check if ARKAN_GPU_BENCH=1 is set (CI-safe: skip if not)
     if !gpu_flag_enabled() {
         eprintln!("GPU benchmarks skipped (ARKAN_GPU_BENCH not set).");
-        eprintln!("Run with: $env:ARKAN_GPU_BENCH=\"1\"; cargo bench --bench gpu_forward --features gpu");
+        eprintln!(
+            "Run with: $env:ARKAN_GPU_BENCH=\"1\"; cargo bench --bench gpu_forward --features gpu"
+        );
         return;
     }
 
     // Initialize GPU backend once
     let backend = match WgpuBackend::init(WgpuOptions::default()) {
         Ok(b) => {
-            println!("GPU: {} ({:?})", b.adapter_info().name, b.adapter_info().backend);
+            println!(
+                "GPU: {} ({:?})",
+                b.adapter_info().name,
+                b.adapter_info().backend
+            );
             b
         }
         Err(e) => {
@@ -74,7 +82,7 @@ fn bench_gpu_forward(c: &mut Criterion) {
 
     let config = KanConfig::preset();
     let cpu_network = KanNetwork::new(config.clone());
-    
+
     // Create GPU network
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
         Ok(n) => n,
@@ -101,14 +109,18 @@ fn bench_gpu_forward(c: &mut Criterion) {
         let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
 
         group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &batch_size| {
-            b.iter(|| {
-                let output = gpu_network
-                    .forward_batch(black_box(&inputs), batch_size, &mut workspace)
-                    .expect("GPU forward failed");
-                black_box(output);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(batch),
+            &batch,
+            |b, &batch_size| {
+                b.iter(|| {
+                    let output = gpu_network
+                        .forward_batch(black_box(&inputs), batch_size, &mut workspace)
+                        .expect("GPU forward failed");
+                    black_box(output);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -129,7 +141,7 @@ fn bench_cpu_vs_gpu(c: &mut Criterion) {
 
     let config = KanConfig::preset();
     let cpu_network = KanNetwork::new(config.clone());
-    
+
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
         Ok(n) => n,
         Err(_) => return,
@@ -137,11 +149,11 @@ fn bench_cpu_vs_gpu(c: &mut Criterion) {
 
     let batch = 256;
     let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
-    
+
     // CPU workspace
     let mut cpu_workspace = cpu_network.create_workspace(batch);
     let mut cpu_outputs = vec![0.0f32; batch * config.output_dim];
-    
+
     // GPU workspace
     let mut gpu_workspace = gpu_network.create_workspace(batch).expect("workspace");
 
@@ -151,7 +163,11 @@ fn bench_cpu_vs_gpu(c: &mut Criterion) {
     // CPU benchmark
     group.bench_function("cpu", |b| {
         b.iter(|| {
-            cpu_network.forward_batch(black_box(&inputs), black_box(&mut cpu_outputs), &mut cpu_workspace);
+            cpu_network.forward_batch(
+                black_box(&inputs),
+                black_box(&mut cpu_outputs),
+                &mut cpu_workspace,
+            );
         });
     });
 
@@ -249,7 +265,13 @@ fn make_config(input: usize, output: usize, hidden: Vec<usize>) -> KanConfig {
 }
 
 #[cfg(feature = "gpu")]
-fn make_config_spline(input: usize, output: usize, hidden: Vec<usize>, grid: usize, order: usize) -> KanConfig {
+fn make_config_spline(
+    input: usize,
+    output: usize,
+    hidden: Vec<usize>,
+    grid: usize,
+    order: usize,
+) -> KanConfig {
     KanConfig {
         input_dim: input,
         output_dim: output,
@@ -282,7 +304,7 @@ fn bench_gpu_arch_latency(c: &mut Criterion) {
     for arch in &archs {
         let config = make_config(arch.input, arch.output, arch.hidden.clone());
         let cpu_network = KanNetwork::new(config.clone());
-        
+
         let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
             Ok(n) => n,
             Err(_) => continue,
@@ -326,7 +348,7 @@ fn bench_gpu_arch_throughput(c: &mut Criterion) {
     for arch in &archs {
         let config = make_config(arch.input, arch.output, arch.hidden.clone());
         let cpu_network = KanNetwork::new(config.clone());
-        
+
         let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
             Ok(n) => n,
             Err(_) => continue,
@@ -374,13 +396,19 @@ fn bench_gpu_spline_order(c: &mut Criterion) {
     };
 
     let batch = 64_usize;
-    let orders = [(1, "linear"), (2, "quadratic"), (3, "cubic"), (4, "quartic"), (5, "quintic")];
+    let orders = [
+        (1, "linear"),
+        (2, "quadratic"),
+        (3, "cubic"),
+        (4, "quartic"),
+        (5, "quintic"),
+    ];
     let mut group = c.benchmark_group("gpu_spline_order_grid5");
 
     for (order, name) in orders {
         let config = make_config_spline(21, 24, vec![64, 64], 5, order);
         let cpu_network = KanNetwork::new(config.clone());
-        
+
         let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
             Ok(n) => n,
             Err(_) => continue,
@@ -424,7 +452,7 @@ fn bench_gpu_grid_size(c: &mut Criterion) {
     for grid in grids {
         let config = make_config_spline(21, 24, vec![64, 64], grid, 3);
         let cpu_network = KanNetwork::new(config.clone());
-        
+
         let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
             Ok(n) => n,
             Err(_) => continue,
@@ -478,7 +506,7 @@ fn bench_gpu_latency_distribution(c: &mut Criterion) {
 
     let config = KanConfig::preset();
     let cpu_network = KanNetwork::new(config.clone());
-    
+
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
         Ok(n) => n,
         Err(_) => return,
@@ -597,7 +625,7 @@ fn bench_gpu_memory_throughput(c: &mut Criterion) {
 
     let config = KanConfig::preset();
     let cpu_network = KanNetwork::new(config.clone());
-    
+
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
         Ok(n) => n,
         Err(_) => return,
@@ -618,14 +646,18 @@ fn bench_gpu_memory_throughput(c: &mut Criterion) {
 
         // Use bytes as throughput metric
         group.throughput(Throughput::Bytes(mem_bytes as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &batch_size| {
-            b.iter(|| {
-                let output = gpu_network
-                    .forward_batch(black_box(&inputs), batch_size, &mut workspace)
-                    .expect("GPU forward failed");
-                black_box(output);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(batch),
+            &batch,
+            |b, &batch_size| {
+                b.iter(|| {
+                    let output = gpu_network
+                        .forward_batch(black_box(&inputs), batch_size, &mut workspace)
+                        .expect("GPU forward failed");
+                    black_box(output);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -633,7 +665,7 @@ fn bench_gpu_memory_throughput(c: &mut Criterion) {
     // Print bandwidth analysis
     println!("\n=== GPU Memory Bandwidth Analysis ===");
     println!("Config: {:?}", config.layer_dims());
-    
+
     let batch = 256;
     let mem_bytes = estimate_gpu_memory_bytes(&config, batch);
     println!(
@@ -685,18 +717,21 @@ fn bench_cpu_vs_gpu_scaling(c: &mut Criterion) {
 
     let config = KanConfig::preset();
     let cpu_network = KanNetwork::new(config.clone());
-    
+
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
         Ok(n) => n,
         Err(_) => return,
     };
 
     let batch_sizes = [1_usize, 8, 32, 64, 128, 256, 512];
-    
+
     // Print comparison table
     println!("\n=== CPU vs GPU Forward Pass Scaling ===");
     println!("---------------------------------------------------------");
-    println!("{:>8} {:>12} {:>12} {:>10}", "Batch", "CPU (µs)", "GPU (µs)", "Speedup");
+    println!(
+        "{:>8} {:>12} {:>12} {:>10}",
+        "Batch", "CPU (µs)", "GPU (µs)", "Speedup"
+    );
     println!("---------------------------------------------------------");
 
     for &batch in &batch_sizes {
@@ -710,12 +745,12 @@ fn bench_cpu_vs_gpu_scaling(c: &mut Criterion) {
 
         // CPU timing
         let iterations = 100;
-        
+
         // Warmup
         for _ in 0..10 {
             cpu_network.forward_batch(&inputs, &mut cpu_outputs, &mut cpu_workspace);
         }
-        
+
         let start = Instant::now();
         for _ in 0..iterations {
             cpu_network.forward_batch(&inputs, &mut cpu_outputs, &mut cpu_workspace);
@@ -726,7 +761,7 @@ fn bench_cpu_vs_gpu_scaling(c: &mut Criterion) {
         for _ in 0..10 {
             let _ = gpu_network.forward_batch(&inputs, batch, &mut gpu_workspace);
         }
-        
+
         let start = Instant::now();
         for _ in 0..iterations {
             let _ = gpu_network.forward_batch(&inputs, batch, &mut gpu_workspace);
@@ -739,8 +774,11 @@ fn bench_cpu_vs_gpu_scaling(c: &mut Criterion) {
         } else {
             format!("{:.2}x CPU", 1.0 / speedup)
         };
-        
-        println!("{:>8} {:>12.1} {:>12.1} {:>10}", batch, cpu_time, gpu_time, speedup_str);
+
+        println!(
+            "{:>8} {:>12.1} {:>12.1} {:>10}",
+            batch, cpu_time, gpu_time, speedup_str
+        );
     }
     println!("---------------------------------------------------------");
 
@@ -749,14 +787,22 @@ fn bench_cpu_vs_gpu_scaling(c: &mut Criterion) {
     let inputs = make_inputs(config.input_dim, config.grid_range, crossover_batch, 42);
     let mut cpu_outputs = vec![0.0f32; crossover_batch * config.output_dim];
     let mut cpu_workspace = cpu_network.create_workspace(crossover_batch);
-    let mut gpu_workspace = gpu_network.create_workspace(crossover_batch).expect("workspace");
+    let mut gpu_workspace = gpu_network
+        .create_workspace(crossover_batch)
+        .expect("workspace");
 
     let mut group = c.benchmark_group("cpu_vs_gpu_crossover_batch64");
-    group.throughput(Throughput::Elements((crossover_batch * config.input_dim) as u64));
+    group.throughput(Throughput::Elements(
+        (crossover_batch * config.input_dim) as u64,
+    ));
 
     group.bench_function("cpu", |b| {
         b.iter(|| {
-            cpu_network.forward_batch(black_box(&inputs), black_box(&mut cpu_outputs), &mut cpu_workspace);
+            cpu_network.forward_batch(
+                black_box(&inputs),
+                black_box(&mut cpu_outputs),
+                &mut cpu_workspace,
+            );
         });
     });
 
@@ -792,7 +838,7 @@ fn bench_gpu_softmax(c: &mut Criterion) {
 
     let config = KanConfig::preset();
     let cpu_network = KanNetwork::new(config.clone());
-    
+
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
         Ok(n) => n,
         Err(_) => return,
@@ -811,14 +857,18 @@ fn bench_gpu_softmax(c: &mut Criterion) {
         let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
 
         group.throughput(Throughput::Elements((batch * config.output_dim) as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &batch_size| {
-            b.iter(|| {
-                let output = gpu_network
-                    .forward_batch_softmax(black_box(&inputs), batch_size, &mut workspace)
-                    .expect("GPU forward+softmax failed");
-                black_box(output);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(batch),
+            &batch,
+            |b, &batch_size| {
+                b.iter(|| {
+                    let output = gpu_network
+                        .forward_batch_softmax(black_box(&inputs), batch_size, &mut workspace)
+                        .expect("GPU forward+softmax failed");
+                    black_box(output);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -837,7 +887,7 @@ fn bench_forward_vs_forward_softmax(c: &mut Criterion) {
 
     let config = KanConfig::preset();
     let cpu_network = KanNetwork::new(config.clone());
-    
+
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
         Ok(n) => n,
         Err(_) => return,
@@ -845,7 +895,7 @@ fn bench_forward_vs_forward_softmax(c: &mut Criterion) {
 
     let batch = 64_usize;
     let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
-    
+
     let mut workspace = match gpu_network.create_workspace(batch) {
         Ok(w) => w,
         Err(_) => return,

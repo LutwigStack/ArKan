@@ -76,7 +76,9 @@ fn run_gpu_example() {
     // 4. Create workspace
     println!("\n4. Creating GPU workspace...");
     let batch_size = 64;
-    let mut workspace = gpu_network.create_workspace(batch_size).expect("Failed to create workspace");
+    let mut workspace = gpu_network
+        .create_workspace(batch_size)
+        .expect("Failed to create workspace");
     println!("   Max batch size: {}", workspace.max_batch);
 
     // 5. Prepare input data
@@ -100,7 +102,7 @@ fn run_gpu_example() {
     println!("\n7. Running CPU forward pass for comparison...");
     let mut cpu_workspace = cpu_network.create_workspace(batch_size);
     let mut cpu_output = vec![0.0f32; batch_size * config.output_dim];
-    
+
     let start = std::time::Instant::now();
     cpu_network.forward_batch(&input, &mut cpu_output, &mut cpu_workspace);
     let cpu_time = start.elapsed();
@@ -114,7 +116,7 @@ fn run_gpu_example() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     println!("   Max difference: {:.6}", max_diff);
-    
+
     if max_diff < 0.1 {
         println!("   ✓ Results match within tolerance");
     } else {

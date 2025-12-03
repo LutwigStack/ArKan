@@ -200,12 +200,23 @@ impl WgpuBackend {
         // Check if we need to filter by name
         if let Some(ref name_filter) = options.force_adapter_name {
             let info = adapter.get_info();
-            if !info.name.to_lowercase().contains(&name_filter.to_lowercase()) {
+            if !info
+                .name
+                .to_lowercase()
+                .contains(&name_filter.to_lowercase())
+            {
                 // Try to find adapter by name
-                let adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).into_iter().collect();
+                let adapters: Vec<_> = instance
+                    .enumerate_adapters(wgpu::Backends::all())
+                    .into_iter()
+                    .collect();
                 for a in adapters {
                     let info = a.get_info();
-                    if info.name.to_lowercase().contains(&name_filter.to_lowercase()) {
+                    if info
+                        .name
+                        .to_lowercase()
+                        .contains(&name_filter.to_lowercase())
+                    {
                         return Ok(a);
                     }
                 }
@@ -309,7 +320,7 @@ impl WgpuBackend {
         let basis_vec4s = (basis_padded + 3) / 4;
         let gpu_weight_count = out_dim * in_dim * basis_vec4s * 4;
         let size_bytes = (gpu_weight_count * std::mem::size_of::<f32>()) as u64;
-        
+
         if !self.supports_buffer_size(size_bytes) {
             return Err(ArkanError::unsupported_limits(format!(
                 "Layer weights ({}x{}x{} -> {} vec4s, {} bytes) exceed max storage buffer size ({} bytes)",
@@ -354,7 +365,10 @@ impl std::fmt::Debug for WgpuBackend {
             .field("adapter", &self.adapter_info.name)
             .field("backend", &self.adapter_info.backend)
             .field("device_type", &self.adapter_info.device_type)
-            .field("max_storage_buffer", &self.limits.max_storage_buffer_binding_size)
+            .field(
+                "max_storage_buffer",
+                &self.limits.max_storage_buffer_binding_size,
+            )
             .finish()
     }
 }

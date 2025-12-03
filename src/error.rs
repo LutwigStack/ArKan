@@ -61,7 +61,7 @@ pub enum ArkanError {
     #[cfg(feature = "gpu")]
     #[error("Failed to find suitable GPU adapter: {0}")]
     AdapterNotFound(String),
-    
+
     /// GPU buffer async operation failed.
     #[cfg(feature = "gpu")]
     #[error("Buffer async error: {0}")]

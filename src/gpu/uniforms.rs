@@ -166,12 +166,7 @@ pub struct TrainingUniforms {
 #[allow(dead_code)]
 impl TrainingUniforms {
     /// Creates training uniforms from layer config and training parameters.
-    pub fn new(
-        base: LayerUniforms,
-        learning_rate: f32,
-        weight_decay: f32,
-        grad_clip: f32,
-    ) -> Self {
+    pub fn new(base: LayerUniforms, learning_rate: f32, weight_decay: f32, grad_clip: f32) -> Self {
         Self {
             grid_min: base.grid_min,
             grid_max: base.grid_max,
@@ -368,11 +363,11 @@ mod tests {
     fn test_layer_uniforms_from_config() {
         let uniforms = LayerUniforms::from_layer_config(
             0.0, 1.0, // grid range
-            5,        // grid_size
-            3,        // order
-            21,       // in_dim
-            64,       // out_dim
-            32,       // batch_size
+            5,   // grid_size
+            3,   // order
+            21,  // in_dim
+            64,  // out_dim
+            32,  // batch_size
         );
 
         assert_eq!(uniforms.grid_min, 0.0);

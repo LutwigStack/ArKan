@@ -76,7 +76,12 @@ impl GpuTensor {
     /// # Errors
     ///
     /// Returns `ArkanError::BatchTooLarge` if the data size exceeds `MAX_VRAM_ALLOC`.
-    pub fn upload(device: &wgpu::Device, _queue: &wgpu::Queue, data: &[f32], shape: Vec<usize>) -> ArkanResult<Self> {
+    pub fn upload(
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        data: &[f32],
+        shape: Vec<usize>,
+    ) -> ArkanResult<Self> {
         let expected_len: usize = shape.iter().product();
         if data.len() != expected_len {
             // Infer logical shape for got: e.g., expected [32, 64], got [31, 64]
@@ -140,7 +145,10 @@ impl GpuTensor {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("GpuTensor (uninit)"),
             size: size_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC | usage,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC
+                | usage,
             mapped_at_creation: false,
         });
 
@@ -156,7 +164,11 @@ impl GpuTensor {
     /// # Errors
     ///
     /// Returns `ArkanError::BatchTooLarge` if the data size exceeds `MAX_VRAM_ALLOC`.
-    pub fn storage_read(device: &wgpu::Device, data: &[f32], shape: Vec<usize>) -> ArkanResult<Self> {
+    pub fn storage_read(
+        device: &wgpu::Device,
+        data: &[f32],
+        shape: Vec<usize>,
+    ) -> ArkanResult<Self> {
         let expected_len: usize = shape.iter().product();
         if data.len() != expected_len {
             // Infer logical shape for got
@@ -179,7 +191,9 @@ impl GpuTensor {
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("GpuTensor (storage read)"),
             contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
         });
 
         Ok(Self {
@@ -279,19 +293,24 @@ impl GpuTensor {
 
         // Map asynchronously
         let staging_clone = Arc::clone(&staging_buffer);
-        staging_buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            let data = match result {
-                Ok(()) => {
-                    let mapped = staging_clone.slice(..).get_mapped_range();
-                    let data: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
-                    drop(mapped);
-                    staging_clone.unmap();
-                    Ok(data)
-                }
-                Err(e) => Err(ArkanError::buffer(format!("Buffer mapping failed: {:?}", e))),
-            };
-            callback(data);
-        });
+        staging_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let data = match result {
+                    Ok(()) => {
+                        let mapped = staging_clone.slice(..).get_mapped_range();
+                        let data: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
+                        drop(mapped);
+                        staging_clone.unmap();
+                        Ok(data)
+                    }
+                    Err(e) => Err(ArkanError::buffer(format!(
+                        "Buffer mapping failed: {:?}",
+                        e
+                    ))),
+                };
+                callback(data);
+            });
     }
 
     /// Updates the tensor data on GPU.
@@ -397,12 +416,7 @@ impl<'a> GpuTensorView<'a> {
     /// * `offset` - Byte offset into the buffer.
     /// * `size` - Size in bytes (None = rest of buffer).
     /// * `shape` - Logical shape of this view.
-    pub fn slice(
-        tensor: &'a GpuTensor,
-        offset: u64,
-        size: Option<u64>,
-        shape: Vec<usize>,
-    ) -> Self {
+    pub fn slice(tensor: &'a GpuTensor, offset: u64, size: Option<u64>, shape: Vec<usize>) -> Self {
         Self {
             buffer: &tensor.buffer,
             offset,
@@ -461,7 +475,12 @@ impl GpuTensor {
     }
 
     /// Creates a view with a specific byte range.
-    pub fn view_slice(&self, offset: u64, size: Option<u64>, shape: Vec<usize>) -> GpuTensorView<'_> {
+    pub fn view_slice(
+        &self,
+        offset: u64,
+        size: Option<u64>,
+        shape: Vec<usize>,
+    ) -> GpuTensorView<'_> {
         GpuTensorView::slice(self, offset, size, shape)
     }
 }

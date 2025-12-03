@@ -309,9 +309,9 @@ impl GpuLayer {
     pub fn param_count(&self) -> usize {
         self.weight_count() + self.bias_count()
     }
-    
+
     // ==================== Backward Pass Support ====================
-    
+
     /// Creates the bind group layout for backward pass.
     ///
     /// Group 0 (backward):
@@ -346,7 +346,7 @@ impl GpuLayer {
             ],
         })
     }
-    
+
     /// Creates a backward bind group for this layer.
     ///
     /// # Arguments

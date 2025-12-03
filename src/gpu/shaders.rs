@@ -595,7 +595,7 @@ fn backward_input_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 /// Bias gradient reduction shader.
 ///
 /// Computes: grad_bias[j] = Σ_batch grad_output[batch, j]
-/// 
+///
 /// This is separated to avoid atomic contention in the main backward pass.
 pub const BACKWARD_BIAS_SHADER: &str = r#"
 struct BiasUniforms {

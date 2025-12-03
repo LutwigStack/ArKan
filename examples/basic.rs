@@ -33,7 +33,10 @@ fn main() {
     println!("  Input:  {} neurons", config.input_dim);
     println!("  Hidden: {:?}", config.hidden_dims);
     println!("  Output: {} neurons", config.output_dim);
-    println!("  Grid:   {}, Order: {}", config.grid_size, config.spline_order);
+    println!(
+        "  Grid:   {}, Order: {}",
+        config.grid_size, config.spline_order
+    );
 
     let network = KanNetwork::new(config.clone());
     println!("\nNetwork created:");
@@ -55,7 +58,7 @@ fn main() {
     let start = std::time::Instant::now();
     network.forward_single(&inputs, &mut outputs, &mut workspace);
     let elapsed = start.elapsed();
-    
+
     println!("Time:   {:?}", elapsed);
     println!("Output: [0]={:.6}, [1]={:.6}, ...", outputs[0], outputs[1]);
 
@@ -68,7 +71,7 @@ fn main() {
     let start = std::time::Instant::now();
     network.forward_batch(&batch_inputs, &mut batch_outputs, &mut workspace);
     let elapsed = start.elapsed();
-    
+
     println!("Time:   {:?}", elapsed);
     println!("Output sample [0]: {:.6}", batch_outputs[0]);
 

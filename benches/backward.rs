@@ -139,7 +139,7 @@ fn bench_backward_overhead(c: &mut Criterion) {
     let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
     let targets = make_inputs(config.output_dim, config.grid_range, batch, 123);
     let mut outputs = vec![0.0f32; batch * config.output_dim];
-    
+
     // Workspace for inference benchmarks (can be reused)
     let mut inference_workspace = base_network.create_workspace(batch);
 
@@ -149,7 +149,11 @@ fn bench_backward_overhead(c: &mut Criterion) {
     // Forward inference only
     group.bench_function("1_forward_inference", |b| {
         b.iter(|| {
-            base_network.forward_batch(black_box(&inputs), black_box(&mut outputs), &mut inference_workspace);
+            base_network.forward_batch(
+                black_box(&inputs),
+                black_box(&mut outputs),
+                &mut inference_workspace,
+            );
         });
     });
 

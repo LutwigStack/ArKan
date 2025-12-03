@@ -16,8 +16,8 @@
 //! cargo run --example training
 //! ```
 
-use arkan::{KanConfig, KanNetwork, TrainOptions};
 use arkan::optimizer::{Adam, AdamConfig};
+use arkan::{KanConfig, KanNetwork, TrainOptions};
 
 fn main() {
     println!("=== ArKan Training Example ===\n");
@@ -126,8 +126,11 @@ fn main() {
         } else {
             no_improvement_count += 1;
             if no_improvement_count >= patience {
-                println!("\nEarly stopping at epoch {} (no improvement for {} epochs)", 
-                    epoch + 1, patience);
+                println!(
+                    "\nEarly stopping at epoch {} (no improvement for {} epochs)",
+                    epoch + 1,
+                    patience
+                );
                 break;
             }
         }
@@ -195,7 +198,7 @@ fn generate_xor_dataset(
     for i in 0..num_samples {
         // Generate input pattern
         let phase = (i as f32 / num_samples as f32) * 2.0 * PI;
-        
+
         for j in 0..input_dim {
             let val = ((phase + j as f32 * 0.5).sin() + 1.0) / 2.0;
             inputs.push(val);
@@ -204,14 +207,23 @@ fn generate_xor_dataset(
         // Generate XOR-like target: high when inputs are "different"
         let sum: f32 = inputs[i * input_dim..(i + 1) * input_dim]
             .iter()
-            .sum::<f32>() / input_dim as f32;
+            .sum::<f32>()
+            / input_dim as f32;
 
         for j in 0..output_dim {
             // Target depends on input pattern
             let target = if j % 2 == 0 {
-                if sum > 0.3 && sum < 0.7 { 1.0 } else { 0.0 }
+                if sum > 0.3 && sum < 0.7 {
+                    1.0
+                } else {
+                    0.0
+                }
             } else {
-                if sum <= 0.3 || sum >= 0.7 { 1.0 } else { 0.0 }
+                if sum <= 0.3 || sum >= 0.7 {
+                    1.0
+                } else {
+                    0.0
+                }
             };
             targets.push(target);
         }

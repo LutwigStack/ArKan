@@ -22,7 +22,7 @@ pub struct PipelineCache {
     forward_layout: Option<wgpu::PipelineLayout>,
     /// Bind group layout for workspace (Group 1)
     workspace_layout: Option<wgpu::BindGroupLayout>,
-    
+
     // Training pipelines
     /// Forward training pipeline (saves z_values and span_indices)
     forward_training_pipeline: Option<wgpu::ComputePipeline>,
@@ -83,42 +83,47 @@ impl PipelineCache {
     /// Gets the workspace bind group layout.
     pub fn get_workspace_layout(&mut self) -> &wgpu::BindGroupLayout {
         if self.workspace_layout.is_none() {
-            self.workspace_layout = Some(GpuLayer::create_workspace_bind_group_layout(&self.device));
+            self.workspace_layout =
+                Some(GpuLayer::create_workspace_bind_group_layout(&self.device));
         }
         self.workspace_layout.as_ref().unwrap()
     }
 
-    fn create_forward_pipeline(
-        &mut self,
-        layer_layout: &wgpu::BindGroupLayout,
-    ) -> ArkanResult<()> {
+    fn create_forward_pipeline(&mut self, layer_layout: &wgpu::BindGroupLayout) -> ArkanResult<()> {
         // Create workspace layout if needed
         if self.workspace_layout.is_none() {
-            self.workspace_layout = Some(GpuLayer::create_workspace_bind_group_layout(&self.device));
+            self.workspace_layout =
+                Some(GpuLayer::create_workspace_bind_group_layout(&self.device));
         }
 
         // Create shader module
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Forward Shader"),
-            source: wgpu::ShaderSource::Wgsl(shaders::FORWARD_SHADER.into()),
-        });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Forward Shader"),
+                source: wgpu::ShaderSource::Wgsl(shaders::FORWARD_SHADER.into()),
+            });
 
         // Create pipeline layout
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Forward Pipeline Layout"),
-            bind_group_layouts: &[layer_layout, self.workspace_layout.as_ref().unwrap()],
-            push_constant_ranges: &[],
-        });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Forward Pipeline Layout"),
+                bind_group_layouts: &[layer_layout, self.workspace_layout.as_ref().unwrap()],
+                push_constant_ranges: &[],
+            });
 
         // Create compute pipeline
-        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Forward Pipeline"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("forward_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Forward Pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("forward_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         self.forward_layout = Some(layout);
         self.forward_pipeline = Some(pipeline);
@@ -132,31 +137,38 @@ impl PipelineCache {
     ) -> ArkanResult<()> {
         // Create workspace layout if needed
         if self.workspace_layout.is_none() {
-            self.workspace_layout = Some(GpuLayer::create_workspace_bind_group_layout(&self.device));
+            self.workspace_layout =
+                Some(GpuLayer::create_workspace_bind_group_layout(&self.device));
         }
 
         // Create shader module
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Forward Simple Shader"),
-            source: wgpu::ShaderSource::Wgsl(shaders::FORWARD_SIMPLE_SHADER.into()),
-        });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Forward Simple Shader"),
+                source: wgpu::ShaderSource::Wgsl(shaders::FORWARD_SIMPLE_SHADER.into()),
+            });
 
         // Create pipeline layout
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Forward Simple Pipeline Layout"),
-            bind_group_layouts: &[layer_layout, self.workspace_layout.as_ref().unwrap()],
-            push_constant_ranges: &[],
-        });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Forward Simple Pipeline Layout"),
+                bind_group_layouts: &[layer_layout, self.workspace_layout.as_ref().unwrap()],
+                push_constant_ranges: &[],
+            });
 
         // Create compute pipeline
-        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Forward Simple Pipeline"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("forward_simple"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Forward Simple Pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("forward_simple"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         self.forward_simple_pipeline = Some(pipeline);
 
@@ -167,48 +179,50 @@ impl PipelineCache {
     pub fn forward_layout(&self) -> Option<&wgpu::PipelineLayout> {
         self.forward_layout.as_ref()
     }
-    
+
     // ==================== Softmax Pipeline ====================
-    
+
     /// Gets the softmax bind group layout (creates if needed).
     pub fn get_softmax_layout(&mut self) -> &wgpu::BindGroupLayout {
         if self.softmax_layout.is_none() {
-            self.softmax_layout = Some(self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Softmax BindGroupLayout"),
-                entries: &[
-                    // binding 0: config (uniform)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+            self.softmax_layout = Some(self.device.create_bind_group_layout(
+                &wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Softmax BindGroupLayout"),
+                    entries: &[
+                        // binding 0: config (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    // binding 1: data (read-write)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        // binding 1: data (read-write)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                ],
-            }));
+                    ],
+                },
+            ));
         }
         self.softmax_layout.as_ref().unwrap()
     }
-    
+
     /// Gets or creates the softmax pipeline.
-    /// 
+    ///
     /// The softmax pipeline normalizes outputs to probability distribution:
     /// softmax(x_i) = exp(x_i) / sum(exp(x_j))
-    /// 
+    ///
     /// Uses bind group layout with uniform config and read-write data buffer.
     pub fn get_softmax_pipeline(&mut self) -> ArkanResult<&wgpu::ComputePipeline> {
         if self.softmax_pipeline.is_none() {
@@ -216,185 +230,195 @@ impl PipelineCache {
         }
         Ok(self.softmax_pipeline.as_ref().unwrap())
     }
-    
+
     fn create_softmax_pipeline(&mut self) -> ArkanResult<()> {
         // Ensure layout is created first
         let _ = self.get_softmax_layout();
         let softmax_layout = self.softmax_layout.as_ref().unwrap();
-        
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Softmax Shader"),
-            source: wgpu::ShaderSource::Wgsl(shaders::SOFTMAX_SHADER.into()),
-        });
 
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Softmax Pipeline Layout"),
-            bind_group_layouts: &[softmax_layout],
-            push_constant_ranges: &[],
-        });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Softmax Shader"),
+                source: wgpu::ShaderSource::Wgsl(shaders::SOFTMAX_SHADER.into()),
+            });
 
-        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Softmax Pipeline"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("softmax_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Softmax Pipeline Layout"),
+                bind_group_layouts: &[softmax_layout],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Softmax Pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("softmax_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         self.softmax_pipeline = Some(pipeline);
         Ok(())
     }
-    
+
     // ==================== Training Pipelines ====================
-    
+
     /// Creates the bind group layout for training forward pass.
     /// Group 1: input, output, z_values, span_indices
     pub fn get_training_workspace_layout(&mut self) -> &wgpu::BindGroupLayout {
         if self.training_workspace_layout.is_none() {
-            self.training_workspace_layout = Some(self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Training Workspace BindGroupLayout"),
-                entries: &[
-                    // binding 0: input (read)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+            self.training_workspace_layout = Some(self.device.create_bind_group_layout(
+                &wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Training Workspace BindGroupLayout"),
+                    entries: &[
+                        // binding 0: input (read)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    // binding 1: output (write)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        // binding 1: output (write)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    // binding 2: z_values (write)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        // binding 2: z_values (write)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    // binding 3: span_indices (write)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        // binding 3: span_indices (write)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                ],
-            }));
+                    ],
+                },
+            ));
         }
         self.training_workspace_layout.as_ref().unwrap()
     }
-    
+
     /// Creates the bind group layout for backward pass.
     /// Group 1: z_values, span_indices, grad_output, grad_weights, grad_bias, grad_input, std_inv
     pub fn get_backward_workspace_layout(&mut self) -> &wgpu::BindGroupLayout {
         if self.backward_workspace_layout.is_none() {
-            self.backward_workspace_layout = Some(self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Backward Workspace BindGroupLayout"),
-                entries: &[
-                    // binding 0: z_values (read)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+            self.backward_workspace_layout = Some(self.device.create_bind_group_layout(
+                &wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Backward Workspace BindGroupLayout"),
+                    entries: &[
+                        // binding 0: z_values (read)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    // binding 1: span_indices (read)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        // binding 1: span_indices (read)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    // binding 2: grad_output (read)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        // binding 2: grad_output (read)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    // binding 3: grad_weights (read-write)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        // binding 3: grad_weights (read-write)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    // binding 4: grad_bias (read-write)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        // binding 4: grad_bias (read-write)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    // binding 5: grad_input (read-write)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 5,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        // binding 5: grad_input (read-write)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 5,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    // binding 6: std_inv (read)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 6,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        // binding 6: std_inv (read)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 6,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                ],
-            }));
+                    ],
+                },
+            ));
         }
         self.backward_workspace_layout.as_ref().unwrap()
     }
-    
+
     /// Gets or creates the forward training pipeline.
     pub fn get_forward_training_pipeline(
         &mut self,
@@ -405,7 +429,7 @@ impl PipelineCache {
         }
         Ok(self.forward_training_pipeline.as_ref().unwrap())
     }
-    
+
     fn create_forward_training_pipeline(
         &mut self,
         layer_layout: &wgpu::BindGroupLayout,
@@ -413,31 +437,37 @@ impl PipelineCache {
         let training_layout = self.get_training_workspace_layout();
         // Need to clone since we mutably borrow self above
         let training_layout_ref = unsafe { &*(training_layout as *const _) };
-        
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Forward Training Shader"),
-            source: wgpu::ShaderSource::Wgsl(shaders::FORWARD_TRAINING_SHADER.into()),
-        });
-        
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Forward Training Pipeline Layout"),
-            bind_group_layouts: &[layer_layout, training_layout_ref],
-            push_constant_ranges: &[],
-        });
-        
-        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Forward Training Pipeline"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("forward_training_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        
+
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Forward Training Shader"),
+                source: wgpu::ShaderSource::Wgsl(shaders::FORWARD_TRAINING_SHADER.into()),
+            });
+
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Forward Training Pipeline Layout"),
+                bind_group_layouts: &[layer_layout, training_layout_ref],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Forward Training Pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("forward_training_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         self.forward_training_pipeline = Some(pipeline);
         Ok(())
     }
-    
+
     /// Gets or creates the backward weights pipeline.
     pub fn get_backward_weights_pipeline(
         &mut self,
@@ -448,7 +478,7 @@ impl PipelineCache {
         }
         Ok(self.backward_weights_pipeline.as_ref().unwrap())
     }
-    
+
     fn create_backward_weights_pipeline(
         &mut self,
         layer_layout: &wgpu::BindGroupLayout,
@@ -456,31 +486,37 @@ impl PipelineCache {
         let backward_layout = self.get_backward_workspace_layout();
         // Need to clone since we mutably borrow self above
         let backward_layout_ref = unsafe { &*(backward_layout as *const _) };
-        
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Backward Weights Shader"),
-            source: wgpu::ShaderSource::Wgsl(shaders::BACKWARD_WEIGHTS_SHADER.into()),
-        });
-        
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Backward Weights Pipeline Layout"),
-            bind_group_layouts: &[layer_layout, backward_layout_ref],
-            push_constant_ranges: &[],
-        });
-        
-        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Backward Weights Pipeline"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("backward_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        
+
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Backward Weights Shader"),
+                source: wgpu::ShaderSource::Wgsl(shaders::BACKWARD_WEIGHTS_SHADER.into()),
+            });
+
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Backward Weights Pipeline Layout"),
+                bind_group_layouts: &[layer_layout, backward_layout_ref],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Backward Weights Pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("backward_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         self.backward_weights_pipeline = Some(pipeline);
         Ok(())
     }
-    
+
     /// Gets or creates the backward input pipeline.
     pub fn get_backward_input_pipeline(
         &mut self,
@@ -491,38 +527,44 @@ impl PipelineCache {
         }
         Ok(self.backward_input_pipeline.as_ref().unwrap())
     }
-    
+
     fn create_backward_input_pipeline(
         &mut self,
         layer_layout: &wgpu::BindGroupLayout,
     ) -> ArkanResult<()> {
         let backward_layout = self.get_backward_workspace_layout();
         let backward_layout_ref = unsafe { &*(backward_layout as *const _) };
-        
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Backward Input Shader"),
-            source: wgpu::ShaderSource::Wgsl(shaders::BACKWARD_INPUT_SHADER.into()),
-        });
-        
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Backward Input Pipeline Layout"),
-            bind_group_layouts: &[layer_layout, backward_layout_ref],
-            push_constant_ranges: &[],
-        });
-        
-        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Backward Input Pipeline"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("backward_input_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        
+
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Backward Input Shader"),
+                source: wgpu::ShaderSource::Wgsl(shaders::BACKWARD_INPUT_SHADER.into()),
+            });
+
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Backward Input Pipeline Layout"),
+                bind_group_layouts: &[layer_layout, backward_layout_ref],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Backward Input Pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("backward_input_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         self.backward_input_pipeline = Some(pipeline);
         Ok(())
     }
-    
+
     /// Gets or creates the backward bias pipeline.
     pub fn get_backward_bias_pipeline(
         &mut self,
@@ -533,75 +575,82 @@ impl PipelineCache {
         }
         Ok(self.backward_bias_pipeline.as_ref().unwrap())
     }
-    
+
     fn create_backward_bias_pipeline(
         &mut self,
         bias_layout: &wgpu::BindGroupLayout,
     ) -> ArkanResult<()> {
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Backward Bias Shader"),
-            source: wgpu::ShaderSource::Wgsl(shaders::BACKWARD_BIAS_SHADER.into()),
-        });
-        
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Backward Bias Pipeline Layout"),
-            bind_group_layouts: &[bias_layout],
-            push_constant_ranges: &[],
-        });
-        
-        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Backward Bias Pipeline"),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some("backward_bias_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Backward Bias Shader"),
+                source: wgpu::ShaderSource::Wgsl(shaders::BACKWARD_BIAS_SHADER.into()),
+            });
+
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Backward Bias Pipeline Layout"),
+                bind_group_layouts: &[bias_layout],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Backward Bias Pipeline"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("backward_bias_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         self.backward_bias_pipeline = Some(pipeline);
         Ok(())
     }
-    
+
     /// Creates bias bind group layout for backward pass.
     pub fn create_bias_bind_group_layout(&self) -> wgpu::BindGroupLayout {
-        self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Bias Backward BindGroupLayout"),
-            entries: &[
-                // binding 0: uniforms
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        self.device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Bias Backward BindGroupLayout"),
+                entries: &[
+                    // binding 0: uniforms
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                // binding 1: grad_output (read)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    // binding 1: grad_output (read)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                // binding 2: grad_bias (write)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    // binding 2: grad_bias (write)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        })
+                ],
+            })
     }
 }
 
@@ -609,11 +658,23 @@ impl std::fmt::Debug for PipelineCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PipelineCache")
             .field("has_forward", &self.forward_pipeline.is_some())
-            .field("has_forward_simple", &self.forward_simple_pipeline.is_some())
+            .field(
+                "has_forward_simple",
+                &self.forward_simple_pipeline.is_some(),
+            )
             .field("has_softmax", &self.softmax_pipeline.is_some())
-            .field("has_forward_training", &self.forward_training_pipeline.is_some())
-            .field("has_backward_weights", &self.backward_weights_pipeline.is_some())
-            .field("has_backward_input", &self.backward_input_pipeline.is_some())
+            .field(
+                "has_forward_training",
+                &self.forward_training_pipeline.is_some(),
+            )
+            .field(
+                "has_backward_weights",
+                &self.backward_weights_pipeline.is_some(),
+            )
+            .field(
+                "has_backward_input",
+                &self.backward_input_pipeline.is_some(),
+            )
             .field("has_backward_bias", &self.backward_bias_pipeline.is_some())
             .finish()
     }

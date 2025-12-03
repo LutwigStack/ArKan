@@ -52,7 +52,6 @@ pub struct GpuWorkspace {
     pub intermediates: Vec<GpuTensor>,
 
     // === Training buffers ===
-    
     /// Saved normalized inputs per layer [layer][batch * in_dim].
     pub z_values: Vec<GpuTensor>,
     /// Saved span indices per layer [layer][batch * in_dim].
@@ -63,12 +62,12 @@ pub struct GpuWorkspace {
     pub grad_input: Option<GpuTensor>,
     /// 1/std for each input dimension `(in_dim,)` per layer.
     pub std_inv: Vec<GpuTensor>,
-    
+
     /// Gradient of weights per layer `(layer, out_dim * in_dim * basis_padded)`.
     pub grad_weights: Vec<GpuTensor>,
     /// Gradient of biases per layer `(layer, out_dim)`.
     pub grad_bias: Vec<GpuTensor>,
-    
+
     /// Input dimension (fixed).
     pub in_dim: usize,
     /// Output dimension (fixed).
@@ -203,7 +202,8 @@ impl GpuWorkspace {
         if exceeds_vram_limit(input_bytes) || exceeds_vram_limit(output_bytes) {
             return Err(ArkanError::batch_too_large(
                 batch_size,
-                (MAX_VRAM_ALLOC / (self.in_dim.max(self.out_dim) * std::mem::size_of::<f32>()) as u64)
+                (MAX_VRAM_ALLOC
+                    / (self.in_dim.max(self.out_dim) * std::mem::size_of::<f32>()) as u64)
                     as usize,
             ));
         }
@@ -291,20 +291,20 @@ impl GpuWorkspace {
         batch_size: usize,
     ) -> ArkanResult<()> {
         let num_layers = layer_dims.len().saturating_sub(1);
-        
+
         // Allocate z_values and span_indices for each layer
         if self.z_values.len() != num_layers {
             self.z_values.clear();
             self.span_indices.clear();
-            
+
             for i in 0..num_layers {
                 let in_dim = layer_dims[i];
                 let size = batch_size * in_dim;
-                
+
                 // z_values: normalized inputs
                 let z = GpuTensor::storage_read_write(device, vec![batch_size, in_dim])?;
                 self.z_values.push(z);
-                
+
                 // span_indices: u32 indices
                 let span_buf = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(&format!("SpanIndices layer {}", i)),
@@ -314,25 +314,27 @@ impl GpuWorkspace {
                 });
                 self.span_indices.push(span_buf);
             }
-            
+
             self.invalidate_cache();
         }
-        
+
         // Max dim across all layers for gradient buffer reuse during backward pass
         // Backward pass uses grad_output to propagate gradients between layers,
         // so it needs to hold gradients of any intermediate layer size
         let max_dim = layer_dims.iter().max().copied().unwrap_or(self.in_dim);
-        
+
         // Allocate grad_output if needed (uses max_dim for intermediate gradient propagation)
-        if self.grad_output.is_none() || self.grad_output.as_ref().unwrap().shape[0] < batch_size 
-            || self.grad_output.as_ref().unwrap().shape[1] < max_dim {
+        if self.grad_output.is_none()
+            || self.grad_output.as_ref().unwrap().shape[0] < batch_size
+            || self.grad_output.as_ref().unwrap().shape[1] < max_dim
+        {
             self.grad_output = Some(GpuTensor::storage_read_write(
                 device,
                 vec![batch_size, max_dim],
             )?);
             self.invalidate_cache();
         }
-        
+
         // Allocate grad_input (max dim across layers for reuse)
         if self.grad_input.is_none() || self.grad_input.as_ref().unwrap().shape[0] < batch_size {
             self.grad_input = Some(GpuTensor::storage_read_write(
@@ -341,10 +343,10 @@ impl GpuWorkspace {
             )?);
             self.invalidate_cache();
         }
-        
+
         Ok(())
     }
-    
+
     /// Prepares gradient buffers for backward pass.
     ///
     /// # Arguments
@@ -357,32 +359,34 @@ impl GpuWorkspace {
         layer_specs: &[(usize, usize, usize)],
     ) -> ArkanResult<()> {
         let num_layers = layer_specs.len();
-        
+
         // Check if we need to reallocate
         let needs_realloc = self.grad_weights.len() != num_layers
-            || self.grad_weights.iter().zip(layer_specs.iter()).any(|(gw, &(in_d, out_d, basis))| {
-                gw.num_elements() < out_d * in_d * basis
-            });
-        
+            || self
+                .grad_weights
+                .iter()
+                .zip(layer_specs.iter())
+                .any(|(gw, &(in_d, out_d, basis))| gw.num_elements() < out_d * in_d * basis);
+
         if needs_realloc {
             self.grad_weights.clear();
             self.grad_bias.clear();
-            
+
             for &(in_dim, out_dim, basis_padded) in layer_specs.iter() {
                 let weight_size = out_dim * in_dim * basis_padded;
                 let gw = GpuTensor::storage_read_write(device, vec![weight_size])?;
                 self.grad_weights.push(gw);
-                
+
                 let gb = GpuTensor::storage_read_write(device, vec![out_dim])?;
                 self.grad_bias.push(gb);
             }
-            
+
             self.invalidate_cache();
         }
-        
+
         Ok(())
     }
-    
+
     /// Clears gradient buffers to zero (must be called before backward pass).
     pub fn zero_grad_buffers(&self, queue: &wgpu::Queue) {
         for gw in &self.grad_weights {
@@ -394,7 +398,7 @@ impl GpuWorkspace {
             gb.update(queue, &zeros);
         }
     }
-    
+
     /// Downloads weight gradients for a specific layer.
     pub fn download_grad_weights(
         &self,
@@ -402,11 +406,12 @@ impl GpuWorkspace {
         queue: &wgpu::Queue,
         layer_idx: usize,
     ) -> ArkanResult<Vec<f32>> {
-        let gw = self.grad_weights.get(layer_idx)
-            .ok_or_else(|| ArkanError::buffer(&format!("grad_weights[{}] not allocated", layer_idx)))?;
+        let gw = self.grad_weights.get(layer_idx).ok_or_else(|| {
+            ArkanError::buffer(&format!("grad_weights[{}] not allocated", layer_idx))
+        })?;
         gw.download(device, queue)
     }
-    
+
     /// Downloads bias gradients for a specific layer.
     pub fn download_grad_bias(
         &self,
@@ -414,8 +419,9 @@ impl GpuWorkspace {
         queue: &wgpu::Queue,
         layer_idx: usize,
     ) -> ArkanResult<Vec<f32>> {
-        let gb = self.grad_bias.get(layer_idx)
-            .ok_or_else(|| ArkanError::buffer(&format!("grad_bias[{}] not allocated", layer_idx)))?;
+        let gb = self.grad_bias.get(layer_idx).ok_or_else(|| {
+            ArkanError::buffer(&format!("grad_bias[{}] not allocated", layer_idx))
+        })?;
         gb.download(device, queue)
     }
 
@@ -427,12 +433,12 @@ impl GpuWorkspace {
         layer_std_inv: &[Vec<f32>],
     ) -> ArkanResult<()> {
         self.std_inv.clear();
-        
+
         for std_inv_vals in layer_std_inv {
             let tensor = GpuTensor::storage_read(device, std_inv_vals, vec![std_inv_vals.len()])?;
             self.std_inv.push(tensor);
         }
-        
+
         self.invalidate_cache();
         Ok(())
     }
@@ -443,7 +449,7 @@ impl GpuWorkspace {
             .grad_output
             .as_ref()
             .ok_or_else(|| ArkanError::buffer("grad_output not allocated"))?;
-        
+
         grad_output.update(queue, grad);
         Ok(())
     }
@@ -460,7 +466,7 @@ impl GpuWorkspace {
             .grad_input
             .as_ref()
             .ok_or_else(|| ArkanError::buffer("grad_input not allocated"))?;
-        
+
         let full_data = grad_input.download(device, queue)?;
         let used = batch_size * in_dim;
         Ok(full_data[..used].to_vec())
@@ -526,7 +532,8 @@ impl GpuWorkspace {
     ) -> ArkanResult<&wgpu::BindGroup> {
         // Ensure cache vector is large enough
         if self.cached_layer_bind_groups.len() < num_layers {
-            self.cached_layer_bind_groups.resize_with(num_layers, || None);
+            self.cached_layer_bind_groups
+                .resize_with(num_layers, || None);
         }
 
         // Check if already cached
@@ -538,32 +545,50 @@ impl GpuWorkspace {
         let (input_buffer, output_buffer) = if layer_idx == 0 {
             // First layer: input from workspace.input, output to intermediate[0]
             (
-                self.input.as_ref()
+                self.input
+                    .as_ref()
                     .ok_or_else(|| ArkanError::buffer("No input buffer"))?
-                    .buffer.as_entire_binding(),
-                self.intermediates.get(0)
+                    .buffer
+                    .as_entire_binding(),
+                self.intermediates
+                    .get(0)
                     .ok_or_else(|| ArkanError::buffer("No intermediate buffer 0"))?
-                    .buffer.as_entire_binding(),
+                    .buffer
+                    .as_entire_binding(),
             )
         } else if layer_idx == num_layers - 1 {
             // Last layer: input from intermediate[n-2], output to workspace.output
             (
-                self.intermediates.get(layer_idx - 1)
-                    .ok_or_else(|| ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1)))?
-                    .buffer.as_entire_binding(),
-                self.output.as_ref()
+                self.intermediates
+                    .get(layer_idx - 1)
+                    .ok_or_else(|| {
+                        ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1))
+                    })?
+                    .buffer
+                    .as_entire_binding(),
+                self.output
+                    .as_ref()
                     .ok_or_else(|| ArkanError::buffer("No output buffer"))?
-                    .buffer.as_entire_binding(),
+                    .buffer
+                    .as_entire_binding(),
             )
         } else {
             // Middle layer: intermediate[i-1] -> intermediate[i]
             (
-                self.intermediates.get(layer_idx - 1)
-                    .ok_or_else(|| ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1)))?
-                    .buffer.as_entire_binding(),
-                self.intermediates.get(layer_idx)
-                    .ok_or_else(|| ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx)))?
-                    .buffer.as_entire_binding(),
+                self.intermediates
+                    .get(layer_idx - 1)
+                    .ok_or_else(|| {
+                        ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1))
+                    })?
+                    .buffer
+                    .as_entire_binding(),
+                self.intermediates
+                    .get(layer_idx)
+                    .ok_or_else(|| {
+                        ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx))
+                    })?
+                    .buffer
+                    .as_entire_binding(),
             )
         };
 
@@ -586,9 +611,9 @@ impl GpuWorkspace {
         self.cached_layer_bind_groups[layer_idx] = Some(bind_group);
         Ok(self.cached_layer_bind_groups[layer_idx].as_ref().unwrap())
     }
-    
+
     // ==================== Training Bind Groups ====================
-    
+
     /// Gets or creates the training bind group for a single-layer network.
     ///
     /// Bindings: input, output, z_values, span_indices
@@ -603,24 +628,37 @@ impl GpuWorkspace {
         // Ensure cache vector is large enough
         let num_layers = self.z_values.len().max(1);
         if self.cached_training_bind_groups.len() < num_layers {
-            self.cached_training_bind_groups.resize_with(num_layers, || None);
+            self.cached_training_bind_groups
+                .resize_with(num_layers, || None);
         }
-        
+
         // Check if already cached for this layer
-        if self.cached_training_bind_groups.get(layer_idx).map_or(false, |bg| bg.is_some()) {
-            return Ok(self.cached_training_bind_groups[layer_idx].as_ref().unwrap());
+        if self
+            .cached_training_bind_groups
+            .get(layer_idx)
+            .map_or(false, |bg| bg.is_some())
+        {
+            return Ok(self.cached_training_bind_groups[layer_idx]
+                .as_ref()
+                .unwrap());
         }
-        
+
         // Get buffers
-        let input = self.input.as_ref()
+        let input = self
+            .input
+            .as_ref()
             .ok_or_else(|| ArkanError::buffer("Input buffer not allocated"))?;
-        let output = self.output.as_ref()
+        let output = self
+            .output
+            .as_ref()
             .ok_or_else(|| ArkanError::buffer("Output buffer not allocated"))?;
-        let z_values = self.z_values.get(layer_idx)
-            .ok_or_else(|| ArkanError::buffer(&format!("z_values buffer {} not allocated", layer_idx)))?;
-        let span_indices = self.span_indices.get(layer_idx)
-            .ok_or_else(|| ArkanError::buffer(&format!("span_indices buffer {} not allocated", layer_idx)))?;
-        
+        let z_values = self.z_values.get(layer_idx).ok_or_else(|| {
+            ArkanError::buffer(&format!("z_values buffer {} not allocated", layer_idx))
+        })?;
+        let span_indices = self.span_indices.get(layer_idx).ok_or_else(|| {
+            ArkanError::buffer(&format!("span_indices buffer {} not allocated", layer_idx))
+        })?;
+
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(&format!("Training BindGroup Layer {}", layer_idx)),
             layout,
@@ -643,14 +681,17 @@ impl GpuWorkspace {
                 },
             ],
         });
-        
+
         if layer_idx >= self.cached_training_bind_groups.len() {
-            self.cached_training_bind_groups.resize_with(layer_idx + 1, || None);
+            self.cached_training_bind_groups
+                .resize_with(layer_idx + 1, || None);
         }
         self.cached_training_bind_groups[layer_idx] = Some(bind_group);
-        Ok(self.cached_training_bind_groups[layer_idx].as_ref().unwrap())
+        Ok(self.cached_training_bind_groups[layer_idx]
+            .as_ref()
+            .unwrap())
     }
-    
+
     /// Gets or creates the training bind group for a layer in multi-layer network.
     ///
     /// Bindings: input, output, z_values, span_indices
@@ -665,50 +706,73 @@ impl GpuWorkspace {
     ) -> ArkanResult<&wgpu::BindGroup> {
         // Ensure cache vector is large enough
         if self.cached_training_bind_groups.len() < num_layers {
-            self.cached_training_bind_groups.resize_with(num_layers, || None);
+            self.cached_training_bind_groups
+                .resize_with(num_layers, || None);
         }
-        
+
         // Check if already cached for this layer
         if self.cached_training_bind_groups[layer_idx].is_some() {
-            return Ok(self.cached_training_bind_groups[layer_idx].as_ref().unwrap());
+            return Ok(self.cached_training_bind_groups[layer_idx]
+                .as_ref()
+                .unwrap());
         }
-        
+
         // Determine input and output buffers (same routing as forward)
         let (input_buffer, output_buffer) = if layer_idx == 0 {
             (
-                self.input.as_ref()
+                self.input
+                    .as_ref()
                     .ok_or_else(|| ArkanError::buffer("No input buffer"))?
-                    .buffer.as_entire_binding(),
-                self.intermediates.get(0)
+                    .buffer
+                    .as_entire_binding(),
+                self.intermediates
+                    .get(0)
                     .ok_or_else(|| ArkanError::buffer("No intermediate buffer 0"))?
-                    .buffer.as_entire_binding(),
+                    .buffer
+                    .as_entire_binding(),
             )
         } else if layer_idx == num_layers - 1 {
             (
-                self.intermediates.get(layer_idx - 1)
-                    .ok_or_else(|| ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1)))?
-                    .buffer.as_entire_binding(),
-                self.output.as_ref()
+                self.intermediates
+                    .get(layer_idx - 1)
+                    .ok_or_else(|| {
+                        ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1))
+                    })?
+                    .buffer
+                    .as_entire_binding(),
+                self.output
+                    .as_ref()
                     .ok_or_else(|| ArkanError::buffer("No output buffer"))?
-                    .buffer.as_entire_binding(),
+                    .buffer
+                    .as_entire_binding(),
             )
         } else {
             (
-                self.intermediates.get(layer_idx - 1)
-                    .ok_or_else(|| ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1)))?
-                    .buffer.as_entire_binding(),
-                self.intermediates.get(layer_idx)
-                    .ok_or_else(|| ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx)))?
-                    .buffer.as_entire_binding(),
+                self.intermediates
+                    .get(layer_idx - 1)
+                    .ok_or_else(|| {
+                        ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1))
+                    })?
+                    .buffer
+                    .as_entire_binding(),
+                self.intermediates
+                    .get(layer_idx)
+                    .ok_or_else(|| {
+                        ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx))
+                    })?
+                    .buffer
+                    .as_entire_binding(),
             )
         };
-        
+
         // Get training buffers
-        let z_values = self.z_values.get(layer_idx)
-            .ok_or_else(|| ArkanError::buffer(&format!("z_values buffer {} not allocated", layer_idx)))?;
-        let span_indices = self.span_indices.get(layer_idx)
-            .ok_or_else(|| ArkanError::buffer(&format!("span_indices buffer {} not allocated", layer_idx)))?;
-        
+        let z_values = self.z_values.get(layer_idx).ok_or_else(|| {
+            ArkanError::buffer(&format!("z_values buffer {} not allocated", layer_idx))
+        })?;
+        let span_indices = self.span_indices.get(layer_idx).ok_or_else(|| {
+            ArkanError::buffer(&format!("span_indices buffer {} not allocated", layer_idx))
+        })?;
+
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(&format!("Training Layer {} BindGroup", layer_idx)),
             layout,
@@ -731,9 +795,11 @@ impl GpuWorkspace {
                 },
             ],
         });
-        
+
         self.cached_training_bind_groups[layer_idx] = Some(bind_group);
-        Ok(self.cached_training_bind_groups[layer_idx].as_ref().unwrap())
+        Ok(self.cached_training_bind_groups[layer_idx]
+            .as_ref()
+            .unwrap())
     }
 
     /// Uploads input data to the GPU.
