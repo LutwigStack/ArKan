@@ -1,13 +1,78 @@
 //! B-spline basis computation with SIMD optimization.
+//!
+//! This module provides the core B-spline computations used by KAN layers:
+//! - Knot vector generation
+//! - Basis function evaluation (Cox-de Boor algorithm)
+//! - Derivative computation for backpropagation
+//! - SIMD-accelerated batch operations
+//!
+//! # B-spline Basics
+//!
+//! A B-spline of order `p` (degree `p`) is defined by:
+//! - A knot vector `t₀ ≤ t₁ ≤ ... ≤ tₘ`
+//! - `n = m - p - 1` basis functions
+//!
+//! The Cox-de Boor recursion computes basis values:
+//!
+//! $$B_{i,0}(x) = \begin{cases} 1 & t_i \leq x < t_{i+1} \\ 0 & \text{otherwise} \end{cases}$$
+//!
+//! $$B_{i,p}(x) = \frac{x - t_i}{t_{i+p} - t_i} B_{i,p-1}(x) + \frac{t_{i+p+1} - x}{t_{i+p+1} - t_{i+1}} B_{i+1,p-1}(x)$$
+//!
+//! # Partition of Unity
+//!
+//! B-spline basis functions sum to 1 at any point:
+//! $\sum_i B_{i,p}(x) = 1$
+//!
+//! This property is preserved in all computations.
+//!
+//! # Example
+//!
+//! ```rust
+//! use arkan::spline::{compute_knots, find_span, compute_basis};
+//!
+//! let knots = compute_knots(5, 3, (0.0, 1.0));
+//! let x = 0.5;
+//! let span = find_span(x, &knots, 3, 5);
+//!
+//! let mut basis = [0.0f32; 8];
+//! compute_basis(x, span, &knots, 3, &mut basis);
+//!
+//! // Verify partition of unity
+//! let sum: f32 = basis[..4].iter().sum();
+//! assert!((sum - 1.0).abs() < 1e-5);
+//! ```
 
 use crate::config::{KanConfig, EPSILON};
 
-/// Максимальный поддерживаемый порядок сплайна (degree <= 7).
+/// Maximum supported spline order (degree ≤ 7).
+///
+/// Higher orders require more storage for the de Boor algorithm.
 const MAX_ORDER: usize = 7;
 use wide::f32x8;
 
 /// Computes uniform B-spline knot vector.
-/// For grid_size G and order k, we have G+2k+1 knots.
+///
+/// For `grid_size` G and `order` k, generates `G + 2k + 1` knots
+/// uniformly spaced within the grid range.
+///
+/// # Arguments
+///
+/// * `grid_size` - Number of grid intervals
+/// * `order` - Spline order (degree)
+/// * `grid_range` - (min, max) values for the grid
+///
+/// # Returns
+///
+/// Vector of knot values.
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::spline::compute_knots;
+///
+/// let knots = compute_knots(5, 3, (0.0, 1.0));
+/// assert_eq!(knots.len(), 5 + 2 * 3 + 1); // 12 knots
+/// ```
 #[inline]
 pub fn compute_knots(grid_size: usize, order: usize, grid_range: (f32, f32)) -> Vec<f32> {
     let (t_min, t_max) = grid_range;
@@ -19,8 +84,21 @@ pub fn compute_knots(grid_size: usize, order: usize, grid_range: (f32, f32)) -> 
         .collect()
 }
 
-/// Finds the knot span index for a given value.
-/// Returns index i such that knots[i] <= x < knots[i+1].
+/// Finds the knot span index for a given value in O(1) time.
+///
+/// Returns index `i` such that `knots[i] <= x < knots[i+1]`.
+/// Uses uniform grid assumption for constant-time lookup.
+///
+/// # Arguments
+///
+/// * `x` - Input value to locate
+/// * `knots` - Knot vector from [`compute_knots`]
+/// * `order` - Spline order
+/// * `grid_size` - Number of grid intervals
+///
+/// # Returns
+///
+/// Span index in range `[order, order + grid_size - 1]`.
 #[inline]
 pub fn find_span(x: f32, knots: &[f32], order: usize, grid_size: usize) -> usize {
     // Uniform grid, so we can compute span in O(1).
@@ -43,11 +121,28 @@ pub fn find_span(x: f32, knots: &[f32], order: usize, grid_size: usize) -> usize
     (idx as usize) + order
 }
 
-/// Computes non-vanishing B-spline basis functions at x.
-/// Uses the Cox-de Boor algorithm.
+/// Computes non-vanishing B-spline basis functions at point x.
 ///
-/// Returns (order+1) values in `basis_out`.
-/// The basis functions are N_{span-order}, N_{span-order+1}, ..., N_{span}.
+/// Uses the Cox-de Boor algorithm. At any point, exactly `order + 1`
+/// basis functions are non-zero.
+///
+/// # Arguments
+///
+/// * `x` - Evaluation point
+/// * `span` - Knot span index from [`find_span`]
+/// * `knots` - Knot vector
+/// * `order` - Spline order
+/// * `basis_out` - Output buffer (must have length ≥ `order + 1`)
+///
+/// # Output
+///
+/// Stores `order + 1` basis values in `basis_out`:
+/// - `basis_out[0]` = N_{span-order}(x)
+/// - `basis_out[1]` = N_{span-order+1}(x)
+/// - ...
+/// - `basis_out[order]` = N_{span}(x)
+///
+/// The values sum to 1.0 (partition of unity).
 #[inline]
 pub fn compute_basis(x: f32, span: usize, knots: &[f32], order: usize, basis_out: &mut [f32]) {
     debug_assert!(basis_out.len() > order);
@@ -77,11 +172,22 @@ pub fn compute_basis(x: f32, span: usize, knots: &[f32], order: usize, basis_out
     }
 }
 
-/// Computes basis functions and their derivatives.
+/// Computes basis functions and their first derivatives.
 ///
-/// Returns:
-/// - basis_out: [order+1] basis function values
-/// - deriv_out: [order+1] first derivatives
+/// Used during backward pass to compute gradients.
+///
+/// # Arguments
+///
+/// * `x` - Evaluation point
+/// * `span` - Knot span index
+/// * `knots` - Knot vector
+/// * `order` - Spline order
+/// * `basis_out` - Output buffer for basis values (length ≥ `order + 1`)
+/// * `deriv_out` - Output buffer for derivatives (length ≥ `order + 1`)
+///
+/// # Derivative Formula
+///
+/// $$\frac{d}{dx} B_{i,p}(x) = p \left( \frac{B_{i,p-1}(x)}{t_{i+p} - t_i} - \frac{B_{i+1,p-1}(x)}{t_{i+p+1} - t_{i+1}} \right)$$
 #[inline]
 pub fn compute_basis_and_deriv(
     x: f32,
@@ -173,9 +279,19 @@ pub fn compute_basis_and_deriv(
     }
 }
 
-/// Batched normalization: z = clamp((x - mean) / std, grid_min, grid_max)
+/// Batched normalization with SIMD acceleration.
 ///
-/// Processes 8 samples at a time using SIMD.
+/// Computes: `z = clamp((x - mean) / std, grid_min, grid_max)`
+///
+/// Processes 8 samples at a time using AVX/SSE SIMD instructions.
+///
+/// # Arguments
+///
+/// * `x` - Input values: `[batch_size * input_dim]` (row-major)
+/// * `mean` - Per-feature mean: `[input_dim]`
+/// * `std` - Per-feature std: `[input_dim]`
+/// * `grid_range` - (min, max) clamp values
+/// * `z_out` - Output buffer: `[batch_size * input_dim]`
 #[inline]
 pub fn normalize_batch(
     x: &[f32],    // [batch * input_dim], Row-Major
@@ -231,9 +347,18 @@ pub fn normalize_batch(
     }
 }
 
-/// Batched basis computation for all inputs.
+/// Batched basis computation for all inputs in a batch.
 ///
-/// For each sample and input, computes basis functions and stores in basis_out.
+/// Computes normalized inputs, finds spans, and evaluates basis functions
+/// for the entire batch at once.
+///
+/// # Arguments
+///
+/// * `z` - Normalized inputs: `[batch_size * input_dim]`
+/// * `knots` - Knot vector: `[grid_size + 2*order + 1]`
+/// * `config` - Network configuration
+/// * `grid_indices` - Output span indices: `[batch_size * input_dim]`
+/// * `basis_out` - Output basis values: `[batch_size * input_dim * basis_aligned]`
 #[inline]
 pub fn compute_basis_batch(
     z: &[f32],     // [batch * input_dim], normalized inputs

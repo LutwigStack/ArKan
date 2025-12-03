@@ -1,24 +1,110 @@
-//! Configuration for KAN network.
+//! Network configuration and hyperparameters.
+//!
+//! This module provides [`KanConfig`] for configuring KAN networks,
+//! including architecture, spline parameters, and normalization.
+//!
+//! # Example
+//!
+//! ```rust
+//! use arkan::KanConfig;
+//!
+//! // Use preset for poker solver
+//! let config = KanConfig::default_poker();
+//! assert_eq!(config.layer_dims(), vec![21, 64, 64, 24]);
+//!
+//! // Or customize
+//! let config = KanConfig {
+//!     input_dim: 10,
+//!     output_dim: 5,
+//!     hidden_dims: vec![32, 32],
+//!     grid_size: 8,
+//!     spline_order: 3,
+//!     ..Default::default()
+//! };
+//! ```
+//!
+//! # Spline Parameters
+//!
+//! The spline configuration determines expressiveness and speed:
+//!
+//! | Parameter | Typical Values | Effect |
+//! |-----------|---------------|--------|
+//! | `grid_size` | 3-16 | More intervals = finer control, more params |
+//! | `spline_order` | 2-5 | Higher = smoother functions, more compute |
+//!
+//! **Recommended**: `grid_size=5`, `spline_order=3` (cubic) for balanced performance.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// Minimum value for standard deviation to avoid division by zero.
+///
+/// Used in normalization calculations to prevent numerical instability.
 pub const EPSILON: f32 = 1e-6;
 
 /// Default grid size (number of intervals).
+///
+/// A grid size of 5 provides a good balance between expressiveness
+/// and computational cost for most applications.
 pub const DEFAULT_GRID_SIZE: usize = 5;
 
 /// Default spline order (cubic).
+///
+/// Cubic splines (order 3) offer smooth second derivatives,
+/// making them ideal for function approximation.
 pub const DEFAULT_SPLINE_ORDER: usize = 3;
 
-/// Number of basis functions = grid_size + spline_order.
+/// Computes the number of basis functions for given spline parameters.
+///
+/// For a B-spline with `grid_size` intervals and polynomial `order`,
+/// the number of basis functions is `grid_size + order`.
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::config::basis_size;
+///
+/// // Cubic spline with 5 intervals: 5 + 3 = 8 basis functions
+/// assert_eq!(basis_size(5, 3), 8);
+/// ```
 #[inline]
 pub const fn basis_size(grid_size: usize, spline_order: usize) -> usize {
     grid_size + spline_order
 }
 
 /// KAN network configuration.
+///
+/// This struct defines all hyperparameters for a Kolmogorov-Arnold Network,
+/// including architecture, spline parameters, and input normalization.
+///
+/// # Creating a Configuration
+///
+/// ```rust
+/// use arkan::KanConfig;
+///
+/// // Preset for poker solver (recommended starting point)
+/// let config = KanConfig::default_poker();
+///
+/// // Custom configuration
+/// let config = KanConfig {
+///     input_dim: 10,
+///     output_dim: 5,
+///     hidden_dims: vec![64, 64],
+///     grid_size: 5,
+///     spline_order: 3,
+///     input_mean: vec![0.0; 10], // Must match input_dim
+///     input_std: vec![1.0; 10],  // Must match input_dim
+///     ..Default::default()
+/// };
+///
+/// // Always validate before use
+/// config.validate().expect("Invalid configuration");
+/// ```
+///
+/// # Architecture
+///
+/// The network has layers: `input_dim → hidden_dims[0] → ... → output_dim`.
+/// Use [`layer_dims`](Self::layer_dims) to get the full dimension list.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct KanConfig {
@@ -78,9 +164,20 @@ impl Default for KanConfig {
 impl KanConfig {
     /// Creates a configuration optimized for poker solver.
     ///
-    /// - Input: 21 features (from nn crate)
-    /// - Output: 24 (8 strategy probs + 8 Q-values + 8 mask)
-    /// - Hidden: [64, 64]
+    /// Architecture: `[21, 64, 64, 24]` with cubic splines (order 3, grid 5).
+    ///
+    /// - **Input**: 21 features (game state encoding)
+    /// - **Output**: 24 values (8 strategy probs + 8 Q-values + 8 mask)
+    /// - **Hidden**: Two layers of 64 neurons each
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::KanConfig;
+    ///
+    /// let config = KanConfig::default_poker();
+    /// assert_eq!(config.layer_dims(), vec![21, 64, 64, 24]);
+    /// ```
     pub fn default_poker() -> Self {
         Self {
             input_dim: 21,
@@ -97,26 +194,50 @@ impl KanConfig {
         }
     }
 
-    /// Number of basis functions per connection.
+    /// Returns the number of basis functions per connection.
+    ///
+    /// This equals `grid_size + spline_order`. For the default poker config
+    /// (grid=5, order=3), this returns 8.
     #[inline]
     pub fn basis_size(&self) -> usize {
         basis_size(self.grid_size, self.spline_order)
     }
 
-    /// Basis size padded to SIMD width.
+    /// Returns basis size padded to SIMD width for aligned memory access.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::KanConfig;
+    ///
+    /// let config = KanConfig::default_poker();
+    /// // basis_size=8 is already aligned to simd_width=8
+    /// assert_eq!(config.basis_size_aligned(), 8);
+    /// ```
     #[inline]
     pub fn basis_size_aligned(&self) -> usize {
         let bs = self.basis_size();
         bs.div_ceil(self.simd_width) * self.simd_width
     }
 
-    /// Total number of layers (hidden + output).
+    /// Returns total number of layers (hidden + output).
+    ///
+    /// Note: This does NOT include the input "layer" (which is just data).
     #[inline]
     pub fn num_layers(&self) -> usize {
         self.hidden_dims.len() + 1
     }
 
-    /// Layer dimensions: [input, hidden..., output].
+    /// Returns all layer dimensions: `[input, hidden..., output]`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::KanConfig;
+    ///
+    /// let config = KanConfig::default_poker();
+    /// assert_eq!(config.layer_dims(), vec![21, 64, 64, 24]);
+    /// ```
     pub fn layer_dims(&self) -> Vec<usize> {
         let mut dims = Vec::with_capacity(self.num_layers() + 1);
         dims.push(self.input_dim);
@@ -125,7 +246,34 @@ impl KanConfig {
         dims
     }
 
-    /// Validates the configuration.
+    /// Validates the configuration and returns any errors.
+    ///
+    /// Should be called before creating a [`KanNetwork`](crate::KanNetwork).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] if:
+    /// - Dimensions are zero
+    /// - `grid_size` not in 1..=16
+    /// - `spline_order` not in 1..=5
+    /// - `grid_range.0 >= grid_range.1`
+    /// - Normalization arrays don't match `input_dim`
+    /// - `simd_width` is not 4, 8, or 16
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::KanConfig;
+    ///
+    /// let config = KanConfig::default_poker();
+    /// assert!(config.validate().is_ok());
+    ///
+    /// let bad_config = KanConfig {
+    ///     grid_size: 100, // Invalid!
+    ///     ..Default::default()
+    /// };
+    /// assert!(bad_config.validate().is_err());
+    /// ```
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.input_dim == 0 {
             return Err(ConfigError::InvalidDimension("input_dim must be > 0"));
@@ -164,6 +312,15 @@ impl KanConfig {
     }
 
     /// Updates normalization parameters from data statistics.
+    ///
+    /// # Arguments
+    ///
+    /// * `mean` - Per-feature mean values, length must equal `input_dim`
+    /// * `std` - Per-feature standard deviations, clamped to [`EPSILON`] minimum
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts if `mean.len() != input_dim` or `std.len() != input_dim`.
     pub fn set_normalization(&mut self, mean: Vec<f32>, std: Vec<f32>) {
         debug_assert_eq!(mean.len(), self.input_dim);
         debug_assert_eq!(std.len(), self.input_dim);
@@ -172,14 +329,22 @@ impl KanConfig {
     }
 }
 
-/// Per-layer configuration.
+/// Per-layer configuration (for advanced use cases).
+///
+/// Most users should use [`KanConfig`] instead. This struct is useful
+/// for fine-grained control over individual layers.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LayerConfig {
+    /// Input dimension for this layer.
     pub in_dim: usize,
+    /// Output dimension for this layer.
     pub out_dim: usize,
+    /// Number of grid intervals for B-splines.
     pub grid_size: usize,
+    /// B-spline polynomial order (3 = cubic).
     pub spline_order: usize,
+    /// Input normalization range `(min, max)`.
     pub grid_range: (f32, f32),
 }
 
@@ -195,24 +360,30 @@ impl Default for LayerConfig {
     }
 }
 
-/// Configuration errors.
+/// Errors returned by [`KanConfig::validate`].
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// A dimension parameter is invalid (zero or mismatched).
     #[error("Invalid dimension: {0}")]
     InvalidDimension(&'static str),
 
+    /// Grid size is out of valid range (1-16).
     #[error("Grid size must be 1-16, got {0}")]
     InvalidGridSize(usize),
 
+    /// Spline order is out of valid range (1-5).
     #[error("Spline order must be 1-5, got {0}")]
     InvalidSplineOrder(usize),
 
+    /// Grid range is invalid (min >= max).
     #[error("Invalid grid range")]
     InvalidGridRange,
 
+    /// Normalization arrays don't match input dimension.
     #[error("Mismatched normalization array: {0}")]
     MismatchedNormalization(&'static str),
 
+    /// SIMD width is not a valid value (4, 8, or 16).
     #[error("SIMD width must be 4, 8, or 16, got {0}")]
     InvalidSimdWidth(usize),
 }

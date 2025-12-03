@@ -1,18 +1,60 @@
 //! Loss functions with masking support.
+//!
+//! This module provides loss functions for training KAN networks:
+//!
+//! - [`masked_mse`] - Mean Squared Error with optional masking
+//! - [`masked_cross_entropy`] - Cross-Entropy for probability outputs
+//! - [`masked_huber`] - Huber (smooth L1) loss for robustness
+//! - [`poker_combined_loss`] - Specialized loss for poker Q-learning
+//!
+//! # Masking
+//!
+//! All loss functions support optional masks to:
+//! - Handle variable-length sequences
+//! - Ignore invalid outputs
+//! - Implement multi-task learning
+//!
+//! # Example
+//!
+//! ```rust
+//! use arkan::loss::masked_mse;
+//!
+//! let predictions = vec![0.5, 1.0, 1.5];
+//! let targets = vec![0.0, 1.0, 2.0];
+//! let mask = vec![1.0, 1.0, 0.0]; // Ignore last element
+//!
+//! let (loss, grad) = masked_mse(&predictions, &targets, Some(&mask));
+//! ```
 
 use crate::config::EPSILON;
 
 /// Masked Mean Squared Error loss.
 ///
-/// Computes MSE only for positions where mask > 0.
+/// Computes MSE only for positions where `mask > 0`.
 ///
 /// # Arguments
-/// * `predictions` - Model output [batch_size * output_dim]
-/// * `targets` - Ground truth [batch_size * output_dim]
-/// * `mask` - Optional mask [batch_size * output_dim], 1.0 for active, 0.0 for ignore
+///
+/// * `predictions` - Model output: `[batch_size * output_dim]`
+/// * `targets` - Ground truth: `[batch_size * output_dim]`
+/// * `mask` - Optional mask: `[batch_size * output_dim]`, 1.0 for active, 0.0 for ignore
 ///
 /// # Returns
-/// (loss, gradient) tuple
+///
+/// Tuple of (loss, gradient):
+/// - `loss`: Scalar MSE value averaged over masked elements
+/// - `gradient`: Vector of gradients for each prediction
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::loss::masked_mse;
+///
+/// let pred = vec![1.0, 2.0, 3.0];
+/// let target = vec![1.0, 1.0, 1.0];
+/// let (loss, grad) = masked_mse(&pred, &target, None);
+///
+/// assert!(loss > 0.0);
+/// ```
 pub fn masked_mse(predictions: &[f32], targets: &[f32], mask: Option<&[f32]>) -> (f32, Vec<f32>) {
     debug_assert_eq!(predictions.len(), targets.len());
 
@@ -45,16 +87,22 @@ pub fn masked_mse(predictions: &[f32], targets: &[f32], mask: Option<&[f32]>) ->
 
 /// Masked Cross-Entropy loss for probability outputs.
 ///
-/// For each batch element, computes cross-entropy for the masked output dimensions.
-/// Expects predictions to be in [0, 1] range (after softmax or sigmoid).
+/// Computes binary cross-entropy for each element, with optional masking.
+/// Expects predictions to be in (0, 1) range (after sigmoid).
 ///
 /// # Arguments
-/// * `predictions` - Probability predictions [batch_size * output_dim]
-/// * `targets` - Target probabilities [batch_size * output_dim]
-/// * `mask` - Optional mask [batch_size * output_dim]
+///
+/// * `predictions` - Probability predictions: `[batch_size * output_dim]`
+/// * `targets` - Target probabilities: `[batch_size * output_dim]`
+/// * `mask` - Optional mask
 ///
 /// # Returns
-/// (loss, gradient) tuple
+///
+/// Tuple of (loss, gradient)
+///
+/// # Note
+///
+/// Predictions are clamped to `[EPSILON, 1-EPSILON]` to avoid log(0).
 pub fn masked_cross_entropy(
     predictions: &[f32],
     targets: &[f32],
@@ -97,16 +145,24 @@ pub fn masked_cross_entropy(
 
 /// Combined loss for poker KAN: MSE for Q-values + Cross-Entropy for probabilities.
 ///
-/// The output layout is: [prob_0..prob_7, q_0..q_7, mask_0..mask_7]
-/// We use cross-entropy for probabilities and MSE for Q-values.
+/// Specialized loss function for poker Q-learning with action masking.
+///
+/// # Output Layout
+///
+/// The output has 24 dimensions per sample:
+/// - `[0..8]`: Action probabilities
+/// - `[8..16]`: Q-values
+/// - `[16..24]`: Action mask (1.0 for valid actions)
 ///
 /// # Arguments
-/// * `predictions` - Model output [batch_size * 24]
-/// * `targets` - Ground truth [batch_size * 24]
-/// * `alpha` - Weight for probability loss (1.0 - alpha for Q-value loss)
+///
+/// * `predictions` - Model output: `[batch_size * 24]`
+/// * `targets` - Ground truth: `[batch_size * 24]`
+/// * `alpha` - Weight for probability loss (0.0 to 1.0)
 ///
 /// # Returns
-/// (total_loss, prob_loss, q_loss, gradient)
+///
+/// Tuple of (total_loss, prob_loss, q_loss, gradient)
 pub fn poker_combined_loss(
     predictions: &[f32],
     targets: &[f32],
@@ -187,12 +243,22 @@ pub fn poker_combined_loss(
 
 /// Huber loss (smooth L1) for robust training.
 ///
-/// Combines L1 and L2 loss to be robust to outliers.
+/// Combines L1 and L2 loss to be robust to outliers:
+/// - Quadratic for small errors (|error| ≤ delta)
+/// - Linear for large errors (|error| > delta)
+///
+/// # Formula
+///
+/// $$L_\delta(a) = \begin{cases}
+///   \frac{1}{2}a^2 & |a| \leq \delta \\
+///   \delta(|a| - \frac{1}{2}\delta) & |a| > \delta
+/// \end{cases}$$
 ///
 /// # Arguments
+///
 /// * `predictions` - Model output
 /// * `targets` - Ground truth
-/// * `delta` - Threshold for switching between L1 and L2
+/// * `delta` - Threshold for switching between L1 and L2 (typically 1.0)
 /// * `mask` - Optional mask
 pub fn masked_huber(
     predictions: &[f32],
@@ -240,7 +306,14 @@ pub fn masked_huber(
 
 /// Computes softmax in-place.
 ///
-/// Applies softmax over the last dimension with the given size.
+/// Applies softmax over batches of size `dim_size`:
+///
+/// $$\text{softmax}(x_i) = \frac{e^{x_i}}{\sum_j e^{x_j}}$$
+///
+/// # Arguments
+///
+/// * `x` - Input logits (modified in-place)
+/// * `dim_size` - Size of each softmax group
 pub fn softmax(x: &mut [f32], dim_size: usize) {
     let batch_size = x.len() / dim_size;
 
@@ -266,10 +339,14 @@ pub fn softmax(x: &mut [f32], dim_size: usize) {
 
 /// Applies masked softmax where inactive positions get zero probability.
 ///
+/// Sets masked positions to `-inf` before softmax, effectively
+/// giving them zero probability in the output.
+///
 /// # Arguments
-/// * `x` - Input logits (will be modified in-place)
-/// * `mask` - Mask (1.0 for active, 0.0 for inactive)
-/// * `dim_size` - Size of the softmax dimension
+///
+/// * `x` - Input logits (modified in-place)
+/// * `mask` - Mask: 1.0 for active, 0.0 for inactive
+/// * `dim_size` - Size of each softmax group
 pub fn masked_softmax(x: &mut [f32], mask: &[f32], dim_size: usize) {
     let batch_size = x.len() / dim_size;
 

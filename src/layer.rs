@@ -1,21 +1,49 @@
 //! KAN Layer Implementation with B-spline basis functions.
 //!
+//! This module contains the [`KanLayer`] struct which implements a single
+//! Kolmogorov-Arnold Network layer using B-spline basis functions.
+//!
 //! # Mathematical Foundation
 //!
-//! Each layer computes: y[j] = Σ_i Σ_k c[j,i,k] * B_k(x[i])
+//! Each layer computes:
+//!
+//! $$y_j = \sum_i \sum_k c_{j,i,k} \cdot B_k(x_i)$$
 //!
 //! where:
-//! - x[i] is the i-th input (normalized to [0,1])
-//! - B_k are B-spline basis functions of given order
-//! - c[j,i,k] are learnable spline coefficients
+//! - $x_i$ is the i-th input (normalized to \[0,1\])
+//! - $B_k$ are B-spline basis functions of given order
+//! - $c_{j,i,k}$ are learnable spline coefficients
 //!
-//! # Spline Indexing (Critical!)
+//! # Spline Indexing
 //!
 //! For order `p` and `n` grid intervals:
 //! - Global basis count: `n + p` (NOT `p + 1`!)
 //! - Each input point activates exactly `p + 1` consecutive basis functions
 //! - Span `s` = floor(x * n), clamped to [p, n+p-1]
 //! - Active weights start at index `s - p` in global coefficient array
+//!
+//! # Example
+//!
+//! ```rust
+//! use arkan::{KanConfig, KanLayer};
+//!
+//! let config = KanConfig::default_poker();
+//! let layer = KanLayer::new(4, 8, &config);
+//!
+//! // Single sample forward pass
+//! let input = vec![0.1, 0.2, 0.3, 0.4];
+//! let mut output = vec![0.0; 8];
+//! let mut basis_buf = vec![0.0; layer.basis_aligned()];
+//!
+//! layer.forward_single(&input, &mut output, &mut basis_buf);
+//! ```
+//!
+//! # SIMD Optimization
+//!
+//! The layer uses SIMD instructions when available:
+//! - 8-wide AVX2 for batch sizes ≥ 8
+//! - 4-wide SSE4 for smaller batches
+//! - Scalar fallback for non-aligned cases
 
 use crate::buffer::Workspace;
 use crate::config::{KanConfig, EPSILON};
@@ -28,44 +56,93 @@ use wide::{f32x4, f32x8};
 use serde::{Deserialize, Serialize};
 
 /// A single KAN layer with learnable spline coefficients.
+///
+/// Each `KanLayer` transforms an input vector through learnable B-spline
+/// functions. Unlike traditional neural networks that use fixed activation
+/// functions, KAN layers learn the activation shape itself.
+///
+/// # Architecture
+///
+/// ```text
+/// Input[in_dim] → Normalize → B-spline Basis → Weighted Sum → Output[out_dim]
+/// ```
+///
+/// # Weight Layout
+///
+/// Weights are stored as a flat array with indexing:
+/// `weights[out_idx * in_dim * global_basis_size + in_idx * global_basis_size + basis_idx]`
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::{KanConfig, KanLayer};
+///
+/// let config = KanConfig::default_poker();
+/// let layer = KanLayer::new(4, 8, &config);
+///
+/// assert_eq!(layer.in_dim, 4);
+/// assert_eq!(layer.out_dim, 8);
+/// assert_eq!(layer.param_count(), 4 * 8 * (config.grid_size + config.spline_order) + 8);
+/// ```
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct KanLayer {
-    /// Input dimension
+    /// Input dimension.
     pub in_dim: usize,
-    /// Output dimension
+    /// Output dimension.
     pub out_dim: usize,
-    /// Spline order (degree)
+    /// Spline order (degree). Typical values: 2-4.
     pub order: usize,
-    /// Number of grid intervals
+    /// Number of grid intervals.
     pub grid_size: usize,
-    /// Global basis size = grid_size + order
+    /// Global basis size = `grid_size + order`.
     pub global_basis_size: usize,
-    /// Local basis size = order + 1 (active functions per input)
+    /// Local basis size = `order + 1` (active functions per input).
     pub local_basis_size: usize,
-    /// Local basis size aligned to SIMD width
+    /// Local basis size aligned to SIMD width for efficient operations.
     pub basis_aligned: usize,
-    /// Grid range (min, max)
+    /// Grid range (min, max) for input normalization.
     pub grid_range: (f32, f32),
-    /// Precomputed knot vector
+    /// Precomputed knot vector (skipped during serialization).
     #[cfg_attr(feature = "serde", serde(skip))]
     knots: Vec<f32>,
-    /// Per-input normalization mean
+    /// Per-input normalization mean.
     pub mean: Vec<f32>,
-    /// Per-input normalization std (clamped by EPSILON)
+    /// Per-input normalization std (clamped by [`EPSILON`]).
     pub std: Vec<f32>,
-    /// Spline coefficients: [out_dim][in_dim][global_basis_size]
-    /// Stored as flat array for cache efficiency
+    /// Spline coefficients: `[out_dim][in_dim][global_basis_size]` stored flat.
     pub weights: Vec<f32>,
-    /// Bias terms for each output
+    /// Bias terms for each output.
     pub bias: Vec<f32>,
-    /// SIMD width for aligned operations (reserved for future use)
+    /// SIMD width for aligned operations.
     #[allow(dead_code)]
     simd_width: usize,
 }
 
 impl KanLayer {
     /// Creates a new KAN layer with the given dimensions.
+    ///
+    /// Initializes weights using Xavier-like initialization scaled by 0.1.
+    /// Bias terms are initialized to zero.
+    ///
+    /// # Arguments
+    ///
+    /// * `in_dim` - Input dimension (must be positive)
+    /// * `out_dim` - Output dimension (must be positive)
+    /// * `config` - Network configuration containing spline parameters
+    ///
+    /// # Panics
+    ///
+    /// Panics if `in_dim` or `out_dim` is zero.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanLayer};
+    ///
+    /// let config = KanConfig::default_poker();
+    /// let layer = KanLayer::new(10, 20, &config);
+    /// ```
     pub fn new(in_dim: usize, out_dim: usize, config: &KanConfig) -> Self {
         assert!(in_dim > 0, "Input dimension must be positive");
         assert!(out_dim > 0, "Output dimension must be positive");
@@ -127,7 +204,8 @@ impl KanLayer {
         }
     }
 
-    /// Creates layer from config (alias for new).
+    /// Creates layer from config (alias for [`new`](Self::new)).
+    #[inline]
     pub fn from_config(in_dim: usize, out_dim: usize, config: &KanConfig) -> Self {
         Self::new(in_dim, out_dim, config)
     }
@@ -139,18 +217,29 @@ impl KanLayer {
     }
 
     /// Basis size aligned to SIMD width.
+    ///
+    /// Use this value to allocate basis function buffers for [`forward_single`](Self::forward_single).
     #[inline]
     pub fn basis_aligned(&self) -> usize {
         self.basis_aligned
     }
 
-    /// Total number of parameters.
+    /// Total number of trainable parameters (weights + biases).
     #[inline]
     pub fn param_count(&self) -> usize {
         self.weights.len() + self.bias.len()
     }
 
-    /// Sets normalization parameters (mean/std).
+    /// Sets normalization parameters (mean and standard deviation).
+    ///
+    /// # Arguments
+    ///
+    /// * `mean` - Per-input mean values
+    /// * `std` - Per-input standard deviations (clamped to [`EPSILON`])
+    ///
+    /// # Panics
+    ///
+    /// Panics if lengths don't match `in_dim`.
     pub fn set_normalization(&mut self, mean: &[f32], std: &[f32]) {
         assert_eq!(mean.len(), self.in_dim);
         assert_eq!(std.len(), self.in_dim);
@@ -160,7 +249,31 @@ impl KanLayer {
         self.std.extend(std.iter().map(|s| s.max(EPSILON)));
     }
 
-    /// Forward pass for a single input sample (with simple basis buffer).
+    /// Forward pass for a single input sample.
+    ///
+    /// This is the lowest-level forward function. For batch processing,
+    /// use [`forward_batch`](Self::forward_batch) instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input values of length `in_dim`
+    /// * `output` - Output buffer of length `out_dim`
+    /// * `basis_buf` - Temporary buffer of length [`basis_aligned()`](Self::basis_aligned)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanLayer};
+    ///
+    /// let config = KanConfig::default_poker();
+    /// let layer = KanLayer::new(4, 8, &config);
+    ///
+    /// let input = vec![0.1, 0.2, 0.3, 0.4];
+    /// let mut output = vec![0.0; 8];
+    /// let mut basis_buf = vec![0.0; layer.basis_aligned()];
+    ///
+    /// layer.forward_single(&input, &mut output, &mut basis_buf);
+    /// ```
     pub fn forward_single(&self, input: &[f32], output: &mut [f32], basis_buf: &mut [f32]) {
         debug_assert_eq!(input.len(), self.in_dim);
         debug_assert_eq!(output.len(), self.out_dim);
@@ -199,7 +312,21 @@ impl KanLayer {
         }
     }
 
-    /// Forward pass for a batch of samples using workspace.
+    /// Forward pass for a batch of samples using preallocated workspace.
+    ///
+    /// This method uses SIMD acceleration when available and stores
+    /// intermediate values in the workspace for potential backward pass.
+    ///
+    /// # Arguments
+    ///
+    /// * `inputs` - Flattened input batch: `[batch_size * in_dim]`
+    /// * `outputs` - Output buffer: `[batch_size * out_dim]`
+    /// * `workspace` - Preallocated buffers (resized automatically if needed)
+    ///
+    /// # Memory Layout
+    ///
+    /// - `inputs`: Row-major `[Batch, Input]`
+    /// - `outputs`: Row-major `[Batch, Output]`
     pub fn forward_batch(&self, inputs: &[f32], outputs: &mut [f32], workspace: &mut Workspace) {
         let batch_size = inputs.len() / self.in_dim;
         debug_assert_eq!(inputs.len(), batch_size * self.in_dim);
@@ -255,7 +382,8 @@ impl KanLayer {
         self.accumulate_batch(workspace, outputs, batch_size);
     }
 
-    /// Accumulates outputs for a batch.
+    /// Accumulates outputs for a batch (internal helper).
+    #[inline]
     fn accumulate_batch(&self, workspace: &Workspace, outputs: &mut [f32], batch_size: usize) {
         let basis_slice = workspace.basis_values.as_slice();
         let spans = &workspace.grid_indices;
@@ -420,11 +548,16 @@ impl KanLayer {
     }
 
     /// Returns the total number of trainable parameters.
+    ///
+    /// Equivalent to [`param_count`](Self::param_count).
+    #[inline]
     pub fn num_parameters(&self) -> usize {
         self.weights.len() + self.bias.len()
     }
 
-    /// Gets all parameters as a flat slice for optimization.
+    /// Gets all parameters as a flat vector for optimization.
+    ///
+    /// Returns weights followed by biases.
     pub fn get_parameters(&self) -> Vec<f32> {
         let mut params = self.weights.clone();
         params.extend(&self.bias);
@@ -432,6 +565,10 @@ impl KanLayer {
     }
 
     /// Sets parameters from a flat slice.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `params.len() != num_parameters()`.
     pub fn set_parameters(&mut self, params: &[f32]) {
         let expected = self.num_parameters();
         assert_eq!(
@@ -447,7 +584,22 @@ impl KanLayer {
         self.bias.copy_from_slice(&params[w_end..]);
     }
 
-    /// Backward pass: computes gradients for weights and bias.
+    /// Backward pass: computes gradients for weights, biases, and optionally inputs.
+    ///
+    /// # Arguments
+    ///
+    /// * `normalized_input` - Stored normalized inputs from forward pass: `[batch * in_dim]`
+    /// * `grid_indices` - Stored span indices from forward pass: `[batch * in_dim]`
+    /// * `grad_output` - Gradient of loss w.r.t. output: `[batch * out_dim]`
+    /// * `grad_input` - Optional gradient buffer for input: `[batch * in_dim]`
+    /// * `grad_weights` - Gradient buffer for weights: `[weights.len()]`
+    /// * `grad_bias` - Gradient buffer for biases: `[bias.len()]`
+    /// * `workspace` - Workspace with basis value buffers
+    ///
+    /// # Note
+    ///
+    /// This method supports masked training: if `grad_output[i] == 0.0`,
+    /// that sample is skipped for efficiency.
     #[allow(clippy::too_many_arguments)]
     pub fn backward(
         &self,
