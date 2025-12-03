@@ -341,7 +341,6 @@ impl KanNetwork {
     ///
 
     /// Full training step: forward + backward + update.
-    ///
     /// Returns the loss value.
     pub fn train_step(
         &mut self,
