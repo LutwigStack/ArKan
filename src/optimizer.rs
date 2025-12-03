@@ -557,6 +557,7 @@ mod tests {
             input_std: vec![1.0; 4],
             multithreading_threshold: 1024,
             simd_width: 8,
+            init_seed: None,
         };
 
         let mut network = KanNetwork::new(config);
