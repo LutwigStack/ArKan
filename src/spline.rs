@@ -1,6 +1,9 @@
 //! B-spline basis computation with SIMD optimization.
 
 use crate::config::{KanConfig, EPSILON};
+
+/// Максимальный поддерживаемый порядок сплайна (degree <= 7).
+const MAX_ORDER: usize = 7;
 use wide::f32x8;
 
 /// Computes uniform B-spline knot vector.
@@ -20,31 +23,24 @@ pub fn compute_knots(grid_size: usize, order: usize, grid_range: (f32, f32)) -> 
 /// Returns index i such that knots[i] <= x < knots[i+1].
 #[inline]
 pub fn find_span(x: f32, knots: &[f32], order: usize, grid_size: usize) -> usize {
-    let n = grid_size + order; // Last valid span index
+    // Uniform grid, so we can compute span in O(1).
+    let t_min = knots[order];
+    let t_max = knots[order + grid_size];
+    let step = (t_max - t_min).max(EPSILON) / grid_size as f32;
+    let x_clamped = x.clamp(t_min, t_max);
 
-    // Handle boundary cases
-    if x >= knots[n] {
-        return n - 1;
-    }
-    if x <= knots[order] {
-        return order;
-    }
+    let raw_idx = ((x_clamped - t_min) / step).floor();
+    let mut idx = raw_idx as isize;
 
-    // Binary search
-    let mut low = order;
-    let mut high = n;
-    let mut mid = (low + high) / 2;
-
-    while x < knots[mid] || x >= knots[mid + 1] {
-        if x < knots[mid] {
-            high = mid;
-        } else {
-            low = mid;
-        }
-        mid = (low + high) / 2;
+    // Clamp to valid intervals to avoid OOB at boundaries (x == t_max).
+    let max_interval = grid_size as isize - 1;
+    if idx < 0 {
+        idx = 0;
+    } else if idx > max_interval {
+        idx = max_interval;
     }
 
-    mid
+    (idx as usize) + order
 }
 
 /// Computes non-vanishing B-spline basis functions at x.
@@ -57,8 +53,8 @@ pub fn compute_basis(x: f32, span: usize, knots: &[f32], order: usize, basis_out
     debug_assert!(basis_out.len() > order);
 
     // Temporary storage for de Boor algorithm
-    let mut left = [0.0f32; 8]; // Max order 7
-    let mut right = [0.0f32; 8];
+    let mut left = [0.0f32; MAX_ORDER + 1];
+    let mut right = [0.0f32; MAX_ORDER + 1];
 
     basis_out[0] = 1.0;
 
@@ -99,9 +95,9 @@ pub fn compute_basis_and_deriv(
     debug_assert!(deriv_out.len() > order);
 
     // Compute basis functions of order-1 first
-    let mut ndu = [[0.0f32; 8]; 8]; // Max order 7
-    let mut left = [0.0f32; 8];
-    let mut right = [0.0f32; 8];
+    let mut ndu = [[0.0f32; MAX_ORDER + 1]; MAX_ORDER + 1];
+    let mut left = [0.0f32; MAX_ORDER + 1];
+    let mut right = [0.0f32; MAX_ORDER + 1];
 
     ndu[0][0] = 1.0;
 
@@ -132,7 +128,7 @@ pub fn compute_basis_and_deriv(
     }
 
     // Compute derivatives
-    let mut a = [[0.0f32; 8]; 2];
+    let mut a = [[0.0f32; MAX_ORDER + 1]; 2];
 
     for r in 0..=order {
         let mut s1 = 0usize;
