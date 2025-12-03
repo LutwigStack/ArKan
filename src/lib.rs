@@ -151,7 +151,10 @@ pub use spline::{
 
 // GPU re-exports (only available with "gpu" feature)
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuLayer, GpuTensor, GpuWorkspace, LayerUniforms, WgpuBackend, WgpuOptions};
+pub use gpu::{
+    GpuLayer, GpuNetwork, GpuTensor, GpuWorkspace, LayerUniforms, 
+    PipelineCache, WgpuBackend, WgpuOptions,
+};
 
 /// Library version from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
