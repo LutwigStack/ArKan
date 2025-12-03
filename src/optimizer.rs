@@ -12,7 +12,7 @@
 //! use arkan::{KanConfig, KanNetwork};
 //! use arkan::optimizer::{Adam, AdamConfig};
 //!
-//! let config = KanConfig::default_poker();
+//! let config = KanConfig::preset();
 //! let mut network = KanNetwork::new(config);
 //! let mut optimizer = Adam::new(&network, AdamConfig::with_lr(0.001));
 //!
@@ -217,7 +217,7 @@ impl Clone for LayerAdamState {
 /// use arkan::{KanConfig, KanNetwork};
 /// use arkan::optimizer::{Adam, AdamConfig};
 ///
-/// let config = KanConfig::default_poker();
+/// let config = KanConfig::preset();
 /// let mut network = KanNetwork::new(config);
 /// let mut optimizer = Adam::new(&network, AdamConfig::with_lr(0.001));
 /// ```
@@ -445,7 +445,7 @@ impl Clone for Adam {
 /// use arkan::{KanConfig, KanNetwork};
 /// use arkan::optimizer::SGD;
 ///
-/// let config = KanConfig::default_poker();
+/// let config = KanConfig::preset();
 /// let network = KanNetwork::new(config);
 /// let mut optimizer = SGD::new(&network, 0.01, 0.9, 0.0);
 /// ```
@@ -716,7 +716,7 @@ mod tests {
 
     #[test]
     fn test_adam_optimizer() {
-        let config = KanConfig::default_poker();
+        let config = KanConfig::preset();
         let network = KanNetwork::new(config);
         let mut optimizer = Adam::new(&network, AdamConfig::with_lr(0.001));
 

@@ -44,6 +44,91 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 * **Cache-Friendly Layout:** Веса хранятся в формате `[Output][Input][Basis]` для последовательного доступа к памяти и минимизации промахов кэша.  
 * **Standalone:** Минимальные зависимости (`rayon`, `wide`). Не тянет за собой `torch` или `burn`, идеально для встраивания.  
 * **Quantization Ready:** Архитектура подготовлена для работы с квантованными весами (baked models) для дальнейшего ускорения.
+* **GPU-ускорение (wgpu):** Опциональный GPU бэкенд с WGSL compute шейдерами для параллельного forward/backward.
+
+## **GPU Backend (Опционально)**
+
+ArKan включает опциональный GPU бэкенд на основе `wgpu` для WebGPU/Vulkan/Metal/DX12 ускорения.
+
+### **Установка**
+
+```toml
+[dependencies]
+arkan = { version = "0.2.0", features = ["gpu"] }
+```
+
+### **Использование**
+
+```rust,ignore
+use arkan::{KanConfig, KanNetwork};
+use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork};
+use arkan::optimizer::{Adam, AdamConfig};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Инициализация GPU бэкенда
+    let backend = WgpuBackend::init(WgpuOptions::default())?;
+    println!("GPU: {}", backend.adapter_name());
+
+    // Создание CPU сети
+    let config = KanConfig::preset();
+    let mut cpu_network = KanNetwork::new(config.clone());
+
+    // Создание GPU сети из CPU сети
+    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)?;
+    let mut workspace = gpu_network.create_workspace(64)?;
+
+    // Forward инференс
+    let input = vec![0.5f32; config.input_dim];
+    let output = gpu_network.forward_single(&input, &mut workspace)?;
+
+    // Обучение с Adam оптимизатором
+    let mut optimizer = Adam::new(&cpu_network, AdamConfig::with_lr(0.001));
+    let target = vec![1.0f32; config.output_dim];
+
+    let loss = gpu_network.train_step_mse(
+        &input, &target, 1,
+        &mut workspace, &mut optimizer, &mut cpu_network
+    )?;
+
+    println!("Loss: {}", loss);
+    Ok(())
+}
+```
+
+### **GPU возможности**
+
+| Функция | Статус |
+|---------|--------|
+| Forward инференс | ✅ |
+| Forward training (сохранение активаций) | ✅ |
+| Backward pass | ✅ (GPU шейдеры) |
+| Adam/SGD оптимизатор | ✅ |
+| Синхронизация весов CPU↔GPU | ✅ |
+| Многослойные сети | ✅ |
+| Batch обработка | ✅ |
+| train_step_with_options | ✅ |
+| Gradient clipping | ✅ |
+| Weight decay | ✅ |
+
+### **Ограничения GPU (wgpu 0.23)**
+
+- **Нет пробрасывания DeviceLost:** wgpu 0.23 не предоставляет ошибки `DeviceLost`. Падение GPU может выглядеть как зависание вместо корректной ошибки.
+- **Лимит памяти:** `MAX_VRAM_ALLOC = 2GB` на буфер. Превышение возвращает ошибку `BatchTooLarge`.
+- **Vec4 выравнивание:** Веса дополняются до границы vec4 (4 элемента) для эффективности шейдеров.
+- **CPU fallback:** Если GPU недоступен, инициализация бэкенда корректно завершается с ошибкой `AdapterNotFound`.
+
+### **Запуск GPU тестов и бенчмарков**
+
+```bash
+# GPU parity тесты
+cargo test --features gpu --test gpu_parity -- --ignored
+
+# GPU бенчмарки (Windows PowerShell)
+$env:ARKAN_GPU_BENCH="1"; cargo bench --bench gpu_forward --features gpu
+
+# GPU бенчмарки (Linux/macOS)
+ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
+```
 
 ## **Бенчмарки (CPU)**
 
@@ -75,9 +160,9 @@ ArKan занимает нишу **специализированного выс�
 
 | Крейт | Назначение | Отличие ArKan |
 | :---- | :---- | :---- |
-| [`burn-efficient-kan`](https://crates.io/crates/burn-efficient-kan) | Часть экосистемы [Burn](https://burn.dev). Отлично подходит для обучения на GPU. | ArKan — легковесная библиотека без тяжелых зависимостей (Burn/Torch/WGPU). Идеальна для встраивания. |
-| [`fekan`](https://crates.io/crates/fekan) | Богатый функционал (CLI, dataset loaders). General-purpose библиотека. | ArKan изначально спроектирован под SIMD (AVX2) и параллелизм, тогда как в `fekan` это пока в планах. |
-| [`rusty_kan`](https://crates.io/crates/rusty_kan) | Базовая реализация, образовательный проект. | ArKan фокусируется на production-ready оптимизациях: workspace, батчинг, многопоточность. |
+| [`burn-efficient-kan`](https://crates.io/crates/burn-efficient-kan) | Часть экосистемы [Burn](https://burn.dev). Отлично подходит для обучения на GPU. | ArKan — легковесная библиотека с опциональным GPU через wgpu. Минимальные зависимости в базовой конфигурации. |
+| [`fekan`](https://crates.io/crates/fekan) | Богатый функционал (CLI, dataset loaders). General-purpose библиотека. | ArKan изначально спроектирован под SIMD (AVX2), параллелизм и GPU-ускорение. |
+| [`rusty_kan`](https://crates.io/crates/rusty_kan) | Базовая реализация, образовательный проект. | ArKan фокусируется на production-ready оптимизациях: workspace, батчинг, GPU. |
 
 ## Быстрый старт
 
@@ -85,15 +170,16 @@ ArKan занимает нишу **специализированного выс�
 
 ```toml
 [dependencies]
-arkan = "0.1.1"
+arkan = "0.2.0"
 ```
-Пример использования (смотрите также `examples/basic.rs`):
-```
+
+Пример использования (смотрите также `examples/basic.rs` и `examples/training.rs`):
+```rust,ignore
 use arkan::{KanConfig, KanNetwork};
 
 fn main() {
     // 1. Конфигурация (Poker Solver preset)
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
 
     // 2. Инициализация сети
     let network = KanNetwork::new(config.clone());
@@ -166,6 +252,139 @@ $$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
 * **Cache-Friendly Layout:** Weights are stored in `[Output][Input][Basis]` format for sequential memory access and minimal cache misses.  
 * **Standalone:** Minimal dependencies (`rayon`, `wide`). No `torch` or `burn` bloat, ideal for embedding.  
 * **Quantization Ready:** Architecture is ready for quantized weights (baked models) for further acceleration.
+* **GPU Acceleration (wgpu):** Optional GPU backend with WGSL compute shaders for parallel forward/backward passes.
+
+## **GPU Backend (Optional)**
+
+ArKan includes an optional GPU backend using `wgpu` for WebGPU/Vulkan/Metal/DX12 acceleration.
+
+### **Installation**
+
+```toml
+[dependencies]
+arkan = { version = "0.2.0", features = ["gpu"] }
+```
+
+### **Usage**
+
+```rust,ignore
+use arkan::{KanConfig, KanNetwork};
+use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork};
+use arkan::optimizer::{Adam, AdamConfig};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize GPU backend
+    let backend = WgpuBackend::init(WgpuOptions::default())?;
+    println!("GPU: {}", backend.adapter_name());
+
+    // Create CPU network
+    let config = KanConfig::preset();
+    let mut cpu_network = KanNetwork::new(config.clone());
+
+    // Create GPU network from CPU network
+    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)?;
+    let mut workspace = gpu_network.create_workspace(64)?;
+
+    // Forward inference
+    let input = vec![0.5f32; config.input_dim];
+    let output = gpu_network.forward_single(&input, &mut workspace)?;
+
+    // Training with Adam optimizer
+    let mut optimizer = Adam::new(&cpu_network, AdamConfig::with_lr(0.001));
+    let target = vec![1.0f32; config.output_dim];
+
+    let loss = gpu_network.train_step_mse(
+        &input, &target, 1, 
+        &mut workspace, &mut optimizer, &mut cpu_network
+    )?;
+
+    println!("Loss: {}", loss);
+    Ok(())
+}
+```
+
+### **GPU Features**
+
+| Feature | Status |
+|---------|--------|
+| Forward inference | ✅ |
+| Forward training (saves activations) | ✅ |
+| Backward pass | ✅ (GPU shaders) |
+| Adam/SGD optimizer | ✅ |
+| Weight sync CPU↔GPU | ✅ |
+| Multi-layer networks | ✅ |
+| Batch processing | ✅ |
+| train_step_with_options | ✅ |
+| Gradient clipping | ✅ |
+| Weight decay | ✅ |
+
+### **Weight Synchronization**
+
+```rust,ignore
+// Sync weights from CPU to GPU (after loading a model)
+gpu_network.sync_weights_cpu_to_gpu(&cpu_network)?;
+
+// Sync weights from GPU to CPU (for saving/export)
+gpu_network.sync_weights_gpu_to_cpu(&mut cpu_network)?;
+```
+
+### **Training with Options**
+
+```rust,ignore
+use arkan::TrainOptions;
+
+let opts = TrainOptions {
+    max_grad_norm: Some(1.0),  // Gradient clipping
+    weight_decay: 0.01,         // AdamW-style weight decay
+};
+
+let loss = gpu_network.train_step_with_options(
+    &input, &target, None, batch_size,
+    &mut workspace, &mut optimizer, &mut cpu_network,
+    &opts
+)?;
+```
+
+### **GPU Limitations (wgpu 0.23)**
+
+- **No DeviceLost propagation:** wgpu 0.23 does not expose `DeviceLost` errors. GPU crashes may appear as hangs instead of proper errors.
+- **Memory limits:** `MAX_VRAM_ALLOC = 2GB` per buffer. Exceeding this returns `BatchTooLarge` error.
+- **Vec4 alignment:** Weights are padded to vec4 (4-element) boundaries for shader efficiency.
+- **CPU fallback:** If GPU is unavailable, the backend initialization fails gracefully with `AdapterNotFound`.
+
+### **Choosing Backend**
+
+```rust,ignore
+// High-performance GPU (default)
+let backend = WgpuBackend::init(WgpuOptions::default())?;
+
+// Compute-optimized (larger buffers)
+let backend = WgpuBackend::init(WgpuOptions::compute())?;
+
+// Low-memory/integrated GPU
+let backend = WgpuBackend::init(WgpuOptions::low_memory())?;
+
+// Force specific adapter
+let opts = WgpuOptions {
+    force_adapter_name: Some("NVIDIA".to_string()),
+    ..Default::default()
+};
+let backend = WgpuBackend::init(opts)?;
+```
+
+### **Running GPU Tests and Benchmarks**
+
+```bash
+# GPU parity tests
+cargo test --features gpu --test gpu_parity -- --ignored
+
+# GPU benchmarks (Windows PowerShell)
+$env:ARKAN_GPU_BENCH="1"; cargo bench --bench gpu_forward --features gpu
+
+# GPU benchmarks (Linux/macOS)
+ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
+ARKAN_GPU_BENCH=1 cargo bench --bench gpu_backward --features gpu
+```
 
 ## **Benchmarks (CPU)**
 
@@ -197,9 +416,9 @@ ArKan occupies the niche of **specialized high-performance inference**.
 
 | Crate | Purpose | Difference from ArKan |
 | :---- | :---- | :---- |
-| [`burn-efficient-kan`](https://crates.io/crates/burn-efficient-kan) | Part of the [Burn](https://burn.dev) ecosystem. | ArKan is a lightweight library without heavy framework dependencies. Ideal for embedding. |
-| [`fekan`](https://crates.io/crates/fekan) | Rich functionality, general-purpose library. | ArKan is designed with SIMD/Parallelism as core features, whereas `fekan` plans to add them later. |
-| [`rusty_kan`](https://crates.io/crates/rusty_kan) | Basic implementation, educational project. | ArKan focuses on production-ready optimizations: workspace, batching, multithreading. |
+| [`burn-efficient-kan`](https://crates.io/crates/burn-efficient-kan) | Part of the [Burn](https://burn.dev) ecosystem. | ArKan is lightweight with optional GPU via wgpu. Minimal dependencies in base config. |
+| [`fekan`](https://crates.io/crates/fekan) | Rich functionality, general-purpose library. | ArKan is designed with SIMD, parallelism, and GPU acceleration from the start. |
+| [`rusty_kan`](https://crates.io/crates/rusty_kan) | Basic implementation, educational project. | ArKan focuses on production-ready optimizations: workspace, batching, GPU. |
 
 ## **Quick Start**
 
@@ -207,16 +426,16 @@ Install from crates.io:
 
 ```toml
 [dependencies]
-arkan = "0.1.1"
+arkan = "0.2.0"
 ```
 
-Usage Example (see also `examples/basic.rs`):
-```
+Usage Example (see also `examples/basic.rs` and `examples/training.rs`):
+```rust,ignore
 use arkan::{KanConfig, KanNetwork};
 
 fn main() {
     // 1. Configuration (Poker Solver preset)
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
 
     // 2. Network initialization
     let network = KanNetwork::new(config.clone());

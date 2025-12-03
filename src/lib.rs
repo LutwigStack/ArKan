@@ -22,7 +22,7 @@
 //! use arkan::{KanConfig, KanNetwork};
 //!
 //! // Create a network with poker-optimized architecture
-//! let config = KanConfig::default_poker(); // [21, 64, 64, 24]
+//! let config = KanConfig::preset(); // [21, 64, 64, 24]
 //! let network = KanNetwork::new(config.clone());
 //!
 //! // Preallocate workspace (reuse across calls for zero-alloc)
@@ -45,7 +45,7 @@
 //! ```rust
 //! use arkan::{KanConfig, KanNetwork};
 //!
-//! let config = KanConfig::default_poker();
+//! let config = KanConfig::preset();
 //! let mut network = KanNetwork::new(config.clone());
 //! let mut workspace = network.create_workspace(64);
 //!
@@ -78,6 +78,7 @@
 //!
 //! | Flag | Description | Default |
 //! |------|-------------|---------|
+//! | `gpu` | GPU backend via wgpu (Vulkan/DX12/Metal) | Off |
 //! | `serde` | Serialization via `serde` + `bincode` | Off |
 //! | `quantization` | Half-precision (f16) support | Off |
 //! | `parallel` | Rayon parallelization | Off |
@@ -87,7 +88,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! arkan = { version = "0.1", features = ["serde"] }
+//! arkan = { version = "0.1", features = ["gpu"] }
 //! ```
 //!
 //! ## Modules
@@ -120,27 +121,40 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
-#![doc(html_root_url = "https://docs.rs/arkan/0.1.0")]
+#![doc(html_root_url = "https://docs.rs/arkan/0.2.0")]
 
 pub mod baked;
 pub mod buffer;
 pub mod config;
+pub mod error;
 pub mod layer;
 pub mod loss;
 pub mod network;
 pub mod optimizer;
 pub mod spline;
 
+// GPU backend (only available with "gpu" feature)
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 // Re-exports for convenience
 pub use baked::BakedModel;
-pub use buffer::{AlignedBuffer, Workspace, CACHE_LINE};
+pub use buffer::{AlignedBuffer, Tensor, TensorView, Workspace, CACHE_LINE};
 pub use config::{ConfigError, KanConfig, LayerConfig, DEFAULT_GRID_SIZE, EPSILON};
+pub use error::{ArkanError, ArkanResult};
 pub use layer::KanLayer;
 pub use loss::{masked_cross_entropy, masked_mse, masked_softmax, poker_combined_loss, softmax};
 pub use network::{KanNetwork, TrainOptions};
 pub use optimizer::{Adam, AdamConfig, AdamState, CosineAnnealingLR, LrScheduler, StepLR, SGD};
 pub use spline::{
     compute_basis, compute_basis_and_deriv, compute_knots, find_span, normalize_batch,
+};
+
+// GPU re-exports (only available with "gpu" feature)
+#[cfg(feature = "gpu")]
+pub use gpu::{
+    GpuLayer, GpuNetwork, GpuTensor, GpuTensorView, GpuWorkspace, LayerUniforms, PipelineCache,
+    PowerPreference, WgpuBackend, WgpuOptions,
 };
 
 /// Library version from Cargo.toml.
@@ -168,7 +182,7 @@ mod tests {
     #[test]
     fn test_quick_start_example() {
         // This test ensures the Quick Start example in docs compiles
-        let config = KanConfig::default_poker();
+        let config = KanConfig::preset();
         let network = KanNetwork::new(config.clone());
         let mut workspace = network.create_workspace(1);
 

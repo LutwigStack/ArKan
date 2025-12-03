@@ -34,7 +34,7 @@ fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> V
 /// Benchmark forward pass only (for comparison with backward).
 /// Measures pure inference without saving history for backward pass.
 fn bench_forward_only(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256];
@@ -58,7 +58,7 @@ fn bench_forward_only(c: &mut Criterion) {
 
 /// Benchmark forward_batch_training (stores intermediate values for backward)
 fn bench_forward_training(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
+    let config = KanConfig::preset();
     let network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256];
@@ -86,9 +86,12 @@ fn bench_forward_training(c: &mut Criterion) {
 
 /// Benchmark full train_step (forward + backward + SGD update)
 /// Compare with forward_only to understand backward overhead
+///
+/// NOTE: Uses iter_batched_ref to reset network state between iterations
+/// for stable measurements (weights don't drift).
 fn bench_full_train_step(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
-    let mut network = KanNetwork::new(config.clone());
+    let config = KanConfig::preset();
+    let base_network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256];
     let mut group = c.benchmark_group("full_train_step");
@@ -96,19 +99,27 @@ fn bench_full_train_step(c: &mut Criterion) {
     for &batch in &batch_sizes {
         let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
         let targets = make_inputs(config.output_dim, config.grid_range, batch, 123);
-        let mut workspace = network.create_workspace(batch);
 
         group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
         group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &_batch| {
-            b.iter(|| {
-                network.train_step(
-                    black_box(&inputs),
-                    black_box(&targets),
-                    None,
-                    0.001,
-                    &mut workspace,
-                );
-            });
+            b.iter_batched_ref(
+                || {
+                    // Setup: clone network and create fresh workspace
+                    let network = base_network.clone();
+                    let workspace = network.create_workspace(batch);
+                    (network, workspace)
+                },
+                |(network, workspace)| {
+                    network.train_step(
+                        black_box(&inputs),
+                        black_box(&targets),
+                        None,
+                        0.001,
+                        workspace,
+                    );
+                },
+                criterion::BatchSize::SmallInput,
+            );
         });
     }
 
@@ -117,16 +128,20 @@ fn bench_full_train_step(c: &mut Criterion) {
 
 /// Compute backward overhead by comparing train_step vs forward_training
 /// backward_time ≈ train_step_time - forward_training_time
+///
+/// NOTE: Uses iter_batched_ref for train_step to reset network state.
 fn bench_backward_overhead(c: &mut Criterion) {
-    let config = KanConfig::default_poker();
-    let mut network = KanNetwork::new(config.clone());
+    let config = KanConfig::preset();
+    let base_network = KanNetwork::new(config.clone());
 
     // Fixed batch for detailed analysis
     let batch = 64_usize;
     let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
     let targets = make_inputs(config.output_dim, config.grid_range, batch, 123);
     let mut outputs = vec![0.0f32; batch * config.output_dim];
-    let mut workspace = network.create_workspace(batch);
+
+    // Workspace for inference benchmarks (can be reused)
+    let mut inference_workspace = base_network.create_workspace(batch);
 
     let mut group = c.benchmark_group("backward_overhead_batch64");
     group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
@@ -134,32 +149,44 @@ fn bench_backward_overhead(c: &mut Criterion) {
     // Forward inference only
     group.bench_function("1_forward_inference", |b| {
         b.iter(|| {
-            network.forward_batch(black_box(&inputs), black_box(&mut outputs), &mut workspace);
+            base_network.forward_batch(
+                black_box(&inputs),
+                black_box(&mut outputs),
+                &mut inference_workspace,
+            );
         });
     });
 
     // Forward with training buffers
     group.bench_function("2_forward_training", |b| {
         b.iter(|| {
-            network.forward_batch_training(
+            base_network.forward_batch_training(
                 black_box(&inputs),
                 black_box(&mut outputs),
-                &mut workspace,
+                &mut inference_workspace,
             );
         });
     });
 
-    // Full train step (forward + backward + update)
+    // Full train step (forward + backward + update) - reset network each iteration
     group.bench_function("3_full_train_step", |b| {
-        b.iter(|| {
-            network.train_step(
-                black_box(&inputs),
-                black_box(&targets),
-                None,
-                0.001,
-                &mut workspace,
-            );
-        });
+        b.iter_batched_ref(
+            || {
+                let network = base_network.clone();
+                let workspace = network.create_workspace(batch);
+                (network, workspace)
+            },
+            |(network, workspace)| {
+                network.train_step(
+                    black_box(&inputs),
+                    black_box(&targets),
+                    None,
+                    0.001,
+                    workspace,
+                );
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     group.finish();

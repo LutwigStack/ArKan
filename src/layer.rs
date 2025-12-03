@@ -27,7 +27,7 @@
 //! ```rust
 //! use arkan::{KanConfig, KanLayer};
 //!
-//! let config = KanConfig::default_poker();
+//! let config = KanConfig::preset();
 //! let layer = KanLayer::new(4, 8, &config);
 //!
 //! // Single sample forward pass
@@ -64,7 +64,7 @@ use serde::{Deserialize, Serialize};
 /// # Architecture
 ///
 /// ```text
-/// Input[in_dim] → Normalize → B-spline Basis → Weighted Sum → Output[out_dim]
+/// Input(in_dim) → Normalize → B-spline Basis → Weighted Sum → Output(out_dim)
 /// ```
 ///
 /// # Weight Layout
@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 /// ```rust
 /// use arkan::{KanConfig, KanLayer};
 ///
-/// let config = KanConfig::default_poker();
+/// let config = KanConfig::preset();
 /// let layer = KanLayer::new(4, 8, &config);
 ///
 /// assert_eq!(layer.in_dim, 4);
@@ -110,7 +110,7 @@ pub struct KanLayer {
     pub mean: Vec<f32>,
     /// Per-input normalization std (clamped by [`EPSILON`]).
     pub std: Vec<f32>,
-    /// Spline coefficients: `[out_dim][in_dim][global_basis_size]` stored flat.
+    /// Spline coefficients: `(out_dim, in_dim, global_basis_size)` stored flat.
     pub weights: Vec<f32>,
     /// Bias terms for each output.
     pub bias: Vec<f32>,
@@ -140,7 +140,7 @@ impl KanLayer {
     /// ```rust
     /// use arkan::{KanConfig, KanLayer};
     ///
-    /// let config = KanConfig::default_poker();
+    /// let config = KanConfig::preset();
     /// let layer = KanLayer::new(10, 20, &config);
     /// ```
     pub fn new(in_dim: usize, out_dim: usize, config: &KanConfig) -> Self {
@@ -265,7 +265,7 @@ impl KanLayer {
     /// ```rust
     /// use arkan::{KanConfig, KanLayer};
     ///
-    /// let config = KanConfig::default_poker();
+    /// let config = KanConfig::preset();
     /// let layer = KanLayer::new(4, 8, &config);
     ///
     /// let input = vec![0.1, 0.2, 0.3, 0.4];
