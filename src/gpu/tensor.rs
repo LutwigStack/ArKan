@@ -8,6 +8,23 @@ use crate::gpu::{exceeds_vram_limit, MAX_VRAM_ALLOC};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
+/// Infers a logical shape for `got` from data length and expected shape.
+///
+/// If shape has >1 dimensions, computes tail = product(shape[1..]).
+/// If data.len() is divisible by tail, returns [data.len()/tail, shape[1..]].
+/// Otherwise returns [data.len()] as flat shape.
+fn infer_got_shape(data_len: usize, expected_shape: &[usize]) -> Vec<usize> {
+    if expected_shape.len() > 1 {
+        let tail: usize = expected_shape[1..].iter().product();
+        if tail > 0 && data_len % tail == 0 {
+            let mut got_shape = vec![data_len / tail];
+            got_shape.extend_from_slice(&expected_shape[1..]);
+            return got_shape;
+        }
+    }
+    vec![data_len]
+}
+
 /// A GPU-resident tensor with shape metadata.
 ///
 /// `GpuTensor` owns a wgpu buffer and stores shape information for
@@ -62,10 +79,12 @@ impl GpuTensor {
     pub fn upload(device: &wgpu::Device, _queue: &wgpu::Queue, data: &[f32], shape: Vec<usize>) -> ArkanResult<Self> {
         let expected_len: usize = shape.iter().product();
         if data.len() != expected_len {
-            return Err(ArkanError::shape_mismatch(
-                &shape,
-                &[data.len()],
-            ));
+            // Infer logical shape for got: e.g., expected [32, 64], got [31, 64]
+            let got_shape = infer_got_shape(data.len(), &shape);
+            return Err(ArkanError::ShapeMismatch {
+                expected: shape,
+                got: got_shape,
+            });
         }
 
         let size_bytes = (data.len() * std::mem::size_of::<f32>()) as u64;
@@ -140,10 +159,12 @@ impl GpuTensor {
     pub fn storage_read(device: &wgpu::Device, data: &[f32], shape: Vec<usize>) -> ArkanResult<Self> {
         let expected_len: usize = shape.iter().product();
         if data.len() != expected_len {
-            return Err(ArkanError::shape_mismatch(
-                &shape,
-                &[data.len()],
-            ));
+            // Infer logical shape for got
+            let got_shape = infer_got_shape(data.len(), &shape);
+            return Err(ArkanError::ShapeMismatch {
+                expected: shape,
+                got: got_shape,
+            });
         }
 
         let size_bytes = (data.len() * std::mem::size_of::<f32>()) as u64;
@@ -320,6 +341,123 @@ impl std::fmt::Debug for GpuTensor {
             .field("capacity_bytes", &self.capacity_bytes)
             .field("num_elements", &self.num_elements())
             .finish()
+    }
+}
+
+/// A borrowed view into a GPU tensor's buffer.
+///
+/// `GpuTensorView` provides zero-copy access to a portion of a GPU buffer,
+/// useful for passing sub-tensors to compute pipelines without creating
+/// new allocations.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use arkan::gpu::{GpuTensor, GpuTensorView};
+///
+/// let tensor = GpuTensor::upload(&device, &queue, &data, vec![batch, features])?;
+/// let view = tensor.view();
+///
+/// // Use view in bind group
+/// let binding = view.as_entire_binding();
+/// ```
+#[derive(Debug)]
+pub struct GpuTensorView<'a> {
+    /// Reference to the underlying buffer.
+    buffer: &'a wgpu::Buffer,
+    /// Byte offset into the buffer.
+    offset: u64,
+    /// Size in bytes (None = entire buffer from offset).
+    size: Option<u64>,
+    /// Logical shape of this view.
+    shape: Vec<usize>,
+}
+
+impl<'a> GpuTensorView<'a> {
+    /// Creates a view of the entire tensor.
+    pub fn new(tensor: &'a GpuTensor) -> Self {
+        Self {
+            buffer: &tensor.buffer,
+            offset: 0,
+            size: None,
+            shape: tensor.shape.clone(),
+        }
+    }
+
+    /// Creates a view with a specific byte range.
+    ///
+    /// # Arguments
+    ///
+    /// * `tensor` - The source tensor.
+    /// * `offset` - Byte offset into the buffer.
+    /// * `size` - Size in bytes (None = rest of buffer).
+    /// * `shape` - Logical shape of this view.
+    pub fn slice(
+        tensor: &'a GpuTensor,
+        offset: u64,
+        size: Option<u64>,
+        shape: Vec<usize>,
+    ) -> Self {
+        Self {
+            buffer: &tensor.buffer,
+            offset,
+            size,
+            shape,
+        }
+    }
+
+    /// Returns the buffer reference.
+    pub fn buffer(&self) -> &'a wgpu::Buffer {
+        self.buffer
+    }
+
+    /// Returns the byte offset.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Returns the size in bytes (None = rest of buffer).
+    pub fn size(&self) -> Option<u64> {
+        self.size
+    }
+
+    /// Returns the logical shape.
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    /// Returns the number of elements.
+    pub fn num_elements(&self) -> usize {
+        self.shape.iter().product()
+    }
+
+    /// Creates a wgpu binding for the entire view.
+    pub fn as_entire_binding(&self) -> wgpu::BindingResource<'a> {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: self.buffer,
+            offset: self.offset,
+            size: self.size.map(|s| std::num::NonZeroU64::new(s).unwrap()),
+        })
+    }
+
+    /// Creates a buffer slice for this view.
+    pub fn as_buffer_slice(&self) -> wgpu::BufferSlice<'a> {
+        match self.size {
+            Some(size) => self.buffer.slice(self.offset..self.offset + size),
+            None => self.buffer.slice(self.offset..),
+        }
+    }
+}
+
+impl GpuTensor {
+    /// Creates a view of the entire tensor.
+    pub fn view(&self) -> GpuTensorView<'_> {
+        GpuTensorView::new(self)
+    }
+
+    /// Creates a view with a specific byte range.
+    pub fn view_slice(&self, offset: u64, size: Option<u64>, shape: Vec<usize>) -> GpuTensorView<'_> {
+        GpuTensorView::slice(self, offset, size, shape)
     }
 }
 

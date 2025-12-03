@@ -285,12 +285,36 @@ impl WgpuBackend {
     }
 
     /// Validates that a layer's weight buffer can fit in GPU memory.
-    pub fn validate_layer_weights(&self, weight_count: usize) -> ArkanResult<()> {
-        let size_bytes = (weight_count * std::mem::size_of::<f32>()) as u64;
+    ///
+    /// # Arguments
+    ///
+    /// * `out_dim` - Output dimension of the layer.
+    /// * `in_dim` - Input dimension of the layer.
+    /// * `global_basis_size` - Number of basis functions (grid_size + order).
+    ///
+    /// # Note
+    ///
+    /// This calculates the actual GPU buffer size including vec4 padding:
+    /// - basis_padded = align4(global_basis_size)
+    /// - basis_vec4s = ceil(basis_padded / 4)
+    /// - GPU buffer size = out_dim * in_dim * basis_vec4s * 4 floats
+    pub fn validate_layer_weights(
+        &self,
+        out_dim: usize,
+        in_dim: usize,
+        global_basis_size: usize,
+    ) -> ArkanResult<()> {
+        // Calculate padded GPU buffer size (same as GpuLayer::from_cpu_layer)
+        let basis_padded = crate::gpu::pad_to_vec4(global_basis_size);
+        let basis_vec4s = (basis_padded + 3) / 4;
+        let gpu_weight_count = out_dim * in_dim * basis_vec4s * 4;
+        let size_bytes = (gpu_weight_count * std::mem::size_of::<f32>()) as u64;
+        
         if !self.supports_buffer_size(size_bytes) {
             return Err(ArkanError::unsupported_limits(format!(
-                "Layer weights ({} floats, {} bytes) exceed max storage buffer size ({} bytes)",
-                weight_count,
+                "Layer weights ({}x{}x{} -> {} vec4s, {} bytes) exceed max storage buffer size ({} bytes)",
+                out_dim, in_dim, global_basis_size,
+                gpu_weight_count / 4,
                 size_bytes,
                 self.max_storage_buffer_size()
             )));

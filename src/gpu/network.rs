@@ -70,8 +70,12 @@ impl GpuNetwork {
         // Upload all layers
         let mut layers = Vec::with_capacity(cpu_network.layers.len());
         for cpu_layer in &cpu_network.layers {
-            // Validate weights fit in GPU memory
-            backend.validate_layer_weights(cpu_layer.weights.len())?;
+            // Validate weights fit in GPU memory (uses padded vec4 size)
+            backend.validate_layer_weights(
+                cpu_layer.out_dim,
+                cpu_layer.in_dim,
+                cpu_layer.global_basis_size,
+            )?;
             
             let gpu_layer = GpuLayer::from_cpu_layer(&device, cpu_layer)?;
             layers.push(gpu_layer);

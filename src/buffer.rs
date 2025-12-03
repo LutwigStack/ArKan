@@ -314,6 +314,117 @@ impl<'de> Deserialize<'de> for AlignedBuffer {
     }
 }
 
+/// Type alias for tensor data on CPU.
+///
+/// This is an alias for [`AlignedBuffer`], providing a more semantic name
+/// when working with tensor operations. The underlying buffer is 64-byte
+/// aligned for optimal SIMD performance.
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::Tensor;
+///
+/// let mut tensor = Tensor::with_capacity(1024);
+/// tensor.resize(100);
+/// tensor.as_mut_slice()[0] = 1.0;
+/// ```
+pub type Tensor = AlignedBuffer;
+
+/// A borrowed view into tensor data without copying.
+///
+/// `TensorView` provides zero-copy access to a slice of `f32` data,
+/// allowing efficient read-only operations on tensor contents.
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::TensorView;
+///
+/// let data = [1.0f32, 2.0, 3.0, 4.0];
+/// let view = TensorView::new(&data);
+///
+/// assert_eq!(view.len(), 4);
+/// assert_eq!(view[0], 1.0);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct TensorView<'a> {
+    data: &'a [f32],
+}
+
+impl<'a> TensorView<'a> {
+    /// Creates a new tensor view from a slice.
+    #[inline]
+    pub fn new(data: &'a [f32]) -> Self {
+        Self { data }
+    }
+
+    /// Returns the length of the view.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns true if the view is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Returns the underlying slice.
+    #[inline]
+    pub fn as_slice(&self) -> &'a [f32] {
+        self.data
+    }
+
+    /// Returns a raw pointer to the data.
+    #[inline]
+    pub fn as_ptr(&self) -> *const f32 {
+        self.data.as_ptr()
+    }
+
+    /// Creates a sub-view of this view.
+    #[inline]
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Self {
+        Self {
+            data: &self.data[range],
+        }
+    }
+
+    /// Iterates over elements.
+    #[inline]
+    pub fn iter(&self) -> std::slice::Iter<'a, f32> {
+        self.data.iter()
+    }
+}
+
+impl<'a> std::ops::Index<usize> for TensorView<'a> {
+    type Output = f32;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.data[index]
+    }
+}
+
+impl<'a> From<&'a [f32]> for TensorView<'a> {
+    fn from(data: &'a [f32]) -> Self {
+        Self::new(data)
+    }
+}
+
+impl<'a> From<&'a AlignedBuffer> for TensorView<'a> {
+    fn from(buffer: &'a AlignedBuffer) -> Self {
+        Self::new(buffer.as_slice())
+    }
+}
+
+impl<'a> From<&'a Vec<f32>> for TensorView<'a> {
+    fn from(vec: &'a Vec<f32>) -> Self {
+        Self::new(vec.as_slice())
+    }
+}
+
 /// Preallocated workspace for zero-allocation forward/backward passes.
 ///
 /// The workspace holds all intermediate buffers needed during inference

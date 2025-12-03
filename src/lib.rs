@@ -138,7 +138,7 @@ pub mod gpu;
 
 // Re-exports for convenience
 pub use baked::BakedModel;
-pub use buffer::{AlignedBuffer, Workspace, CACHE_LINE};
+pub use buffer::{AlignedBuffer, Tensor, TensorView, Workspace, CACHE_LINE};
 pub use config::{ConfigError, KanConfig, LayerConfig, DEFAULT_GRID_SIZE, EPSILON};
 pub use error::{ArkanError, ArkanResult};
 pub use layer::KanLayer;
@@ -152,7 +152,7 @@ pub use spline::{
 // GPU re-exports (only available with "gpu" feature)
 #[cfg(feature = "gpu")]
 pub use gpu::{
-    GpuLayer, GpuNetwork, GpuTensor, GpuWorkspace, LayerUniforms, 
+    GpuLayer, GpuNetwork, GpuTensor, GpuTensorView, GpuWorkspace, LayerUniforms, 
     PipelineCache, WgpuBackend, WgpuOptions,
 };
 

@@ -55,7 +55,7 @@ pub use backend::{WgpuBackend, WgpuOptions, PowerPreference};
 pub use layer::GpuLayer;
 pub use network::GpuNetwork;
 pub use pipeline::{PipelineCache, WORKGROUP_SIZE, workgroup_count};
-pub use tensor::GpuTensor;
+pub use tensor::{GpuTensor, GpuTensorView};
 pub use uniforms::LayerUniforms;
 pub use workspace::GpuWorkspace;
 
