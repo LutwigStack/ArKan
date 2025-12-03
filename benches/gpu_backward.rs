@@ -1,20 +1,24 @@
 //! GPU Backward pass and training step benchmarks.
 //!
-//! Run with: cargo bench --bench gpu_backward --features gpu -- --gpu
+//! Run with: ARKAN_GPU_BENCH=1 cargo bench --bench gpu_backward --features gpu
 //!
 //! # Notes
 //!
 //! These benchmarks measure GPU backward pass and training step performance.
 //! For fair comparison with CPU, both include data transfer time.
 //!
-//! # GPU Flag
+//! # Enabling GPU Benchmarks
 //!
-//! To enable GPU benchmarks in CI-safe mode, pass `--gpu` flag:
+//! Set environment variable `ARKAN_GPU_BENCH=1`:
 //! ```bash
-//! cargo bench --bench gpu_backward --features gpu -- --gpu
+//! # Linux/macOS
+//! ARKAN_GPU_BENCH=1 cargo bench --bench gpu_backward --features gpu
+//!
+//! # Windows PowerShell
+//! $env:ARKAN_GPU_BENCH="1"; cargo bench --bench gpu_backward --features gpu
 //! ```
 //!
-//! Without `--gpu` flag, benchmarks will be skipped gracefully (CI-safe default).
+//! Without this variable, benchmarks are skipped (CI-safe default).
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -27,9 +31,11 @@ use arkan::gpu::{GpuNetwork, WgpuBackend, WgpuOptions};
 #[cfg(feature = "gpu")]
 use arkan::optimizer::{Adam, AdamConfig, SGD};
 
-/// Check if --gpu flag was passed to criterion.
+/// Check if GPU benchmarks are enabled via environment variable.
+/// 
+/// Set `ARKAN_GPU_BENCH=1` to enable GPU benchmarks.
 fn gpu_flag_enabled() -> bool {
-    std::env::args().any(|arg| arg == "--gpu")
+    std::env::var("ARKAN_GPU_BENCH").map(|v| v == "1").unwrap_or(false)
 }
 
 fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> Vec<f32> {

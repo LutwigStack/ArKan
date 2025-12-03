@@ -1,6 +1,6 @@
 //! Comprehensive GPU Forward pass benchmarks.
 //!
-//! Run with: cargo bench --bench gpu_forward --features gpu -- --gpu
+//! Run with: ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
 //!
 //! # Benchmarks
 //!
@@ -12,15 +12,21 @@
 //! - `gpu_grid_size`: Grid size impact
 //! - `gpu_latency_distribution`: Latency percentiles
 //! - `gpu_memory_throughput`: Memory bandwidth analysis
+//! - `gpu_softmax`: GPU softmax at different batch sizes
+//! - `gpu_softmax_overhead`: Forward vs forward+softmax comparison
 //!
-//! # GPU Flag
+//! # Enabling GPU Benchmarks
 //!
-//! To enable GPU benchmarks, pass `--gpu` flag:
+//! Set environment variable `ARKAN_GPU_BENCH=1`:
 //! ```bash
-//! cargo bench --bench gpu_forward --features gpu -- --gpu
+//! # Linux/macOS
+//! ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
+//!
+//! # Windows PowerShell
+//! $env:ARKAN_GPU_BENCH="1"; cargo bench --bench gpu_forward --features gpu
 //! ```
 //!
-//! Without `--gpu` flag, benchmarks are skipped (CI-safe default).
+//! Without this variable, benchmarks are skipped (CI-safe default).
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -31,9 +37,11 @@ use arkan::{KanConfig, KanNetwork};
 #[cfg(feature = "gpu")]
 use arkan::gpu::{GpuNetwork, WgpuBackend, WgpuOptions};
 
-/// Check if --gpu flag was passed to criterion.
+/// Check if GPU benchmarks are enabled via environment variable.
+/// 
+/// Set `ARKAN_GPU_BENCH=1` to enable GPU benchmarks.
 fn gpu_flag_enabled() -> bool {
-    std::env::args().any(|arg| arg == "--gpu")
+    std::env::var("ARKAN_GPU_BENCH").map(|v| v == "1").unwrap_or(false)
 }
 
 fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> Vec<f32> {
@@ -47,8 +55,8 @@ fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> V
 fn bench_gpu_forward(c: &mut Criterion) {
     // Check if --gpu flag is enabled (CI-safe: skip if not)
     if !gpu_flag_enabled() {
-        eprintln!("GPU benchmarks skipped (--gpu flag not provided).");
-        eprintln!("Run with: cargo bench --bench gpu_forward --features gpu -- --gpu");
+        eprintln!("GPU benchmarks skipped (ARKAN_GPU_BENCH not set).");
+        eprintln!("Run with: $env:ARKAN_GPU_BENCH=\"1\"; cargo bench --bench gpu_forward --features gpu");
         return;
     }
 

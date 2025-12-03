@@ -123,8 +123,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 # GPU parity тесты
 cargo test --features gpu --test gpu_parity -- --ignored
 
-# GPU бенчмарки
-cargo bench --bench gpu_forward --features gpu -- --gpu
+# GPU бенчмарки (Windows PowerShell)
+$env:ARKAN_GPU_BENCH="1"; cargo bench --bench gpu_forward --features gpu
+
+# GPU бенчмарки (Linux/macOS)
+ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
 ```
 
 ## **Бенчмарки (CPU)**
@@ -375,9 +378,12 @@ let backend = WgpuBackend::init(opts)?;
 # GPU parity tests
 cargo test --features gpu --test gpu_parity -- --ignored
 
-# GPU benchmarks
-cargo bench --bench gpu_forward --features gpu -- --gpu
-cargo bench --bench gpu_backward --features gpu -- --gpu
+# GPU benchmarks (Windows PowerShell)
+$env:ARKAN_GPU_BENCH="1"; cargo bench --bench gpu_forward --features gpu
+
+# GPU benchmarks (Linux/macOS)
+ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
+ARKAN_GPU_BENCH=1 cargo bench --bench gpu_backward --features gpu
 ```
 
 ## **Benchmarks (CPU)**
