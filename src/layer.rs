@@ -19,7 +19,7 @@
 
 use crate::buffer::Workspace;
 use crate::config::{KanConfig, EPSILON};
-use crate::spline::{compute_basis, compute_knots, find_span};
+use crate::spline::{compute_basis, compute_basis_and_deriv, compute_knots, find_span};
 use wide::{f32x4, f32x8};
 
 #[cfg(feature = "serde")]
@@ -202,6 +202,10 @@ impl KanLayer {
         debug_assert_eq!(inputs.len(), batch_size * self.in_dim);
         debug_assert_eq!(outputs.len(), batch_size * self.out_dim);
 
+        // Ensure z_buffer is ready to store normalized inputs
+        let z_needed = batch_size * self.in_dim;
+        workspace.z_buffer.resize(z_needed);
+
         // Ensure workspace has enough capacity
         let basis_needed = batch_size * self.in_dim * self.basis_aligned;
         if workspace.basis_values.len() < basis_needed {
@@ -223,6 +227,7 @@ impl KanLayer {
                 let raw = inputs[input_start + i];
                 let z = ((raw - self.mean[i]) / self.std[i])
                     .clamp(self.grid_range.0, self.grid_range.1);
+                workspace.z_buffer.as_mut_slice()[input_start + i] = z;
                 let span = find_span(z, &self.knots, self.order, self.grid_size);
                 workspace.grid_indices[span_batch_start + i] = span as u32;
 
@@ -442,43 +447,95 @@ impl KanLayer {
     /// Backward pass: computes gradients for weights and bias.
     pub fn backward(
         &self,
-        input: &[f32],
+        normalized_input: &[f32],
+        grid_indices: &[u32],
         grad_output: &[f32],
-        _grad_input: Option<&mut [f32]>,
+        mut grad_input: Option<&mut [f32]>,
         grad_weights: &mut [f32],
         grad_bias: &mut [f32],
-        workspace: &Workspace,
+        workspace: &mut Workspace,
     ) {
-        let batch_size = input.len() / self.in_dim;
+        let batch_size = normalized_input.len() / self.in_dim;
+        debug_assert_eq!(normalized_input.len(), batch_size * self.in_dim);
+        debug_assert_eq!(grid_indices.len(), batch_size * self.in_dim);
         debug_assert_eq!(grad_output.len(), batch_size * self.out_dim);
         debug_assert_eq!(grad_weights.len(), self.weights.len());
         debug_assert_eq!(grad_bias.len(), self.bias.len());
 
-        let basis_slice = workspace.basis_values.as_slice();
-        let spans = &workspace.grid_indices;
+        // Prepare basis buffers
+        let basis_needed = batch_size * self.in_dim * self.basis_aligned;
+        if workspace.basis_values.len() < basis_needed {
+            workspace.basis_values.resize(basis_needed);
+        }
+        if workspace.basis_derivs.len() < basis_needed {
+            workspace.basis_derivs.resize(basis_needed);
+        }
 
+        let basis_slice = workspace.basis_values.as_mut_slice();
+        let deriv_slice = workspace.basis_derivs.as_mut_slice();
+
+        // Recompute basis values and derivatives for stored inputs
+        for b in 0..batch_size {
+            let base_offset = b * self.in_dim * self.basis_aligned;
+            let input_offset = b * self.in_dim;
+
+            for i in 0..self.in_dim {
+                let z = normalized_input[input_offset + i];
+                let span = grid_indices[input_offset + i] as usize;
+                let basis_offset = base_offset + i * self.basis_aligned;
+
+                compute_basis_and_deriv(
+                    z,
+                    span,
+                    &self.knots,
+                    self.order,
+                    &mut basis_slice[basis_offset..basis_offset + self.local_basis_size],
+                    &mut deriv_slice[basis_offset..basis_offset + self.local_basis_size],
+                );
+
+                // Zero padding for alignment to avoid reading stale data
+                for k in self.local_basis_size..self.basis_aligned {
+                    basis_slice[basis_offset + k] = 0.0;
+                    deriv_slice[basis_offset + k] = 0.0;
+                }
+            }
+        }
+
+        if let Some(ref mut gi) = grad_input {
+            debug_assert_eq!(gi.len(), batch_size * self.in_dim);
+            gi.iter_mut().for_each(|x| *x = 0.0);
+        }
+
+        // Accumulate gradients
         for b in 0..batch_size {
             let span_batch_start = b * self.in_dim;
             let basis_batch_start = b * self.in_dim * self.basis_aligned;
             let grad_out_start = b * self.out_dim;
 
-            // Gradient w.r.t. bias: just copy grad_output
-            for j in 0..self.out_dim {
-                grad_bias[j] += grad_output[grad_out_start + j];
-            }
-
-            // Gradient w.r.t. weights: outer product of grad_output and basis
             for j in 0..self.out_dim {
                 let g_out = grad_output[grad_out_start + j];
+                // Masking safety: zero grad_output short-circuits
+                if g_out == 0.0 {
+                    continue;
+                }
+
+                grad_bias[j] += g_out;
 
                 for i in 0..self.in_dim {
-                    let span = spans[span_batch_start + i] as usize;
+                    let span = grid_indices[span_batch_start + i] as usize;
                     let start_idx = span - self.order;
                     let basis_start = basis_batch_start + i * self.basis_aligned;
 
                     for k in 0..self.local_basis_size {
                         let weight_idx = self.weight_index(j, i, start_idx + k);
-                        grad_weights[weight_idx] += g_out * basis_slice[basis_start + k];
+                        let basis_val = basis_slice[basis_start + k];
+                        grad_weights[weight_idx] += g_out * basis_val;
+
+                        if let Some(ref mut gi) = grad_input {
+                            let deriv = deriv_slice[basis_start + k];
+                            let std_inv = 1.0 / self.std[i].max(EPSILON);
+                            gi[span_batch_start + i] += g_out * self.weights[weight_idx] * deriv * std_inv;
+                        }
                     }
                 }
             }
