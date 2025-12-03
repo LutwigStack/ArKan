@@ -235,19 +235,42 @@ impl Adam {
         layer: &mut KanLayer,
         weight_grads: &[f32],
         bias_grads: &[f32],
+        max_grad_norm: Option<f32>,
     ) {
         let state = &mut self.layer_states[layer_idx];
 
+        let (wg_scaled, bg_scaled) = if let Some(max_norm) = max_grad_norm {
+            let mut sq: f32 = weight_grads.iter().map(|g| g * g).sum();
+            sq += bias_grads.iter().map(|g| g * g).sum::<f32>();
+            let norm = sq.sqrt();
+            if norm > max_norm && norm > 0.0 {
+                let scale = max_norm / norm;
+                let mut wg = weight_grads.to_vec();
+                let mut bg = bias_grads.to_vec();
+                for g in &mut wg {
+                    *g *= scale;
+                }
+                for g in &mut bg {
+                    *g *= scale;
+                }
+                (wg, bg)
+            } else {
+                (weight_grads.to_vec(), bias_grads.to_vec())
+            }
+        } else {
+            (weight_grads.to_vec(), bias_grads.to_vec())
+        };
+
         Self::update_params(
             layer.weights.as_mut_slice(),
-            weight_grads,
+            &wg_scaled,
             &mut state.weights,
             &self.config,
         );
 
         Self::update_params(
             layer.bias.as_mut_slice(),
-            bias_grads,
+            &bg_scaled,
             &mut state.bias,
             &self.config,
         );
@@ -262,13 +285,30 @@ impl Adam {
         network: &mut KanNetwork,
         all_weight_grads: &[Vec<f32>],
         all_bias_grads: &[Vec<f32>],
+        max_grad_norm: Option<f32>,
     ) {
         debug_assert_eq!(all_weight_grads.len(), network.layers.len());
         debug_assert_eq!(all_bias_grads.len(), network.layers.len());
 
         for (i, layer) in network.layers.iter_mut().enumerate() {
-            self.step_layer(i, layer, &all_weight_grads[i], &all_bias_grads[i]);
+            self.step_layer(
+                i,
+                layer,
+                &all_weight_grads[i],
+                &all_bias_grads[i],
+                max_grad_norm,
+            );
         }
+    }
+
+    /// Backward-compatible вызов без клиппинга.
+    pub fn step_unclipped(
+        &mut self,
+        network: &mut KanNetwork,
+        all_weight_grads: &[Vec<f32>],
+        all_bias_grads: &[Vec<f32>],
+    ) {
+        self.step(network, all_weight_grads, all_bias_grads, None);
     }
 }
 
@@ -331,6 +371,7 @@ impl SGD {
         network: &mut KanNetwork,
         all_weight_grads: &[Vec<f32>],
         all_bias_grads: &[Vec<f32>],
+        max_grad_norm: Option<f32>,
     ) {
         for (i, layer) in network.layers.iter_mut().enumerate() {
             let (ref mut vw, ref mut vb) = self.velocities[i];
@@ -339,25 +380,59 @@ impl SGD {
             let weights = layer.weights.as_mut_slice();
             let weight_grads = &all_weight_grads[i];
             let vw_slice = vw.as_mut_slice();
+            let bias_grads = &all_bias_grads[i];
+
+            // Клиппинг по слою, если задан
+            let (wg_view, bg_view) = if let Some(max_norm) = max_grad_norm {
+                let mut sq: f32 = weight_grads.iter().map(|g| g * g).sum();
+                sq += bias_grads.iter().map(|g| g * g).sum::<f32>();
+                let norm = sq.sqrt();
+                if norm > max_norm && norm > 0.0 {
+                    let scale = max_norm / norm;
+                    let mut wg = weight_grads.clone();
+                    let mut bg = bias_grads.clone();
+                    for g in &mut wg {
+                        *g *= scale;
+                    }
+                    for g in &mut bg {
+                        *g *= scale;
+                    }
+                    (wg, bg)
+                } else {
+                    (weight_grads.clone(), bias_grads.clone())
+                }
+            } else {
+                (weight_grads.clone(), bias_grads.clone())
+            };
 
             for j in 0..weights.len() {
-                vw_slice[j] = self.momentum * vw_slice[j] + weight_grads[j];
-                weights[j] -= self.lr * vw_slice[j];
+                vw_slice[j] = self.momentum * vw_slice[j] + wg_view[j];
                 if self.weight_decay > 0.0 {
-                    weights[j] -= self.lr * self.weight_decay * weights[j];
+                    // decoupled weight decay
+                    weights[j] *= 1.0 - self.lr * self.weight_decay;
                 }
+                weights[j] -= self.lr * vw_slice[j];
             }
 
             // Update bias
             let bias = layer.bias.as_mut_slice();
-            let bias_grads = &all_bias_grads[i];
             let vb_slice = vb.as_mut_slice();
 
             for j in 0..bias.len() {
-                vb_slice[j] = self.momentum * vb_slice[j] + bias_grads[j];
+                vb_slice[j] = self.momentum * vb_slice[j] + bg_view[j];
                 bias[j] -= self.lr * vb_slice[j];
             }
         }
+    }
+
+    /// Backward-compatible вызов без клиппинга.
+    pub fn step_unclipped(
+        &mut self,
+        network: &mut KanNetwork,
+        all_weight_grads: &[Vec<f32>],
+        all_bias_grads: &[Vec<f32>],
+    ) {
+        self.step(network, all_weight_grads, all_bias_grads, None);
     }
 
     /// Resets velocity.
@@ -495,7 +570,7 @@ mod tests {
         let bias_grads = vec![vec![0.5f32; network.layers[0].bias.len()]];
 
         // Step
-        optimizer.step(&mut network, &weight_grads, &bias_grads);
+        optimizer.step_unclipped(&mut network, &weight_grads, &bias_grads);
 
         // Weight should have decreased
         let new_weight = network.layers[0].weights[0];
