@@ -101,11 +101,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 |---------|--------|
 | Forward инференс | ✅ |
 | Forward training (сохранение активаций) | ✅ |
-| Backward pass | ✅ (CPU fallback) |
+| Backward pass | ✅ (GPU шейдеры) |
 | Adam/SGD оптимизатор | ✅ |
 | Синхронизация весов CPU↔GPU | ✅ |
 | Многослойные сети | ✅ |
 | Batch обработка | ✅ |
+| train_step_with_options | ✅ |
+| Gradient clipping | ✅ |
+| Weight decay | ✅ |
+
+### **Ограничения GPU (wgpu 0.23)**
+
+- **Нет пробрасывания DeviceLost:** wgpu 0.23 не предоставляет ошибки `DeviceLost`. Падение GPU может выглядеть как зависание вместо корректной ошибки.
+- **Лимит памяти:** `MAX_VRAM_ALLOC = 2GB` на буфер. Превышение возвращает ошибку `BatchTooLarge`.
+- **Vec4 выравнивание:** Веса дополняются до границы vec4 (4 элемента) для эффективности шейдеров.
+- **CPU fallback:** Если GPU недоступен, инициализация бэкенда корректно завершается с ошибкой `AdapterNotFound`.
+
+### **Запуск GPU тестов и бенчмарков**
+
+```bash
+# GPU parity тесты
+cargo test --features gpu --test gpu_parity -- --ignored
+
+# GPU бенчмарки
+cargo bench --bench gpu_forward --features gpu -- --gpu
+```
 
 ## **Бенчмарки (CPU)**
 
@@ -137,9 +157,9 @@ ArKan занимает нишу **специализированного выс�
 
 | Крейт | Назначение | Отличие ArKan |
 | :---- | :---- | :---- |
-| [`burn-efficient-kan`](https://crates.io/crates/burn-efficient-kan) | Часть экосистемы [Burn](https://burn.dev). Отлично подходит для обучения на GPU. | ArKan — легковесная библиотека без тяжелых зависимостей (Burn/Torch/WGPU). Идеальна для встраивания. |
-| [`fekan`](https://crates.io/crates/fekan) | Богатый функционал (CLI, dataset loaders). General-purpose библиотека. | ArKan изначально спроектирован под SIMD (AVX2) и параллелизм, тогда как в `fekan` это пока в планах. |
-| [`rusty_kan`](https://crates.io/crates/rusty_kan) | Базовая реализация, образовательный проект. | ArKan фокусируется на production-ready оптимизациях: workspace, батчинг, многопоточность. |
+| [`burn-efficient-kan`](https://crates.io/crates/burn-efficient-kan) | Часть экосистемы [Burn](https://burn.dev). Отлично подходит для обучения на GPU. | ArKan — легковесная библиотека с опциональным GPU через wgpu. Минимальные зависимости в базовой конфигурации. |
+| [`fekan`](https://crates.io/crates/fekan) | Богатый функционал (CLI, dataset loaders). General-purpose библиотека. | ArKan изначально спроектирован под SIMD (AVX2), параллелизм и GPU-ускорение. |
+| [`rusty_kan`](https://crates.io/crates/rusty_kan) | Базовая реализация, образовательный проект. | ArKan фокусируется на production-ready оптимизациях: workspace, батчинг, GPU. |
 
 ## Быстрый старт
 
@@ -149,7 +169,8 @@ ArKan занимает нишу **специализированного выс�
 [dependencies]
 arkan = "0.1.1"
 ```
-Пример использования (смотрите также `examples/basic.rs`):
+
+Пример использования (смотрите также `examples/basic.rs` и `examples/training.rs`):
 ```rust,ignore
 use arkan::{KanConfig, KanNetwork};
 
@@ -389,9 +410,9 @@ ArKan occupies the niche of **specialized high-performance inference**.
 
 | Crate | Purpose | Difference from ArKan |
 | :---- | :---- | :---- |
-| [`burn-efficient-kan`](https://crates.io/crates/burn-efficient-kan) | Part of the [Burn](https://burn.dev) ecosystem. | ArKan is a lightweight library without heavy framework dependencies. Ideal for embedding. |
-| [`fekan`](https://crates.io/crates/fekan) | Rich functionality, general-purpose library. | ArKan is designed with SIMD/Parallelism as core features, whereas `fekan` plans to add them later. |
-| [`rusty_kan`](https://crates.io/crates/rusty_kan) | Basic implementation, educational project. | ArKan focuses on production-ready optimizations: workspace, batching, multithreading. |
+| [`burn-efficient-kan`](https://crates.io/crates/burn-efficient-kan) | Part of the [Burn](https://burn.dev) ecosystem. | ArKan is lightweight with optional GPU via wgpu. Minimal dependencies in base config. |
+| [`fekan`](https://crates.io/crates/fekan) | Rich functionality, general-purpose library. | ArKan is designed with SIMD, parallelism, and GPU acceleration from the start. |
+| [`rusty_kan`](https://crates.io/crates/rusty_kan) | Basic implementation, educational project. | ArKan focuses on production-ready optimizations: workspace, batching, GPU. |
 
 ## **Quick Start**
 
@@ -402,7 +423,7 @@ Install from crates.io:
 arkan = "0.1.1"
 ```
 
-Usage Example (see also `examples/basic.rs`):
+Usage Example (see also `examples/basic.rs` and `examples/training.rs`):
 ```rust,ignore
 use arkan::{KanConfig, KanNetwork};
 
