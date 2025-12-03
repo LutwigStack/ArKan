@@ -61,12 +61,12 @@ pub struct GpuWorkspace {
     pub grad_output: Option<GpuTensor>,
     /// Gradient w.r.t. input (for layer backprop) [batch, max_dim].
     pub grad_input: Option<GpuTensor>,
-    /// 1/std for each input dimension [in_dim] per layer.
+    /// 1/std for each input dimension `(in_dim,)` per layer.
     pub std_inv: Vec<GpuTensor>,
     
-    /// Gradient of weights per layer [layer][out_dim * in_dim * basis_padded].
+    /// Gradient of weights per layer `(layer, out_dim * in_dim * basis_padded)`.
     pub grad_weights: Vec<GpuTensor>,
-    /// Gradient of biases per layer [layer][out_dim].
+    /// Gradient of biases per layer `(layer, out_dim)`.
     pub grad_bias: Vec<GpuTensor>,
     
     /// Input dimension (fixed).
@@ -510,9 +510,9 @@ impl GpuWorkspace {
     ///
     /// # Buffer Routing
     ///
-    /// - Layer 0: input -> intermediate[0]
-    /// - Layer i (middle): intermediate[i-1] -> intermediate[i]
-    /// - Layer n-1: intermediate[n-2] -> output
+    /// - Layer 0: input -> intermediate\[0\]
+    /// - Layer i (middle): intermediate\[i-1\] -> intermediate\[i\]
+    /// - Layer n-1: intermediate\[n-2\] -> output
     pub fn get_or_create_layer_bind_group(
         &mut self,
         device: &wgpu::Device,

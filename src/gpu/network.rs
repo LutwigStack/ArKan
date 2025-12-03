@@ -121,12 +121,12 @@ impl GpuNetwork {
     ///
     /// # Arguments
     ///
-    /// * `input` - Input data [input_dim].
+    /// * `input` - Input data `(input_dim,)`.
     /// * `workspace` - GPU workspace for intermediate buffers.
     ///
     /// # Returns
     ///
-    /// Output data [output_dim].
+    /// Output data `(output_dim,)`.
     pub fn forward_single(
         &mut self,
         input: &[f32],

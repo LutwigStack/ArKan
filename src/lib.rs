@@ -78,6 +78,7 @@
 //!
 //! | Flag | Description | Default |
 //! |------|-------------|---------|
+//! | `gpu` | GPU backend via wgpu (Vulkan/DX12/Metal) | Off |
 //! | `serde` | Serialization via `serde` + `bincode` | Off |
 //! | `quantization` | Half-precision (f16) support | Off |
 //! | `parallel` | Rayon parallelization | Off |
@@ -87,7 +88,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! arkan = { version = "0.1", features = ["serde"] }
+//! arkan = { version = "0.1", features = ["gpu"] }
 //! ```
 //!
 //! ## Modules

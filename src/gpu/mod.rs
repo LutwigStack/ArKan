@@ -31,16 +31,16 @@
 //! The GPU backend uses a resize policy for workspace buffers:
 //!
 //! - If `requested_size > current_capacity`: Reallocate buffer
-//! - If `requested_size > MAX_VRAM_ALLOC`: Return `ArkanError::BatchTooLarge`
+//! - If `requested_size > MAX_VRAM_ALLOC`: Return [`ArkanError::BatchTooLarge`](crate::ArkanError::BatchTooLarge)
 //!
-//! # Modules
+//! # Public API
 //!
-//! - [`backend`] — GPU device initialization and management
-//! - [`tensor`] — GPU tensor abstraction with upload/download
-//! - [`uniforms`] — Uniform buffer structures (std140 layout)
-//! - [`workspace`] — GPU workspace with resize policy
-//! - [`layer`] — GPU layer implementation with bind groups
-//! - [`shaders`] — WGSL shader source code
+//! - [`WgpuBackend`] — GPU device initialization and management
+//! - [`GpuTensor`] — GPU tensor abstraction with upload/download
+//! - [`LayerUniforms`] — Uniform buffer structures (std140 layout)
+//! - [`GpuWorkspace`] — GPU workspace with resize policy
+//! - [`GpuLayer`] — GPU layer implementation with bind groups
+//! - [`GpuNetwork`] — GPU network with forward/backward passes
 
 mod backend;
 mod layer;

@@ -20,7 +20,7 @@ use wgpu::util::DeviceExt;
 /// # Bind Group Layout
 ///
 /// Group 0 (Static - per layer):
-/// - Binding 0: Weights (storage, read) - array<vec4<f32>>
+/// - Binding 0: Weights (storage, read) - `array<vec4<f32>>`
 /// - Binding 1: Bias (storage, read)
 /// - Binding 2: Uniforms (uniform)
 ///
@@ -33,7 +33,7 @@ use wgpu::util::DeviceExt;
 pub struct GpuLayer {
     /// Weight tensor [out_dim, in_dim, basis_vec4s] stored as vec4.
     pub weights: GpuTensor,
-    /// Bias tensor [out_dim].
+    /// Bias tensor `(out_dim,)`.
     pub bias: GpuTensor,
     /// Uniform buffer.
     pub uniforms_buffer: wgpu::Buffer,

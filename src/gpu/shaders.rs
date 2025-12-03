@@ -11,7 +11,7 @@
 ///
 /// - Group 0 (Static):
 ///   - Binding 0: weights (storage, read) - array<vec4<f32>>, layout [out_dim, in_dim, basis_vec4s]
-///   - Binding 1: bias (storage, read) - [out_dim]
+///   - Binding 1: bias (storage, read) - `(out_dim,)`
 ///   - Binding 2: config (uniform) - LayerUniforms
 ///
 /// - Group 1 (Dynamic):

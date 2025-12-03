@@ -59,7 +59,7 @@ arkan = { version = "0.1.1", features = ["gpu"] }
 
 ### **Использование**
 
-```rust
+```rust,ignore
 use arkan::{KanConfig, KanNetwork};
 use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork};
 use arkan::optimizer::{Adam, AdamConfig};
@@ -150,7 +150,7 @@ ArKan занимает нишу **специализированного выс�
 arkan = "0.1.1"
 ```
 Пример использования (смотрите также `examples/basic.rs`):
-```
+```rust,ignore
 use arkan::{KanConfig, KanNetwork};
 
 fn main() {
@@ -243,7 +243,7 @@ arkan = { version = "0.1.1", features = ["gpu"] }
 
 ### **Usage**
 
-```rust
+```rust,ignore
 use arkan::{KanConfig, KanNetwork};
 use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork};
 use arkan::optimizer::{Adam, AdamConfig};
@@ -296,7 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### **Weight Synchronization**
 
-```rust
+```rust,ignore
 // Sync weights from CPU to GPU (after loading a model)
 gpu_network.sync_weights_cpu_to_gpu(&cpu_network)?;
 
@@ -306,7 +306,7 @@ gpu_network.sync_weights_gpu_to_cpu(&mut cpu_network)?;
 
 ### **Training with Options**
 
-```rust
+```rust,ignore
 use arkan::TrainOptions;
 
 let opts = TrainOptions {
@@ -330,7 +330,7 @@ let loss = gpu_network.train_step_with_options(
 
 ### **Choosing Backend**
 
-```rust
+```rust,ignore
 // High-performance GPU (default)
 let backend = WgpuBackend::init(WgpuOptions::default())?;
 
@@ -403,7 +403,7 @@ arkan = "0.1.1"
 ```
 
 Usage Example (see also `examples/basic.rs`):
-```
+```rust,ignore
 use arkan::{KanConfig, KanNetwork};
 
 fn main() {
