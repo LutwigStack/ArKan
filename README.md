@@ -85,7 +85,7 @@ ArKan занимает нишу **специализированного выс�
 
 ```toml
 [dependencies]
-arkan = "0.1"
+arkan = "0.1.1"
 ```
 Пример использования (смотрите также `examples/basic.rs`):
 ```
@@ -207,7 +207,7 @@ Install from crates.io:
 
 ```toml
 [dependencies]
-arkan = "0.1"
+arkan = "0.1.1"
 ```
 
 Usage Example (see also `examples/basic.rs`):
