@@ -1,3 +1,5 @@
+#![forbid(unsafe_op_in_unsafe_fn)]
+
 //! # ArKan - High-Performance Kolmogorov-Arnold Network
 //!
 //! Zero-allocation inference, SIMD-optimized B-spline evaluation,
