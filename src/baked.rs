@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 /// Quantized KAN model for inference.
 ///
 /// This is a stub for future implementation.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct BakedModel {
