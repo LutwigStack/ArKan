@@ -1,4 +1,34 @@
-//! Adam optimizer for KAN training.
+//! Optimizers for KAN network training.
+//!
+//! This module provides gradient-based optimizers for training KAN networks:
+//!
+//! - [`Adam`] - Adaptive moment estimation (recommended for most cases)
+//! - [`SGD`] - Stochastic gradient descent with momentum
+//! - Learning rate schedulers: [`StepLR`], [`CosineAnnealingLR`]
+//!
+//! # Example
+//!
+//! ```rust
+//! use arkan::{KanConfig, KanNetwork};
+//! use arkan::optimizer::{Adam, AdamConfig};
+//!
+//! let config = KanConfig::default_poker();
+//! let mut network = KanNetwork::new(config);
+//! let mut optimizer = Adam::new(&network, AdamConfig::with_lr(0.001));
+//!
+//! // Training loop
+//! // optimizer.step(&mut network, &weight_grads, &bias_grads, Some(1.0));
+//! ```
+//!
+//! # Gradient Clipping
+//!
+//! All optimizers support gradient clipping via `max_grad_norm` parameter.
+//! This helps prevent exploding gradients during training.
+//!
+//! # Weight Decay
+//!
+//! Weight decay is implemented as decoupled weight decay (AdamW style),
+//! not L2 regularization. This provides better generalization.
 
 use crate::buffer::AlignedBuffer;
 use crate::layer::KanLayer;
@@ -8,20 +38,25 @@ use crate::network::KanNetwork;
 use serde::{Deserialize, Serialize};
 
 /// Adam optimizer state for a single parameter tensor.
+///
+/// Stores the first moment (mean) and second moment (variance)
+/// estimates used by the Adam algorithm.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AdamState {
-    /// First moment (mean of gradients).
+    /// First moment estimate (exponential moving average of gradients).
     pub m: AlignedBuffer,
 
-    /// Second moment (variance of gradients).
+    /// Second moment estimate (exponential moving average of squared gradients).
     pub v: AlignedBuffer,
 
-    /// Timestep for bias correction.
+    /// Timestep counter for bias correction.
     pub t: usize,
 }
 
 impl AdamState {
     /// Creates a new Adam state for a parameter tensor of given size.
+    ///
+    /// Initializes both moments to zero.
     pub fn new(size: usize) -> Self {
         let mut m = AlignedBuffer::with_capacity(size);
         m.resize(size); // Zeros
@@ -51,6 +86,31 @@ impl Clone for AdamState {
 }
 
 /// Adam optimizer configuration.
+///
+/// # Default Values
+///
+/// | Parameter | Default | Description |
+/// |-----------|---------|-------------|
+/// | `lr` | 0.001 | Learning rate |
+/// | `beta1` | 0.9 | First moment decay |
+/// | `beta2` | 0.999 | Second moment decay |
+/// | `epsilon` | 1e-8 | Numerical stability |
+/// | `weight_decay` | 0.0 | L2 regularization |
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::optimizer::AdamConfig;
+///
+/// // Default config
+/// let config = AdamConfig::default();
+///
+/// // Custom learning rate
+/// let config = AdamConfig::with_lr(0.0001);
+///
+/// // With weight decay (AdamW)
+/// let config = AdamConfig::with_decay(0.001, 0.01);
+/// ```
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AdamConfig {
@@ -101,7 +161,9 @@ impl AdamConfig {
     }
 }
 
-/// Per-layer optimizer state.
+/// Per-layer optimizer state for Adam.
+///
+/// Holds separate states for weights and biases.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LayerAdamState {
     /// State for weights.
@@ -136,7 +198,29 @@ impl Clone for LayerAdamState {
     }
 }
 
-/// Adam optimizer for a KAN network.
+/// Adam optimizer for KAN networks.
+///
+/// Implements the Adam algorithm with bias correction and optional
+/// decoupled weight decay (AdamW).
+///
+/// # Algorithm
+///
+/// $$m_t = \beta_1 m_{t-1} + (1 - \beta_1) g_t$$
+/// $$v_t = \beta_2 v_{t-1} + (1 - \beta_2) g_t^2$$
+/// $$\hat{m}_t = m_t / (1 - \beta_1^t)$$
+/// $$\hat{v}_t = v_t / (1 - \beta_2^t)$$
+/// $$\theta_t = \theta_{t-1} - \alpha \cdot \hat{m}_t / (\sqrt{\hat{v}_t} + \epsilon)$$
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::{KanConfig, KanNetwork};
+/// use arkan::optimizer::{Adam, AdamConfig};
+///
+/// let config = KanConfig::default_poker();
+/// let mut network = KanNetwork::new(config);
+/// let mut optimizer = Adam::new(&network, AdamConfig::with_lr(0.001));
+/// ```
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Adam {
     /// Configuration.
@@ -182,6 +266,15 @@ impl Adam {
     }
 
     /// Updates a single parameter tensor using Adam.
+    ///
+    /// # Update Order (AdamW-style)
+    ///
+    /// 1. **Moment update**: $m_t$, $v_t$ computed from gradients
+    /// 2. **Weight decay**: `param *= 1 - lr * decay` (applied BEFORE gradient step)
+    /// 3. **Gradient step**: `param -= alpha * m / (sqrt(v) + eps)`
+    ///
+    /// This is "decoupled" weight decay (AdamW), not L2 regularization.
+    /// The decay is proportional to `lr`, so it scales with learning rate.
     fn update_params(
         params: &mut [f32],
         grads: &[f32],
@@ -218,7 +311,8 @@ impl Adam {
             // Compute update
             let update = alpha * m[i] / (v[i].sqrt() + eps);
 
-            // Apply weight decay (decoupled)
+            // Apply weight decay (decoupled, AdamW-style)
+            // Applied BEFORE gradient update for proper decoupling
             if decay > 0.0 {
                 params[i] *= 1.0 - lr * decay;
             }
@@ -278,8 +372,12 @@ impl Adam {
 
     /// Performs one optimization step on the entire network.
     ///
-    /// `all_weight_grads` and `all_bias_grads` should contain gradients
-    /// for all layers concatenated.
+    /// # Arguments
+    ///
+    /// * `network` - Network to update
+    /// * `all_weight_grads` - Weight gradients per layer
+    /// * `all_bias_grads` - Bias gradients per layer
+    /// * `max_grad_norm` - Optional gradient clipping threshold
     pub fn step(
         &mut self,
         network: &mut KanNetwork,
@@ -301,7 +399,8 @@ impl Adam {
         }
     }
 
-    /// Backward-compatible вызов без клиппинга.
+    /// Backward-compatible step without gradient clipping.
+    #[deprecated(since = "0.2.0", note = "use step() with None instead")]
     pub fn step_unclipped(
         &mut self,
         network: &mut KanNetwork,
@@ -322,6 +421,34 @@ impl Clone for Adam {
 }
 
 /// SGD optimizer with momentum.
+///
+/// Implements classic stochastic gradient descent with optional
+/// momentum and decoupled weight decay.
+///
+/// # Algorithm
+///
+/// $$v_t = \mu \cdot v_{t-1} + g_t$$
+/// $$\theta_t = \theta_{t-1} - \alpha \cdot v_t$$
+///
+/// # Update Order
+///
+/// 1. **Velocity update**: $v = \mu \cdot v + g$ (momentum accumulation)
+/// 2. **Weight decay**: `param *= 1 - lr * decay` (applied BEFORE gradient step)
+/// 3. **Gradient step**: `param -= lr * v`
+///
+/// Weight decay is decoupled (not L2 regularization), matching AdamW behavior.
+/// Note: decay is only applied to weights, not biases.
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::{KanConfig, KanNetwork};
+/// use arkan::optimizer::SGD;
+///
+/// let config = KanConfig::default_poker();
+/// let network = KanNetwork::new(config);
+/// let mut optimizer = SGD::new(&network, 0.01, 0.9, 0.0);
+/// ```
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SGD {
     /// Learning rate.
@@ -425,7 +552,8 @@ impl SGD {
         }
     }
 
-    /// Backward-compatible вызов без клиппинга.
+    /// Backward-compatible step without gradient clipping.
+    #[deprecated(since = "0.2.0", note = "use step() with None instead")]
     pub fn step_unclipped(
         &mut self,
         network: &mut KanNetwork,
@@ -435,7 +563,7 @@ impl SGD {
         self.step(network, all_weight_grads, all_bias_grads, None);
     }
 
-    /// Resets velocity.
+    /// Resets all velocity buffers to zero.
     pub fn reset(&mut self) {
         for (vw, vb) in &mut self.velocities {
             vw.zero();
@@ -456,23 +584,50 @@ impl Clone for SGD {
 }
 
 /// Learning rate scheduler trait.
+///
+/// Implement this trait to create custom learning rate schedules.
 pub trait LrScheduler {
-    /// Gets the learning rate for the given epoch.
+    /// Returns the learning rate for the given epoch.
+    ///
+    /// # Arguments
+    ///
+    /// * `epoch` - Current epoch number (0-indexed)
+    /// * `current_lr` - Current learning rate (may be ignored)
     fn get_lr(&self, epoch: usize, current_lr: f32) -> f32;
 }
 
-/// Step decay scheduler.
+/// Step decay learning rate scheduler.
+///
+/// Multiplies the learning rate by `gamma` every `step_size` epochs.
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::optimizer::{StepLR, LrScheduler};
+///
+/// let scheduler = StepLR::new(0.1, 10, 0.5);
+///
+/// assert!((scheduler.get_lr(0, 0.1) - 0.1).abs() < 1e-6);
+/// assert!((scheduler.get_lr(10, 0.1) - 0.05).abs() < 1e-6);
+/// ```
 #[derive(Debug, Clone)]
 pub struct StepLR {
     /// Initial learning rate.
     pub initial_lr: f32,
-    /// Decay factor.
+    /// Decay factor (multiplied each step).
     pub gamma: f32,
-    /// Step size in epochs.
+    /// Number of epochs between decays.
     pub step_size: usize,
 }
 
 impl StepLR {
+    /// Creates a new step decay scheduler.
+    ///
+    /// # Arguments
+    ///
+    /// * `initial_lr` - Starting learning rate
+    /// * `step_size` - Epochs between decays
+    /// * `gamma` - Decay factor
     pub fn new(initial_lr: f32, step_size: usize, gamma: f32) -> Self {
         Self {
             initial_lr,
@@ -489,18 +644,46 @@ impl LrScheduler for StepLR {
     }
 }
 
-/// Cosine annealing scheduler.
+/// Cosine annealing learning rate scheduler.
+///
+/// Smoothly decreases the learning rate from `initial_lr` to `min_lr`
+/// following a cosine curve over `t_max` epochs.
+///
+/// # Formula
+///
+/// $$\eta_t = \eta_{min} + \frac{1}{2}(\eta_{max} - \eta_{min})(1 + \cos(\frac{t \pi}{T_{max}}))$$
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::optimizer::{CosineAnnealingLR, LrScheduler};
+///
+/// let scheduler = CosineAnnealingLR::new(0.1, 100, 0.001);
+///
+/// // At start: ~0.1
+/// let lr_start = scheduler.get_lr(0, 0.1);
+///
+/// // At end: ~0.001
+/// let lr_end = scheduler.get_lr(100, 0.1);
+/// ```
 #[derive(Debug, Clone)]
 pub struct CosineAnnealingLR {
-    /// Initial learning rate.
+    /// Initial (maximum) learning rate.
     pub initial_lr: f32,
-    /// Minimum learning rate.
+    /// Minimum learning rate at the end of annealing.
     pub min_lr: f32,
-    /// Total epochs.
+    /// Total number of epochs for one cycle.
     pub t_max: usize,
 }
 
 impl CosineAnnealingLR {
+    /// Creates a new cosine annealing scheduler.
+    ///
+    /// # Arguments
+    ///
+    /// * `initial_lr` - Starting learning rate
+    /// * `t_max` - Total epochs for decay
+    /// * `min_lr` - Minimum learning rate
     pub fn new(initial_lr: f32, t_max: usize, min_lr: f32) -> Self {
         Self {
             initial_lr,
@@ -571,6 +754,7 @@ mod tests {
         let bias_grads = vec![vec![0.5f32; network.layers[0].bias.len()]];
 
         // Step
+        #[allow(deprecated)]
         optimizer.step_unclipped(&mut network, &weight_grads, &bias_grads);
 
         // Weight should have decreased
