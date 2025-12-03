@@ -250,8 +250,6 @@ python scripts/bench_pytorch_train.py  # Full training
 ## 🔧 Test Environment
 
 - **OS:** Windows
-- **CPU:** (Your CPU here)
-- **Memory:** (Your RAM here)
 - **Rust:** stable (with AVX2 support)
 - **Python:** 3.12 with PyTorch (CPU)
 
