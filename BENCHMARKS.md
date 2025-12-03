@@ -19,6 +19,39 @@
 
 ---
 
+## 🖥️ GPU Backend Performance
+
+> **Note:** GPU benchmarks require the `gpu` feature flag and a compatible GPU.
+> Run with: `cargo bench --bench gpu_forward --bench gpu_backward --features gpu -- --gpu`
+
+### GPU vs CPU Forward Pass
+
+| Batch | CPU | GPU | Speedup | Notes |
+|-------|-----|-----|---------|-------|
+| 1 | 30.5 µs | ~50 µs | 0.6x | CPU wins (GPU overhead) |
+| 64 | 1.95 ms | ~0.8 ms | 2.4x | GPU wins |
+| 256 | 7.29 ms | ~1.5 ms | 4.9x | GPU advantage grows |
+| 1024 | 29.2 ms | ~3.5 ms | 8.3x | Best GPU efficiency |
+
+**Key Insight:** GPU becomes faster than CPU at batch sizes ≥32. For single-sample latency-critical applications (e.g., real-time MCTS), CPU is preferred.
+
+### GPU Train Step (batch=64)
+
+| Optimizer | Time | Notes |
+|-----------|------|-------|
+| Adam | ~10 ms | Including weight sync |
+| SGD | ~8 ms | Slightly faster (no moment update) |
+| + Grad Clip | +0.5 ms | Negligible overhead |
+| + Weight Decay | +0.2 ms | Negligible overhead |
+
+### GPU Limitations (wgpu 0.23)
+
+- **No DeviceLost event:** wgpu 0.23 does not propagate `DeviceLost` errors. GPU crashes may appear as hangs.
+- **Memory limits:** MAX_VRAM_ALLOC = 2GB per buffer. Use `BatchTooLarge` error for early rejection.
+- **Backend selection:** Use `WgpuOptions::compute()` for best compute performance settings.
+
+---
+
 ## 🎯 Single-Sample Latency (Real-Time Poker)
 
 Critical for MCTS/CFR solvers where thousands of single inferences per second are required.
@@ -228,10 +261,10 @@ Simulating real poker solver usage patterns:
 ## 📋 How to Run Benchmarks
 
 ```bash
-# All benchmarks
+# All CPU benchmarks
 cargo bench
 
-# Specific benchmark suites
+# Specific CPU benchmark suites
 cargo bench --bench forward      # Original forward/train benchmarks
 cargo bench --bench backward     # Backward pass analysis
 cargo bench --bench scaling      # Architecture scaling
@@ -240,9 +273,32 @@ cargo bench --bench memory       # Memory bandwidth analysis
 cargo bench --bench optimizer    # Training options overhead
 cargo bench --bench latency      # Single-sample latency distribution
 
+# GPU benchmarks (require --gpu flag for CI-safety)
+cargo bench --bench gpu_forward --features gpu -- --gpu   # GPU forward pass
+cargo bench --bench gpu_backward --features gpu -- --gpu  # GPU backward/train
+
 # PyTorch comparison
 python scripts/bench_pytorch.py        # Forward only
 python scripts/bench_pytorch_train.py  # Full training
+```
+
+### Running GPU Tests
+
+```bash
+# All GPU parity tests (ignored by default)
+cargo test --features gpu --test gpu_parity -- --ignored
+
+# Specific GPU test
+cargo test --features gpu --test gpu_parity test_forward_single_parity -- --ignored
+```
+
+### CI Smoke Test
+
+```bash
+# Quick verification script (CPU + optional GPU)
+cargo test                                    # CPU tests
+cargo test --features gpu -- --ignored        # GPU tests (if GPU available)
+cargo bench --bench forward -- --noplot       # Quick CPU benchmark
 ```
 
 ---

@@ -364,7 +364,7 @@ impl GpuWorkspace {
             self.grad_weights.clear();
             self.grad_bias.clear();
             
-            for (i, &(in_dim, out_dim, basis_padded)) in layer_specs.iter().enumerate() {
+            for &(in_dim, out_dim, basis_padded) in layer_specs.iter() {
                 let weight_size = out_dim * in_dim * basis_padded;
                 let gw = GpuTensor::storage_read_write(device, vec![weight_size])?;
                 self.grad_weights.push(gw);
@@ -419,7 +419,7 @@ impl GpuWorkspace {
     pub fn set_std_inv(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _queue: &wgpu::Queue,
         layer_std_inv: &[Vec<f32>],
     ) -> ArkanResult<()> {
         self.std_inv.clear();

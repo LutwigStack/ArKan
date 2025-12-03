@@ -244,6 +244,10 @@ fn forward_simple(@builtin(global_invocation_id) global_id: vec3<u32>) {
 "#;
 
 /// Softmax shader for output normalization.
+///
+/// **Status: Experimental** - Available but not integrated into forward pipeline.
+/// Can be used for custom post-processing or added manually to compute passes.
+#[allow(dead_code)]
 pub const SOFTMAX_SHADER: &str = r#"
 struct Uniforms {
     num_elements: u32,
@@ -288,6 +292,10 @@ fn softmax_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 "#;
 
 /// ReLU activation shader.
+///
+/// **Status: Experimental** - Available but not integrated into forward pipeline.
+/// KAN networks typically don't use ReLU (the B-splines provide non-linearity).
+#[allow(dead_code)]
 pub const RELU_SHADER: &str = r#"
 @group(0) @binding(0) var<storage, read_write> data: array<f32>;
 
@@ -301,6 +309,10 @@ fn relu_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 "#;
 
 /// Element-wise addition shader.
+///
+/// **Status: Experimental** - Available for custom tensor operations.
+/// Not used in standard KAN forward/backward passes.
+#[allow(dead_code)]
 pub const ADD_SHADER: &str = r#"
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;

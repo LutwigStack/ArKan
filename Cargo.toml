@@ -80,3 +80,8 @@ harness = false
 name = "gpu_forward"
 harness = false
 required-features = ["gpu"]
+
+[[bench]]
+name = "gpu_backward"
+harness = false
+required-features = ["gpu"]

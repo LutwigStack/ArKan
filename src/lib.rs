@@ -153,7 +153,7 @@ pub use spline::{
 #[cfg(feature = "gpu")]
 pub use gpu::{
     GpuLayer, GpuNetwork, GpuTensor, GpuTensorView, GpuWorkspace, LayerUniforms, 
-    PipelineCache, WgpuBackend, WgpuOptions,
+    PipelineCache, PowerPreference, WgpuBackend, WgpuOptions,
 };
 
 /// Library version from Cargo.toml.

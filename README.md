@@ -285,11 +285,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 |---------|--------|
 | Forward inference | ✅ |
 | Forward training (saves activations) | ✅ |
-| Backward pass | ✅ (CPU fallback) |
+| Backward pass | ✅ (GPU shaders) |
 | Adam/SGD optimizer | ✅ |
 | Weight sync CPU↔GPU | ✅ |
 | Multi-layer networks | ✅ |
 | Batch processing | ✅ |
+| train_step_with_options | ✅ |
+| Gradient clipping | ✅ |
+| Weight decay | ✅ |
+
+### **Weight Synchronization**
+
+```rust
+// Sync weights from CPU to GPU (after loading a model)
+gpu_network.sync_weights_cpu_to_gpu(&cpu_network)?;
+
+// Sync weights from GPU to CPU (for saving/export)
+gpu_network.sync_weights_gpu_to_cpu(&mut cpu_network)?;
+```
+
+### **Training with Options**
+
+```rust
+use arkan::TrainOptions;
+
+let opts = TrainOptions {
+    max_grad_norm: Some(1.0),  // Gradient clipping
+    weight_decay: 0.01,         // AdamW-style weight decay
+};
+
+let loss = gpu_network.train_step_with_options(
+    &input, &target, None, batch_size,
+    &mut workspace, &mut optimizer, &mut cpu_network,
+    &opts
+)?;
+```
+
+### **GPU Limitations (wgpu 0.23)**
+
+- **No DeviceLost propagation:** wgpu 0.23 does not expose `DeviceLost` errors. GPU crashes may appear as hangs instead of proper errors.
+- **Memory limits:** `MAX_VRAM_ALLOC = 2GB` per buffer. Exceeding this returns `BatchTooLarge` error.
+- **Vec4 alignment:** Weights are padded to vec4 (4-element) boundaries for shader efficiency.
+- **CPU fallback:** If GPU is unavailable, the backend initialization fails gracefully with `AdapterNotFound`.
+
+### **Choosing Backend**
+
+```rust
+// High-performance GPU (default)
+let backend = WgpuBackend::init(WgpuOptions::default())?;
+
+// Compute-optimized (larger buffers)
+let backend = WgpuBackend::init(WgpuOptions::compute())?;
+
+// Low-memory/integrated GPU
+let backend = WgpuBackend::init(WgpuOptions::low_memory())?;
+
+// Force specific adapter
+let opts = WgpuOptions {
+    force_adapter_name: Some("NVIDIA".to_string()),
+    ..Default::default()
+};
+let backend = WgpuBackend::init(opts)?;
+```
+
+### **Running GPU Tests and Benchmarks**
+
+```bash
+# GPU parity tests
+cargo test --features gpu --test gpu_parity -- --ignored
+
+# GPU benchmarks
+cargo bench --bench gpu_forward --features gpu -- --gpu
+cargo bench --bench gpu_backward --features gpu -- --gpu
+```
 
 ## **Benchmarks (CPU)**
 

@@ -8,8 +8,8 @@ use crate::gpu::backend::WgpuBackend;
 use crate::gpu::layer::GpuLayer;
 use crate::gpu::pipeline::{PipelineCache, WORKGROUP_SIZE, workgroup_count};
 use crate::gpu::workspace::GpuWorkspace;
-use crate::network::KanNetwork;
-use crate::optimizer::Adam;
+use crate::network::{KanNetwork, TrainOptions};
+use crate::optimizer::{Adam, SGD};
 use crate::loss::{masked_mse, masked_cross_entropy};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -625,7 +625,6 @@ impl GpuNetwork {
             
             // If computing input grad, copy grad_input to grad_output for next layer
             if compute_input_grad {
-                let prev_layer = &self.layers[layer_idx - 1];
                 let grad_input = workspace.download_grad_input(
                     &self.device, &self.queue, batch_size, self.layers[layer_idx].in_dim
                 )?;
@@ -949,10 +948,230 @@ impl GpuNetwork {
         Ok(loss)
     }
     
+    /// Performs a training step with options (gradient clipping, weight decay) using Adam.
+    ///
+    /// This method provides parity with the CPU [`KanNetwork::train_step_with_options`].
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data [batch_size * input_dim].
+    /// * `target` - Target data [batch_size * output_dim].
+    /// * `mask` - Optional mask [batch_size * output_dim] (1.0 = active, 0.0 = ignore).
+    /// * `batch_size` - Number of samples in the batch.
+    /// * `workspace` - GPU workspace for training buffers.
+    /// * `optimizer` - Adam optimizer with state.
+    /// * `cpu_network` - CPU network to update weights on.
+    /// * `opts` - Training options (gradient clipping, weight decay).
+    ///
+    /// # Returns
+    ///
+    /// The loss value for this batch.
+    pub fn train_step_with_options(
+        &mut self,
+        input: &[f32],
+        target: &[f32],
+        mask: Option<&[f32]>,
+        batch_size: usize,
+        workspace: &mut GpuWorkspace,
+        optimizer: &mut Adam,
+        cpu_network: &mut KanNetwork,
+        opts: &TrainOptions,
+    ) -> ArkanResult<f32> {
+        // Validate target shape
+        let expected_target_len = batch_size * self.output_dim;
+        if target.len() != expected_target_len {
+            return Err(ArkanError::shape_mismatch(
+                &[batch_size, self.output_dim],
+                &[target.len() / self.output_dim, self.output_dim],
+            ));
+        }
+        
+        // 1. Forward pass with training data
+        let output = self.forward_batch_training(input, batch_size, workspace)?;
+        
+        // 2. Compute loss and gradient
+        let (loss, grad_output) = masked_mse(&output, target, mask);
+        
+        // 3. Backward pass
+        let mut grad_weights = Vec::new();
+        let mut grad_biases = Vec::new();
+        let _grad_input = self.backward_batch(
+            &grad_output,
+            batch_size,
+            workspace,
+            &mut grad_weights,
+            &mut grad_biases,
+        )?;
+        
+        // 4. Apply weight decay if specified (AdamW-style decoupled decay)
+        if opts.weight_decay > 0.0 {
+            let lr = optimizer.config.lr;
+            for layer in &mut cpu_network.layers {
+                for w in layer.weights.as_mut_slice() {
+                    *w *= 1.0 - lr * opts.weight_decay;
+                }
+            }
+        }
+        
+        // 5. Optimizer step on CPU network with gradient clipping
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, opts.max_grad_norm);
+        
+        // 6. Sync weights from CPU to GPU
+        self.sync_weights(cpu_network)?;
+        
+        Ok(loss)
+    }
+    
+    /// Performs a training step using SGD optimizer.
+    ///
+    /// This method provides parity with CPU training using SGD.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data [batch_size * input_dim].
+    /// * `target` - Target data [batch_size * output_dim].
+    /// * `batch_size` - Number of samples in the batch.
+    /// * `workspace` - GPU workspace for training buffers.
+    /// * `optimizer` - SGD optimizer.
+    /// * `cpu_network` - CPU network to update weights on.
+    ///
+    /// # Returns
+    ///
+    /// The loss value for this batch.
+    pub fn train_step_sgd(
+        &mut self,
+        input: &[f32],
+        target: &[f32],
+        batch_size: usize,
+        workspace: &mut GpuWorkspace,
+        optimizer: &mut SGD,
+        cpu_network: &mut KanNetwork,
+    ) -> ArkanResult<f32> {
+        // Validate target shape
+        let expected_target_len = batch_size * self.output_dim;
+        if target.len() != expected_target_len {
+            return Err(ArkanError::shape_mismatch(
+                &[batch_size, self.output_dim],
+                &[target.len() / self.output_dim, self.output_dim],
+            ));
+        }
+        
+        // 1. Forward pass with training data
+        let output = self.forward_batch_training(input, batch_size, workspace)?;
+        
+        // 2. Compute loss and gradient
+        let (loss, grad_output) = masked_mse(&output, target, None);
+        
+        // 3. Backward pass
+        let mut grad_weights = Vec::new();
+        let mut grad_biases = Vec::new();
+        let _grad_input = self.backward_batch(
+            &grad_output,
+            batch_size,
+            workspace,
+            &mut grad_weights,
+            &mut grad_biases,
+        )?;
+        
+        // 4. Optimizer step on CPU network
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, None);
+        
+        // 5. Sync weights from CPU to GPU
+        self.sync_weights(cpu_network)?;
+        
+        Ok(loss)
+    }
+    
+    /// Performs a training step using SGD optimizer with options.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data [batch_size * input_dim].
+    /// * `target` - Target data [batch_size * output_dim].
+    /// * `mask` - Optional mask [batch_size * output_dim] (1.0 = active, 0.0 = ignore).
+    /// * `batch_size` - Number of samples in the batch.
+    /// * `workspace` - GPU workspace for training buffers.
+    /// * `optimizer` - SGD optimizer.
+    /// * `cpu_network` - CPU network to update weights on.
+    /// * `opts` - Training options (gradient clipping, weight decay).
+    ///
+    /// # Returns
+    ///
+    /// The loss value for this batch.
+    pub fn train_step_sgd_with_options(
+        &mut self,
+        input: &[f32],
+        target: &[f32],
+        mask: Option<&[f32]>,
+        batch_size: usize,
+        workspace: &mut GpuWorkspace,
+        optimizer: &mut SGD,
+        cpu_network: &mut KanNetwork,
+        opts: &TrainOptions,
+    ) -> ArkanResult<f32> {
+        // Validate target shape
+        let expected_target_len = batch_size * self.output_dim;
+        if target.len() != expected_target_len {
+            return Err(ArkanError::shape_mismatch(
+                &[batch_size, self.output_dim],
+                &[target.len() / self.output_dim, self.output_dim],
+            ));
+        }
+        
+        // 1. Forward pass with training data
+        let output = self.forward_batch_training(input, batch_size, workspace)?;
+        
+        // 2. Compute loss and gradient
+        let (loss, grad_output) = masked_mse(&output, target, mask);
+        
+        // 3. Backward pass
+        let mut grad_weights = Vec::new();
+        let mut grad_biases = Vec::new();
+        let _grad_input = self.backward_batch(
+            &grad_output,
+            batch_size,
+            workspace,
+            &mut grad_weights,
+            &mut grad_biases,
+        )?;
+        
+        // 4. Apply weight decay override if specified in opts
+        if opts.weight_decay > 0.0 {
+            let lr = optimizer.lr;
+            for layer in &mut cpu_network.layers {
+                for w in layer.weights.as_mut_slice() {
+                    *w *= 1.0 - lr * opts.weight_decay;
+                }
+            }
+        }
+        
+        // 5. Optimizer step on CPU network with gradient clipping
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, opts.max_grad_norm);
+        
+        // 6. Sync weights from CPU to GPU
+        self.sync_weights(cpu_network)?;
+        
+        Ok(loss)
+    }
+    
     /// Syncs weights from CPU network to GPU layers.
     ///
     /// Call this after modifying weights on the CPU side (e.g., after optimizer step).
     pub fn sync_weights_from_cpu(&mut self, cpu_network: &KanNetwork) -> ArkanResult<()> {
+        self.sync_weights(cpu_network)
+    }
+    
+    /// Syncs weights from GPU layers back to CPU network.
+    ///
+    /// This is an alias for `sync_weights_to_cpu` for naming consistency.
+    pub fn sync_weights_gpu_to_cpu(&self, cpu_network: &mut KanNetwork) -> ArkanResult<()> {
+        self.sync_weights_to_cpu(cpu_network)
+    }
+    
+    /// Syncs weights from CPU network to GPU layers.
+    ///
+    /// This is an alias for `sync_weights_from_cpu` for naming consistency.
+    pub fn sync_weights_cpu_to_gpu(&mut self, cpu_network: &KanNetwork) -> ArkanResult<()> {
         self.sync_weights(cpu_network)
     }
     

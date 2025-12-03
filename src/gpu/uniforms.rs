@@ -163,6 +163,7 @@ pub struct TrainingUniforms {
     pub _padding: u32,
 }
 
+#[allow(dead_code)]
 impl TrainingUniforms {
     /// Creates training uniforms from layer config and training parameters.
     pub fn new(
@@ -211,6 +212,7 @@ pub struct SimpleUniforms {
     pub _padding: u32,
 }
 
+#[allow(dead_code)]
 impl SimpleUniforms {
     /// Creates new simple uniforms.
     pub fn new(num_elements: u32, dim: u32, batch_size: u32) -> Self {
@@ -287,6 +289,7 @@ impl BackwardUniforms {
     }
 
     /// Returns the size in bytes.
+    #[allow(dead_code)]
     pub const fn size_bytes() -> usize {
         std::mem::size_of::<Self>()
     }
@@ -321,6 +324,7 @@ impl BiasUniforms {
     }
 
     /// Returns the size in bytes.
+    #[allow(dead_code)]
     pub const fn size_bytes() -> usize {
         std::mem::size_of::<Self>()
     }
