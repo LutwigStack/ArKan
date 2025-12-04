@@ -256,7 +256,7 @@ impl GpuNetwork {
     pub fn is_training_initialized(&self) -> bool {
         self.layers
             .first()
-            .map_or(true, |l| l.is_training_initialized())
+            .is_none_or(|l| l.is_training_initialized())
     }
 
     /// Zeros all gradient buffers.
@@ -1716,6 +1716,7 @@ impl GpuNetwork {
     ///
     /// Gradient clipping requires downloading gradients to CPU for norm calculation.
     /// If performance is critical and you don't need clipping, use [`train_step_gpu_native`].
+    #[allow(clippy::too_many_arguments)]
     pub fn train_step_gpu_native_with_options(
         &mut self,
         input: &[f32],

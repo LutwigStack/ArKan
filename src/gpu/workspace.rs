@@ -326,11 +326,11 @@ impl GpuWorkspace {
         let max_dim = layer_dims.iter().max().copied().unwrap_or(self.in_dim);
 
         // Allocate grad_output if needed (uses max_dim for intermediate gradient propagation)
-        // Use map_or to avoid unwrap on Option
+        // Use is_none_or to avoid unwrap on Option
         let needs_grad_output_realloc = self
             .grad_output
             .as_ref()
-            .map_or(true, |g| g.shape[0] < batch_size || g.shape[1] < max_dim);
+            .is_none_or(|g| g.shape[0] < batch_size || g.shape[1] < max_dim);
         if needs_grad_output_realloc {
             self.grad_output = Some(GpuTensor::storage_read_write(
                 device,
@@ -343,7 +343,7 @@ impl GpuWorkspace {
         let needs_grad_input_realloc = self
             .grad_input
             .as_ref()
-            .map_or(true, |g| g.shape[0] < batch_size);
+            .is_none_or(|g| g.shape[0] < batch_size);
         if needs_grad_input_realloc {
             self.grad_input = Some(GpuTensor::storage_read_write(
                 device,
@@ -710,7 +710,7 @@ impl GpuWorkspace {
         if self
             .cached_training_bind_groups
             .get(layer_idx)
-            .map_or(false, |bg| bg.is_some())
+            .is_some_and(|bg| bg.is_some())
         {
             return self.cached_training_bind_groups[layer_idx]
                 .as_ref()
