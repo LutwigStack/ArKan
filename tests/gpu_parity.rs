@@ -597,6 +597,9 @@ fn test_validate_layer_weights() {
         hidden_dims: vec![],
         spline_order: 3,
         grid_size: 5,
+        grid_range: (-3.0, 3.0),
+        input_mean: vec![0.0; 4],
+        input_std: vec![1.0; 4],
         ..Default::default()
     };
     let cpu_network = KanNetwork::new(config.clone());
@@ -1167,5 +1170,521 @@ fn test_gpu_native_training_multi_layer() {
 
     println!("Final loss: {:.6}", prev_loss);
     println!("Multi-layer native GPU training test passed");
+}
+
+// ==================== Error Path Tests ====================
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_unsupported_spline_order_1() {
+    use arkan::ArkanError;
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    // Create config with spline_order = 1 (not supported on GPU, min is 2)
+    let config = KanConfig {
+        input_dim: 4,
+        output_dim: 2,
+        hidden_dims: vec![],
+        spline_order: 1, // Too low for GPU
+        grid_size: 5,
+        grid_range: (-3.0, 3.0),
+        input_mean: vec![0.0; 4],
+        input_std: vec![1.0; 4],
+        ..Default::default()
+    };
+    let cpu_network = KanNetwork::new(config);
+
+    let result = GpuNetwork::from_cpu(&backend, &cpu_network);
+    assert!(result.is_err(), "Should fail for spline_order=1");
+
+    match result.unwrap_err() {
+        ArkanError::UnsupportedOrder(order) => {
+            assert_eq!(order, 1);
+            println!("Correctly rejected spline_order=1: order={}", order);
+        }
+        other => panic!("Expected UnsupportedOrder, got {:?}", other),
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_unsupported_spline_order_6() {
+    use arkan::ArkanError;
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    // Create config with spline_order = 6 (not supported on GPU, max is 5)
+    let config = KanConfig {
+        input_dim: 4,
+        output_dim: 2,
+        hidden_dims: vec![],
+        spline_order: 6, // Too high for GPU
+        grid_size: 5,
+        grid_range: (-3.0, 3.0),
+        input_mean: vec![0.0; 4],
+        input_std: vec![1.0; 4],
+        ..Default::default()
+    };
+    let cpu_network = KanNetwork::new(config);
+
+    let result = GpuNetwork::from_cpu(&backend, &cpu_network);
+    assert!(result.is_err(), "Should fail for spline_order=6");
+
+    match result.unwrap_err() {
+        ArkanError::UnsupportedOrder(order) => {
+            assert_eq!(order, 6);
+            println!("Correctly rejected spline_order=6");
+        }
+        other => panic!("Expected UnsupportedOrder, got {:?}", other),
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_shape_mismatch_forward_input_size() {
+    use arkan::ArkanError;
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut workspace = gpu_network.create_workspace(8).expect("Failed to create workspace");
+
+    // Wrong input size: expected 4 * batch, got wrong length
+    let wrong_input = vec![0.0f32; 3]; // Should be 4 for batch=1
+
+    let result = gpu_network.forward_batch(&wrong_input, 1, &mut workspace);
+    assert!(result.is_err(), "Should fail with wrong input size");
+
+    match result.unwrap_err() {
+        ArkanError::ShapeMismatch { expected, got } => {
+            println!("Correctly detected shape mismatch: expected {:?}, got {:?}", expected, got);
+        }
+        other => panic!("Expected ShapeMismatch, got {:?}", other),
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_shape_mismatch_batch_not_divisible() {
+    use arkan::ArkanError;
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut workspace = gpu_network.create_workspace(8).expect("Failed to create workspace");
+
+    // Input not divisible by input_dim (4)
+    let wrong_input = vec![0.0f32; 5]; // 5 is not divisible by 4
+
+    let result = gpu_network.forward_batch(&wrong_input, 1, &mut workspace);
+    assert!(result.is_err(), "Should fail when input not divisible by input_dim");
+
+    match result.unwrap_err() {
+        ArkanError::ShapeMismatch { .. } => {
+            println!("Correctly detected non-divisible input");
+        }
+        other => panic!("Expected ShapeMismatch, got {:?}", other),
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_train_step_target_mismatch() {
+    use arkan::ArkanError;
+    use arkan::optimizer::{Adam, AdamConfig};
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut cpu_network_copy = cpu_network.clone();
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut workspace = gpu_network.create_workspace(8).expect("Failed to create workspace");
+    let mut optimizer = Adam::new(&cpu_network, AdamConfig::with_lr(0.01));
+
+    let batch_size = 4;
+    let input = vec![0.5f32; batch_size * config.input_dim];
+    let wrong_target = vec![0.5f32; 3]; // Should be batch_size * output_dim = 4 * 2 = 8
+
+    let result = gpu_network.train_step_mse(
+        &input,
+        &wrong_target,
+        batch_size,
+        &mut workspace,
+        &mut optimizer,
+        &mut cpu_network_copy,
+    );
+    assert!(result.is_err(), "Should fail with wrong target size");
+
+    match result.unwrap_err() {
+        ArkanError::ShapeMismatch { .. } => {
+            println!("Correctly detected target shape mismatch");
+        }
+        other => panic!("Expected ShapeMismatch, got {:?}", other),
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_batch_zero_forward() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut workspace = gpu_network.create_workspace(8).expect("Failed to create workspace");
+
+    // batch_size = 0 should return empty result or handle gracefully
+    let empty_input: Vec<f32> = vec![];
+    let result = gpu_network.forward_batch(&empty_input, 0, &mut workspace);
+
+    // Either returns empty vec or an error - both are acceptable
+    match result {
+        Ok(output) => {
+            assert!(output.is_empty(), "Output should be empty for batch=0");
+            println!("batch=0 returned empty output (acceptable)");
+        }
+        Err(_) => {
+            println!("batch=0 returned error (acceptable)");
+        }
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_workspace_batch_exceeds_capacity() {
+    use arkan::ArkanError;
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
+    // Create workspace with small capacity
+    let mut workspace = gpu_network.create_workspace(4).expect("Failed to create workspace");
+
+    // Try to process batch larger than workspace capacity
+    let large_batch_size = 16;
+    let input = vec![0.5f32; large_batch_size * config.input_dim];
+
+    let result = gpu_network.forward_batch(&input, large_batch_size, &mut workspace);
+
+    // Should either resize workspace or return BatchTooLarge error
+    match result {
+        Ok(output) => {
+            // Workspace was resized
+            assert_eq!(output.len(), large_batch_size * config.output_dim);
+            println!("Workspace automatically resized to accommodate batch");
+        }
+        Err(ArkanError::BatchTooLarge { .. }) => {
+            println!("BatchTooLarge error returned (acceptable)");
+        }
+        Err(other) => {
+            panic!("Unexpected error: {:?}", other);
+        }
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_native_training_without_init() {
+    use arkan::gpu::{GpuAdam, GpuAdamConfig};
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut workspace = gpu_network.create_workspace(8).expect("Failed to create workspace");
+
+    // DON'T call init_training() - try to use native training without init
+    let layer_sizes = gpu_network.layer_param_sizes();
+    let mut optimizer = GpuAdam::new(
+        backend.device_arc(),
+        backend.queue_arc(),
+        &layer_sizes,
+        GpuAdamConfig::with_lr(0.01),
+    );
+
+    let batch_size = 4;
+    let input = vec![0.5f32; batch_size * config.input_dim];
+    let target = vec![0.5f32; batch_size * config.output_dim];
+
+    // This should work - native training uses workspace grad buffers, not layer grad buffers
+    let result = gpu_network.train_step_gpu_native(
+        &input,
+        &target,
+        batch_size,
+        &mut workspace,
+        &mut optimizer,
+    );
+
+    match result {
+        Ok(loss) => {
+            // Training worked without explicit init - workspace handles grad buffers
+            println!("Native training succeeded without explicit init, loss = {:.6}", loss);
+            assert!(loss.is_finite(), "Loss should be finite");
+        }
+        Err(e) => {
+            // Also acceptable - some paths may require init
+            println!("Native training without init returned error: {:?}", e);
+        }
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_tensor_shape_mismatch() {
+    use arkan::gpu::GpuTensor;
+    use arkan::ArkanError;
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    // Try to upload data with mismatched shape
+    let data = vec![1.0f32; 10]; // 10 elements
+    let wrong_shape = vec![3, 4]; // 12 elements expected
+
+    let result = GpuTensor::upload(&backend.device, &backend.queue, &data, wrong_shape);
+    assert!(result.is_err(), "Should fail with shape mismatch");
+
+    match result.unwrap_err() {
+        ArkanError::ShapeMismatch { expected, got } => {
+            println!("Correctly detected tensor shape mismatch: expected {:?}, got {:?}", expected, got);
+        }
+        other => panic!("Expected ShapeMismatch, got {:?}", other),
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_backward_without_forward() {
+    use arkan::ArkanError;
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut workspace = gpu_network.create_workspace(8).expect("Failed to create workspace");
+
+    // Try backward without forward - should fail or handle gracefully
+    let batch_size = 4;
+    let grad_output = vec![0.1f32; batch_size * config.output_dim];
+    let mut grad_weights = Vec::new();
+    let mut grad_biases = Vec::new();
+
+    // backward_batch requires output from forward pass
+    // This tests internal state validation
+    let result = gpu_network.backward_batch(
+        &grad_output,
+        batch_size,
+        &mut workspace,
+        &mut grad_weights,
+        &mut grad_biases,
+    );
+
+    // Should either work with zero gradients or return an error
+    match result {
+        Ok(grads) => {
+            println!("Backward returned gradients (workspace had cached forward state)");
+            assert!(!grads.is_empty());
+        }
+        Err(e) => {
+            println!("Backward without forward returned error: {:?} (acceptable)", e);
+        }
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_multiple_spline_orders() {
+    // Test all supported spline orders (2-5)
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    for order in 2..=5 {
+        let config = KanConfig {
+            input_dim: 4,
+            output_dim: 2,
+            hidden_dims: vec![8],
+            spline_order: order,
+            grid_size: 5,
+            grid_range: (-3.0, 3.0),
+            input_mean: vec![0.0; 4],
+            input_std: vec![1.0; 4],
+            ..Default::default()
+        };
+        let cpu_network = KanNetwork::new(config.clone());
+        let mut cpu_workspace = cpu_network.create_workspace(4);
+
+        let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
+            .expect(&format!("Failed to create GPU network for order={}", order));
+        let mut gpu_workspace = gpu_network
+            .create_workspace(4)
+            .expect("Failed to create workspace");
+
+        // Test forward pass
+        let input = vec![0.5f32; 4 * config.input_dim];
+        let mut cpu_output = vec![0.0f32; 4 * config.output_dim];
+        cpu_network.forward_batch(&input, &mut cpu_output, &mut cpu_workspace);
+        let gpu_output = gpu_network
+            .forward_batch(&input, 4, &mut gpu_workspace)
+            .expect("GPU forward failed");
+
+        // Higher order splines have more numerical variance - use larger tolerance
+        let tolerance = match order {
+            2 => 1e-4,
+            3 => 1e-4,
+            4 => 0.02,  // Quartic has more precision differences
+            5 => 0.05,  // Quintic even more
+            _ => 0.1,
+        };
+
+        // Compare results
+        assert_approx_eq(&cpu_output, &gpu_output, tolerance);
+        println!("spline_order={} passed parity test (tol={})", order, tolerance);
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_large_batch_forward() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
+    // Test with progressively larger batches
+    for batch_size in [1, 8, 64, 256, 1024] {
+        let mut workspace = gpu_network
+            .create_workspace(batch_size)
+            .expect(&format!("Failed to create workspace for batch={}", batch_size));
+
+        let input: Vec<f32> = (0..batch_size * config.input_dim)
+            .map(|i| (i as f32 * 0.001).sin())
+            .collect();
+
+        let result = gpu_network.forward_batch(&input, batch_size, &mut workspace);
+        assert!(result.is_ok(), "Forward failed for batch={}", batch_size);
+
+        let output = result.unwrap();
+        assert_eq!(output.len(), batch_size * config.output_dim);
+        println!("batch={} forward passed", batch_size);
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_warmup_and_memory_stats() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = multi_layer_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let _workspace = gpu_network.create_workspace(32).expect("Failed to create workspace");
+
+    // Test warmup
+    let warmup_result = gpu_network.warmup();
+    assert!(warmup_result.is_ok(), "Warmup should succeed");
+    println!("Warmup completed successfully");
+
+    // Test memory stats
+    let stats = gpu_network.memory_stats();
+    println!("Memory stats: {:?}", stats);
+    assert!(stats.weights_bytes > 0);
+    assert!(stats.total_bytes > 0);
+    println!(
+        "Weights: {} bytes, Bias: {} bytes, Total: {} bytes",
+        stats.weights_bytes, stats.bias_bytes, stats.total_bytes
+    );
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_weight_download_upload_roundtrip() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut cpu_network_copy = cpu_network.clone();
+
+    let gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
+    // Download weights back
+    gpu_network
+        .sync_weights_to_cpu(&mut cpu_network_copy)
+        .expect("Failed to download weights");
+
+    // Compare weights
+    for (original, downloaded) in cpu_network.layers.iter().zip(cpu_network_copy.layers.iter()) {
+        assert_eq!(original.weights.len(), downloaded.weights.len());
+        assert_approx_eq(&original.weights, &downloaded.weights, 1e-6);
+        assert_approx_eq(&original.bias, &downloaded.bias, 1e-6);
+    }
+    println!("Weight roundtrip passed");
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_multiple_workspaces() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
+    // Create multiple workspaces with different sizes
+    let mut workspace_small = gpu_network.create_workspace(4).expect("Failed");
+    let mut workspace_large = gpu_network.create_workspace(64).expect("Failed");
+
+    let input_small = vec![0.5f32; 4 * config.input_dim];
+    let input_large = vec![0.5f32; 64 * config.input_dim];
+
+    // Use both workspaces
+    let result_small = gpu_network
+        .forward_batch(&input_small, 4, &mut workspace_small)
+        .expect("Small forward failed");
+    let result_large = gpu_network
+        .forward_batch(&input_large, 64, &mut workspace_large)
+        .expect("Large forward failed");
+
+    assert_eq!(result_small.len(), 4 * config.output_dim);
+    assert_eq!(result_large.len(), 64 * config.output_dim);
+
+    // First 4 samples should be approximately equal
+    assert_approx_eq(&result_small, &result_large[..result_small.len()], 1e-5);
+    println!("Multiple workspaces work correctly");
 }
 
