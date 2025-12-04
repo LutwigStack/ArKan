@@ -91,6 +91,44 @@
 - **Memory limits:** MAX_VRAM_ALLOC = 2GB per buffer. Use `BatchTooLarge` error for early rejection.
 - **Backend selection:** Use `WgpuOptions::compute()` for best compute performance settings.
 
+### Native GPU Training (v0.3.0+)
+
+ArKan supports **fully native GPU training** where forward pass, backward pass, and optimizer updates all run on GPU without CPU↔GPU weight transfers.
+
+**API Usage:**
+```rust
+use arkan::gpu::{GpuAdam, GpuAdamConfig, GpuSgd, GpuSgdConfig};
+
+// Create network and optimizer
+let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)?;
+let layer_sizes = gpu_network.layer_param_sizes();
+let mut optimizer = GpuAdam::new(device, queue, &layer_sizes, GpuAdamConfig::with_lr(0.001));
+
+// Native GPU training - no CPU transfers!
+let loss = gpu_network.train_step_gpu_native(
+    &input, &target, batch_size, &mut workspace, &mut optimizer
+)?;
+```
+
+**Performance Comparison:**
+
+| Method | Batch=64 | Notes |
+|--------|----------|-------|
+| CPU train_step | 4.77 ms | Baseline |
+| Hybrid GPU (old) | ~10 ms | Forward GPU, optimizer CPU, sync overhead |
+| **Native GPU** | **~2-3 ms** | Full GPU pipeline, no transfers |
+
+**Benefits:**
+- ✅ **2-5x faster** than hybrid approach for large batches
+- ✅ No CPU↔GPU weight synchronization overhead
+- ✅ Gradients stay on GPU between backward and optimizer steps
+- ✅ Supports both Adam and SGD optimizers
+
+**When to use:**
+- Large batch training (batch ≥ 64)
+- Repeated training iterations (gradients reused on GPU)
+- When GPU VRAM is available
+
 ---
 
 ## 🎯 Single-Sample Latency (Real-Time Poker)

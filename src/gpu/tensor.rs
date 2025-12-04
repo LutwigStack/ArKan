@@ -213,6 +213,52 @@ impl GpuTensor {
         Self::uninit(device, shape, wgpu::BufferUsages::empty())
     }
 
+    /// Creates a GPU tensor for use as read-write storage, initialized with data.
+    ///
+    /// This is useful for gradient buffers that need to be both read and written
+    /// by compute shaders, and initialized with zeros.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ArkanError::BatchTooLarge` if the data size exceeds `MAX_VRAM_ALLOC`.
+    pub fn storage_rw(
+        device: &wgpu::Device,
+        data: &[f32],
+        shape: Vec<usize>,
+    ) -> ArkanResult<Self> {
+        let expected_len: usize = shape.iter().product();
+        if data.len() != expected_len {
+            let got_shape = infer_got_shape(data.len(), &shape);
+            return Err(ArkanError::ShapeMismatch {
+                expected: shape,
+                got: got_shape,
+            });
+        }
+
+        let size_bytes = (data.len() * std::mem::size_of::<f32>()) as u64;
+
+        if exceeds_vram_limit(size_bytes) {
+            return Err(ArkanError::batch_too_large(
+                data.len(),
+                (MAX_VRAM_ALLOC / std::mem::size_of::<f32>() as u64) as usize,
+            ));
+        }
+
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("GpuTensor (storage rw)"),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        Ok(Self {
+            buffer,
+            shape,
+            capacity_bytes: size_bytes,
+        })
+    }
+
     /// Downloads tensor data from GPU to CPU.
     ///
     /// This operation is synchronous and will block until the data transfer

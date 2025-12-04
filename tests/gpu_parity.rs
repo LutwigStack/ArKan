@@ -981,3 +981,191 @@ fn test_gpu_softmax_vs_cpu() {
 
     println!("GPU vs CPU softmax test passed");
 }
+
+// ==================== Native GPU Training Tests ====================
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_native_training_adam() {
+    use arkan::gpu::{GpuAdam, GpuAdamConfig};
+
+    // Initialize GPU backend
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    // Create network
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut gpu_workspace = gpu_network
+        .create_workspace(16)
+        .expect("Failed to create workspace");
+
+    // Create GPU Adam optimizer
+    let layer_sizes = gpu_network.layer_param_sizes();
+    let mut optimizer = GpuAdam::new(
+        backend.device_arc(),
+        backend.queue_arc(),
+        &layer_sizes,
+        GpuAdamConfig::with_lr(0.01),
+    );
+
+    // Generate training data
+    let batch_size = 16;
+    let input: Vec<f32> = (0..batch_size * config.input_dim)
+        .map(|i| ((i as f32 * 0.1).sin()) * 0.5)
+        .collect();
+    let target: Vec<f32> = (0..batch_size * config.output_dim)
+        .map(|i| ((i as f32 * 0.2).cos()) * 0.5)
+        .collect();
+
+    // Run several training steps
+    let mut losses = Vec::new();
+    for _step in 0..10 {
+        let loss = gpu_network
+            .train_step_gpu_native(&input, &target, batch_size, &mut gpu_workspace, &mut optimizer)
+            .expect("Native GPU training step failed");
+        losses.push(loss);
+    }
+
+    // Verify loss is decreasing (at least not increasing dramatically)
+    println!("Native GPU training losses: {:?}", losses);
+    assert!(
+        losses.len() == 10,
+        "Expected 10 training steps, got {}",
+        losses.len()
+    );
+
+    // Loss should generally decrease or stay stable
+    let first_loss = losses[0];
+    let last_loss = losses[losses.len() - 1];
+    println!(
+        "First loss: {:.6}, Last loss: {:.6}, Change: {:.2}%",
+        first_loss,
+        last_loss,
+        (last_loss - first_loss) / first_loss * 100.0
+    );
+
+    // Not strictly required to decrease (depends on data), but shouldn't explode
+    assert!(
+        last_loss < first_loss * 10.0,
+        "Loss exploded: {} -> {}",
+        first_loss,
+        last_loss
+    );
+
+    println!("Native GPU Adam training test passed");
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_native_training_sgd() {
+    use arkan::gpu::{GpuSgd, GpuSgdConfig};
+
+    // Initialize GPU backend
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    // Create network
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut gpu_workspace = gpu_network
+        .create_workspace(8)
+        .expect("Failed to create workspace");
+
+    // Create GPU SGD optimizer
+    let layer_sizes = gpu_network.layer_param_sizes();
+    let mut optimizer = GpuSgd::new(
+        backend.device_arc(),
+        backend.queue_arc(),
+        &layer_sizes,
+        GpuSgdConfig::with_lr(0.1),
+    );
+
+    // Generate training data
+    let batch_size = 8;
+    let input: Vec<f32> = (0..batch_size * config.input_dim)
+        .map(|i| ((i as f32 * 0.1).sin()) * 0.5)
+        .collect();
+    let target: Vec<f32> = (0..batch_size * config.output_dim)
+        .map(|i| ((i as f32 * 0.2).cos()) * 0.5)
+        .collect();
+
+    // Run training steps
+    for step in 0..5 {
+        let loss = gpu_network
+            .train_step_gpu_native_sgd(
+                &input,
+                &target,
+                batch_size,
+                &mut gpu_workspace,
+                &mut optimizer,
+            )
+            .expect("Native GPU SGD training step failed");
+        println!("SGD Step {}: loss = {:.6}", step, loss);
+    }
+
+    println!("Native GPU SGD training test passed");
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_native_training_multi_layer() {
+    use arkan::gpu::{GpuAdam, GpuAdamConfig};
+
+    // Initialize GPU backend
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    // Create multi-layer network
+    let config = multi_layer_config();
+    let cpu_network = KanNetwork::new(config.clone());
+
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut gpu_workspace = gpu_network
+        .create_workspace(32)
+        .expect("Failed to create workspace");
+
+    // Create optimizer
+    let layer_sizes = gpu_network.layer_param_sizes();
+    println!("Layer sizes for optimizer: {:?}", layer_sizes);
+
+    let mut optimizer = GpuAdam::new(
+        backend.device_arc(),
+        backend.queue_arc(),
+        &layer_sizes,
+        GpuAdamConfig::with_lr(0.001),
+    );
+
+    // Training data
+    let batch_size = 32;
+    let input: Vec<f32> = (0..batch_size * config.input_dim)
+        .map(|i| ((i as f32 * 0.05).sin()) * 0.5)
+        .collect();
+    let target: Vec<f32> = (0..batch_size * config.output_dim)
+        .map(|i| ((i as f32 * 0.1).cos()) * 0.3 + 0.5)
+        .collect();
+
+    // Train for several epochs
+    let mut prev_loss = f32::MAX;
+    for epoch in 0..20 {
+        let loss = gpu_network
+            .train_step_gpu_native(&input, &target, batch_size, &mut gpu_workspace, &mut optimizer)
+            .expect("Multi-layer GPU training failed");
+
+        if epoch % 5 == 0 {
+            println!("Epoch {}: loss = {:.6}", epoch, loss);
+        }
+        prev_loss = loss;
+    }
+
+    println!("Final loss: {:.6}", prev_loss);
+    println!("Multi-layer native GPU training test passed");
+}
+

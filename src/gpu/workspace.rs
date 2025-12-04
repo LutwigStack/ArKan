@@ -402,6 +402,25 @@ impl GpuWorkspace {
         }
     }
 
+    /// Returns references to gradient buffers for GPU optimizer.
+    ///
+    /// Returns Vec of (&grad_weights_buffer, &grad_bias_buffer) for each layer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if gradient buffers are not allocated. Call `prepare_grad_buffers` first.
+    pub fn get_layer_grad_buffers(&self) -> Vec<(&wgpu::Buffer, &wgpu::Buffer)> {
+        assert!(
+            !self.grad_weights.is_empty(),
+            "Gradient buffers not allocated. Call prepare_grad_buffers first."
+        );
+        self.grad_weights
+            .iter()
+            .zip(self.grad_bias.iter())
+            .map(|(gw, gb)| (&gw.buffer, &gb.buffer))
+            .collect()
+    }
+
     /// Downloads weight gradients for a specific layer.
     pub fn download_grad_weights(
         &self,
