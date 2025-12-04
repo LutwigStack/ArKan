@@ -684,24 +684,24 @@ impl KanNetwork {
             buffer_a.try_resize(ping_pong_size)?;
             buffer_b.try_resize(ping_pong_size)?;
 
-            let mut current_is_a = true;
+            // Ping-pong buffer tracking:
+            // - After each layer, current_is_a indicates which buffer CONTAINS the output
+            // - Next layer reads from that buffer and writes to the other
+            let mut current_is_a = false; // Will become true after layer 0 writes to buffer_a
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let in_size = checked_buffer_size(batch_size, layer.in_dim)?;
                 let out_size = checked_buffer_size(batch_size, layer.out_dim)?;
 
+                // Determine input source and output destination
                 let (input_slice, output_buf): (&[f32], &mut _) = if layer_idx == 0 {
-                    (
-                        input,
-                        if current_is_a {
-                            &mut buffer_a
-                        } else {
-                            &mut buffer_b
-                        },
-                    )
+                    // First layer: read from input slice, write to buffer_a
+                    (input, &mut buffer_a)
                 } else if current_is_a {
+                    // Previous layer wrote to buffer_a, read from there, write to buffer_b
                     (&buffer_a.as_slice()[..in_size], &mut buffer_b)
                 } else {
+                    // Previous layer wrote to buffer_b, read from there, write to buffer_a
                     (&buffer_b.as_slice()[..in_size], &mut buffer_a)
                 };
 
@@ -723,7 +723,14 @@ impl KanNetwork {
                     output.copy_from_slice(&output_buf.as_slice()[..out_size]);
                 }
 
-                current_is_a = !current_is_a;
+                // After writing, update current_is_a to indicate where the output now lives
+                // Layer 0 always writes to buffer_a, so current_is_a becomes true
+                // Subsequent layers toggle: if we just read from A and wrote to B, current_is_a = false
+                if layer_idx == 0 {
+                    current_is_a = true; // Layer 0 always outputs to buffer_a
+                } else {
+                    current_is_a = !current_is_a;
+                }
             }
 
             Ok(())

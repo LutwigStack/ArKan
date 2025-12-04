@@ -213,7 +213,8 @@ impl KanLayer {
         };
 
         // Initialize weights with small random values (Xavier-like)
-        let scale = (2.0 / (in_dim + out_dim) as f32).sqrt() * 0.1;
+        // KAN needs larger initialization because B-splines have bounded support
+        let scale = (2.0 / (in_dim + out_dim) as f32).sqrt();
         let mut rng: SmallRng = if let Some(seed) = config.init_seed {
             SmallRng::seed_from_u64(seed)
         } else {
