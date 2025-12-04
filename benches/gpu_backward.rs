@@ -25,7 +25,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::cell::RefCell;
 
 #[cfg(feature = "gpu")]
-use arkan::gpu::{GpuNetwork, WgpuBackend, WgpuOptions};
+use arkan::gpu::{GpuAdamConfig, GpuAdam, GpuNetwork, WgpuBackend, WgpuOptions};
 #[cfg(feature = "gpu")]
 use arkan::optimizer::{Adam, AdamConfig, SGD};
 #[cfg(feature = "gpu")]
@@ -400,8 +400,8 @@ fn bench_cpu_vs_gpu_train(c: &mut Criterion) {
         );
     });
 
-    // GPU benchmark - reset network and optimizer each iteration
-    group.bench_function("gpu", |b| {
+    // GPU hybrid benchmark - reset network and optimizer each iteration
+    group.bench_function("gpu_hybrid", |b| {
         b.iter_batched(
             || {
                 let gpu_cpu_network = base_cpu_network.clone();
@@ -433,6 +433,93 @@ fn bench_cpu_vs_gpu_train(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark native GPU training (all computation on GPU, no CPU readback).
+///
+/// This benchmark measures `train_step_gpu_native` performance, which keeps
+/// all optimizer state and gradients on the GPU. This is the fastest training
+/// method but requires explicit `sync_weights_gpu_to_cpu` to read weights back.
+#[cfg(feature = "gpu")]
+fn bench_gpu_native_training(c: &mut Criterion) {
+    if !gpu_flag_enabled() {
+        eprintln!("GPU benchmarks skipped (ARKAN_GPU_BENCH not set).");
+        return;
+    }
+
+    let backend = match WgpuBackend::init(WgpuOptions::default()) {
+        Ok(b) => {
+            println!(
+                "Native GPU training benchmark - GPU: {} ({:?})",
+                b.adapter_info().name,
+                b.adapter_info().backend
+            );
+            b
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize GPU: {}. Skipping.", e);
+            return;
+        }
+    };
+
+    let config = KanConfig::preset();
+    let cpu_network = KanNetwork::new(config.clone());
+
+    let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Failed to create GPU network: {}. Skipping.", e);
+            return;
+        }
+    };
+
+    let batch_sizes = [1_usize, 8, 16, 64, 256];
+    let mut group = c.benchmark_group("gpu_native_training");
+
+    let max_batch = *batch_sizes.iter().max().unwrap();
+    let mut workspace = match gpu_network.create_workspace(max_batch) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Failed to create workspace: {}. Skipping.", e);
+            return;
+        }
+    };
+
+    // Create GpuAdam optimizer (native GPU optimizer)
+    let layer_sizes = gpu_network.layer_param_sizes();
+    let mut optimizer = GpuAdam::new(
+        backend.device_arc(),
+        backend.queue_arc(),
+        &layer_sizes,
+        GpuAdamConfig::with_lr(0.001),
+    );
+
+    for &batch in &batch_sizes {
+        let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
+        let targets = make_targets(config.output_dim, batch, 42);
+
+        group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(batch),
+            &batch,
+            |b, &batch_size| {
+                b.iter(|| {
+                    let loss = gpu_network
+                        .train_step_gpu_native(
+                            black_box(&inputs),
+                            black_box(&targets),
+                            batch_size,
+                            &mut workspace,
+                            &mut optimizer,
+                        )
+                        .expect("Native GPU train step failed");
+                    black_box(loss)
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 #[cfg(feature = "gpu")]
 criterion_group!(
     benches,
@@ -440,6 +527,7 @@ criterion_group!(
     bench_gpu_train_step_sgd,
     bench_gpu_train_step_with_options,
     bench_cpu_vs_gpu_train,
+    bench_gpu_native_training,
 );
 
 #[cfg(not(feature = "gpu"))]

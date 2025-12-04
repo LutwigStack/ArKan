@@ -1960,4 +1960,121 @@ mod tests {
         let result = checked_buffer_size(usize::MAX, 2);
         assert!(result.is_err());
     }
+
+    // =========================================================================
+    // Serialization tests (serde feature)
+    // =========================================================================
+
+    /// Test serialization round-trip: to_bytes -> from_bytes
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serialization_roundtrip() {
+        let config = KanConfig::preset();
+        let original = KanNetwork::new(config);
+
+        // Serialize
+        let bytes = original.to_bytes().expect("to_bytes failed");
+
+        // Verify header
+        assert_eq!(&bytes[..5], SERIALIZATION_MAGIC);
+        let version = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
+        assert_eq!(version, SERIALIZATION_VERSION);
+
+        // Deserialize
+        let loaded = KanNetwork::from_bytes(&bytes).expect("from_bytes failed");
+
+        // Verify properties match
+        assert_eq!(loaded.param_count(), original.param_count());
+        assert_eq!(loaded.num_layers(), original.num_layers());
+        assert_eq!(loaded.config.input_dim, original.config.input_dim);
+        assert_eq!(loaded.config.output_dim, original.config.output_dim);
+    }
+
+    /// Test from_bytes with wrong magic bytes returns error
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_from_bytes_wrong_magic() {
+        // Create invalid bytes with wrong magic
+        let mut invalid_bytes = vec![0u8; 20];
+        invalid_bytes[..5].copy_from_slice(b"WRONG"); // Wrong magic
+        invalid_bytes[5..9].copy_from_slice(&1u32.to_le_bytes()); // Version 1
+
+        let result = KanNetwork::from_bytes(&invalid_bytes);
+        let err = result.err().expect("Expected error for wrong magic");
+
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("wrong magic") || err_msg.contains("not an ArKan"),
+            "Expected wrong magic error, got: {}",
+            err_msg
+        );
+    }
+
+    /// Test from_bytes with incompatible version returns error
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_from_bytes_incompatible_version() {
+        // Create bytes with valid magic but wrong version
+        let mut invalid_bytes = vec![0u8; 100];
+        invalid_bytes[..5].copy_from_slice(SERIALIZATION_MAGIC); // Correct magic
+        invalid_bytes[5..9].copy_from_slice(&99u32.to_le_bytes()); // Wrong version (99)
+
+        let result = KanNetwork::from_bytes(&invalid_bytes);
+        let err = result.err().expect("Expected error for incompatible version");
+
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("Incompatible") || err_msg.contains("version"),
+            "Expected incompatible version error, got: {}",
+            err_msg
+        );
+    }
+
+    /// Test from_bytes with truncated header returns error
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_from_bytes_truncated_header() {
+        // Too short for header (magic + version = 9 bytes)
+        let too_short = vec![b'A', b'R', b'K']; // Only 3 bytes
+
+        let result = KanNetwork::from_bytes(&too_short);
+        let err = result.err().expect("Expected error for truncated header");
+
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("too short") || err_msg.contains("Invalid"),
+            "Expected header error, got: {}",
+            err_msg
+        );
+    }
+
+    /// Test from_bytes with corrupted network data returns error
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_from_bytes_corrupted_data() {
+        // Valid header but garbage network data
+        let mut corrupted_bytes = vec![0u8; 50];
+        corrupted_bytes[..5].copy_from_slice(SERIALIZATION_MAGIC);
+        corrupted_bytes[5..9].copy_from_slice(&SERIALIZATION_VERSION.to_le_bytes());
+        // Rest is zeros - invalid bincode data
+
+        let result = KanNetwork::from_bytes(&corrupted_bytes);
+        assert!(result.is_err()); // Should fail to deserialize
+    }
+
+    /// Test legacy from_bytes_legacy for backwards compatibility
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_from_bytes_legacy() {
+        let config = KanConfig::preset();
+        let original = KanNetwork::new(config);
+
+        // Legacy format: just bincode, no header
+        let legacy_bytes = bincode::serialize(&original).expect("serialize failed");
+
+        // Legacy loader should work
+        let loaded =
+            KanNetwork::from_bytes_legacy(&legacy_bytes).expect("from_bytes_legacy failed");
+        assert_eq!(loaded.param_count(), original.param_count());
+    }
 }

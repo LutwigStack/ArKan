@@ -2078,7 +2078,7 @@ fn test_gpu_gradient_clipping() {
     let config = multi_layer_config();
     let cpu_network = KanNetwork::new(config.clone());
     let mut gpu_cpu_network = cpu_network.clone();
-    let mut cpu_workspace = cpu_network.create_workspace(8);
+    let _cpu_workspace = cpu_network.create_workspace(8);
 
     let mut gpu_network =
         GpuNetwork::from_cpu(&backend, &gpu_cpu_network).expect("Failed to create GPU network");
