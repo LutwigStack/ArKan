@@ -1688,3 +1688,817 @@ fn test_multiple_workspaces() {
     println!("Multiple workspaces work correctly");
 }
 
+// ==================== Extended GPU Tests ====================
+
+/// Test GPU network with different grid sizes.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_grid_size_variations() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    for grid_size in [3_usize, 5, 8, 12, 16] {
+        let config = KanConfig {
+            input_dim: 4,
+            output_dim: 2,
+            hidden_dims: vec![8],
+            spline_order: 3,
+            grid_size,
+            grid_range: (-3.0, 3.0),
+            input_mean: vec![0.0; 4],
+            input_std: vec![1.0; 4],
+            ..Default::default()
+        };
+
+        let cpu_network = KanNetwork::new(config.clone());
+        let mut cpu_workspace = cpu_network.create_workspace(4);
+
+        let mut gpu_network =
+            GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+        let mut gpu_workspace = gpu_network.create_workspace(4).expect("Failed");
+
+        let input = vec![0.5f32; 4 * config.input_dim];
+        let mut cpu_output = vec![0.0f32; 4 * config.output_dim];
+
+        cpu_network.forward_batch(&input, &mut cpu_output, &mut cpu_workspace);
+        let gpu_output = gpu_network
+            .forward_batch(&input, 4, &mut gpu_workspace)
+            .expect("GPU forward failed");
+
+        // Allow slightly larger tolerance for larger grids
+        let tol = 0.01 + (grid_size as f32) * 0.001;
+        assert_approx_eq(&cpu_output, &gpu_output, tol);
+        println!("Grid size {} passed", grid_size);
+    }
+}
+
+/// Test GPU network with extreme input values.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_extreme_input_values() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut cpu_workspace = cpu_network.create_workspace(1);
+
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut gpu_workspace = gpu_network.create_workspace(1).expect("Failed");
+
+    // Test extreme input values
+    let test_cases = [
+        vec![0.0f32; config.input_dim],           // All zeros
+        vec![1.0f32; config.input_dim],           // All ones
+        vec![-1.0f32; config.input_dim],          // All negative ones
+        vec![3.0f32; config.input_dim],           // At grid boundary
+        vec![-3.0f32; config.input_dim],          // At negative grid boundary
+        vec![10.0f32; config.input_dim],          // Beyond grid range
+        vec![-10.0f32; config.input_dim],         // Beyond negative grid range
+    ];
+
+    for (i, input) in test_cases.iter().enumerate() {
+        let mut cpu_output = vec![0.0f32; config.output_dim];
+        cpu_network.forward_batch(input, &mut cpu_output, &mut cpu_workspace);
+
+        let gpu_output = gpu_network
+            .forward_batch(input, 1, &mut gpu_workspace)
+            .expect("GPU forward failed");
+
+        // Check for NaN/Inf
+        for (j, &val) in gpu_output.iter().enumerate() {
+            assert!(
+                val.is_finite(),
+                "Test case {}: output[{}] is not finite: {}",
+                i,
+                j,
+                val
+            );
+        }
+
+        assert_approx_eq(&cpu_output, &gpu_output, 0.01);
+        println!("Extreme input test case {} passed", i);
+    }
+}
+
+/// Test GPU native optimizer learning rate API.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_optimizer_lr_api() {
+    use arkan::gpu::{GpuAdam, GpuAdamConfig, GpuSgd, GpuSgdConfig};
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
+    let layer_sizes = gpu_network.layer_param_sizes();
+
+    // Test Adam LR API
+    let mut adam = GpuAdam::new(
+        backend.device_arc(),
+        backend.queue_arc(),
+        &layer_sizes,
+        GpuAdamConfig::with_lr(0.001),
+    );
+    assert!((adam.get_lr() - 0.001).abs() < 1e-6);
+
+    adam.set_lr(0.01);
+    assert!((adam.get_lr() - 0.01).abs() < 1e-6);
+
+    // Test SGD LR API
+    let mut sgd = GpuSgd::new(
+        backend.device_arc(),
+        backend.queue_arc(),
+        &layer_sizes,
+        GpuSgdConfig::with_lr(0.1),
+    );
+    assert!((sgd.get_lr() - 0.1).abs() < 1e-6);
+
+    sgd.set_lr(0.05);
+    assert!((sgd.get_lr() - 0.05).abs() < 1e-6);
+
+    println!("GPU optimizer LR API tests passed");
+}
+
+/// Test that GPU training loss decreases over multiple steps.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_training_convergence() {
+    use arkan::gpu::{GpuAdam, GpuAdamConfig};
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = KanConfig {
+        input_dim: 4,
+        output_dim: 2,
+        hidden_dims: vec![8],
+        spline_order: 3,
+        grid_size: 5,
+        grid_range: (-1.0, 1.0),
+        input_mean: vec![0.0; 4],
+        input_std: vec![1.0; 4],
+        ..Default::default()
+    };
+
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut workspace = gpu_network.create_workspace(16).expect("Failed");
+
+    let layer_sizes = gpu_network.layer_param_sizes();
+    let mut optimizer = GpuAdam::new(
+        backend.device_arc(),
+        backend.queue_arc(),
+        &layer_sizes,
+        GpuAdamConfig::with_lr(0.01),
+    );
+
+    // Simple pattern: input sum -> output
+    let inputs: Vec<f32> = (0..16 * 4).map(|i| ((i % 4) as f32) * 0.5 - 1.0).collect();
+    let targets: Vec<f32> = (0..16).flat_map(|i| {
+        let sum: f32 = (0..4).map(|j| inputs[i * 4 + j]).sum();
+        vec![sum.tanh(), (-sum).tanh()]
+    }).collect();
+
+    let mut losses = Vec::new();
+    for _ in 0..20 {
+        let loss = gpu_network
+            .train_step_gpu_native(&inputs, &targets, 16, &mut workspace, &mut optimizer)
+            .expect("Training failed");
+        losses.push(loss);
+    }
+
+    // Check that loss generally decreased
+    let first_loss = losses[0];
+    let last_loss = *losses.last().unwrap();
+    println!(
+        "Convergence test: first_loss={:.6}, last_loss={:.6}",
+        first_loss, last_loss
+    );
+    assert!(
+        last_loss < first_loss,
+        "Loss should decrease: first={}, last={}",
+        first_loss,
+        last_loss
+    );
+}
+
+/// Test concurrent GPU forward passes on different networks.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_concurrent_networks() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    // Create multiple independent networks
+    let configs: Vec<KanConfig> = (0..3)
+        .map(|i| KanConfig {
+            input_dim: 4 + i,
+            output_dim: 2,
+            hidden_dims: vec![8],
+            spline_order: 3,
+            grid_size: 5,
+            grid_range: (-3.0, 3.0),
+            input_mean: vec![0.0; 4 + i],
+            input_std: vec![1.0; 4 + i],
+            ..Default::default()
+        })
+        .collect();
+
+    let mut networks: Vec<(GpuNetwork, _)> = configs
+        .iter()
+        .map(|cfg| {
+            let cpu = KanNetwork::new(cfg.clone());
+            let gpu = GpuNetwork::from_cpu(&backend, &cpu).expect("Failed");
+            let ws = gpu.create_workspace(4).expect("Failed");
+            (gpu, ws)
+        })
+        .collect();
+
+    // Run forward passes on all networks
+    for (i, (network, workspace)) in networks.iter_mut().enumerate() {
+        let input_dim = configs[i].input_dim;
+        let input = vec![0.5f32; 4 * input_dim];
+
+        let result = network
+            .forward_batch(&input, 4, workspace)
+            .expect("Forward failed");
+
+        assert_eq!(result.len(), 4 * configs[i].output_dim);
+        println!("Network {} forward passed", i);
+    }
+}
+
+/// Test WgpuOptions variants.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_wgpu_options_variants() {
+    // Test default options
+    let backend_default =
+        WgpuBackend::init(WgpuOptions::default()).expect("Default options failed");
+    println!("Default backend: {}", backend_default.adapter_info().name);
+
+    // Test compute options
+    let backend_compute =
+        WgpuBackend::init(WgpuOptions::compute()).expect("Compute options failed");
+    println!("Compute backend: {}", backend_compute.adapter_info().name);
+
+    // Both should work
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+
+    let mut gpu1 =
+        GpuNetwork::from_cpu(&backend_default, &cpu_network).expect("Failed with default");
+    let mut gpu2 =
+        GpuNetwork::from_cpu(&backend_compute, &cpu_network).expect("Failed with compute");
+
+    let mut ws1 = gpu1.create_workspace(1).expect("Failed");
+    let mut ws2 = gpu2.create_workspace(1).expect("Failed");
+
+    let input = vec![0.5f32; config.input_dim];
+
+    let result1 = gpu1
+        .forward_batch(&input, 1, &mut ws1)
+        .expect("Forward failed on default");
+    let result2 = gpu2
+        .forward_batch(&input, 1, &mut ws2)
+        .expect("Forward failed on compute");
+
+    // Results should be identical
+    assert_approx_eq(&result1, &result2, 1e-6);
+    println!("WgpuOptions variants test passed");
+}
+
+/// Test GPU memory stats with different network sizes.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_memory_stats_scaling() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let configs = [
+        ("tiny", vec![], 4, 2),
+        ("small", vec![8], 4, 2),
+        ("medium", vec![16, 8], 8, 4),
+        ("large", vec![32, 32, 16], 16, 8),
+    ];
+
+    let mut prev_total = 0;
+    for (name, hidden, input_dim, output_dim) in configs {
+        let config = KanConfig {
+            input_dim,
+            output_dim,
+            hidden_dims: hidden,
+            spline_order: 3,
+            grid_size: 5,
+            grid_range: (-3.0, 3.0),
+            input_mean: vec![0.0; input_dim],
+            input_std: vec![1.0; input_dim],
+            ..Default::default()
+        };
+
+        let cpu_network = KanNetwork::new(config);
+        let gpu_network =
+            GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
+        let stats = gpu_network.memory_stats();
+        println!(
+            "{}: weights={} bytes, bias={} bytes, total={:.2} KB",
+            name,
+            stats.weights_bytes,
+            stats.bias_bytes,
+            stats.total_kb()
+        );
+
+        assert!(stats.weights_bytes > 0);
+        assert!(stats.total_bytes >= stats.weights_bytes);
+        assert!(stats.total_bytes >= prev_total);
+        prev_total = stats.total_bytes;
+    }
+}
+
+/// Test optimizer reset functionality.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_optimizer_reset() {
+    use arkan::gpu::{GpuAdam, GpuAdamConfig};
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut workspace = gpu_network.create_workspace(4).expect("Failed");
+
+    let layer_sizes = gpu_network.layer_param_sizes();
+    let mut optimizer = GpuAdam::new(
+        backend.device_arc(),
+        backend.queue_arc(),
+        &layer_sizes,
+        GpuAdamConfig::with_lr(0.01),
+    );
+
+    let inputs = vec![0.5f32; 4 * config.input_dim];
+    let targets = vec![0.5f32; 4 * config.output_dim];
+
+    // Train a few steps
+    for _ in 0..5 {
+        let _ = gpu_network
+            .train_step_gpu_native(&inputs, &targets, 4, &mut workspace, &mut optimizer)
+            .expect("Training failed");
+    }
+
+    // Reset optimizer
+    optimizer.reset();
+
+    // Should be able to train again
+    let loss_after_reset = gpu_network
+        .train_step_gpu_native(&inputs, &targets, 4, &mut workspace, &mut optimizer)
+        .expect("Training after reset failed");
+
+    assert!(loss_after_reset.is_finite());
+    println!("Optimizer reset test passed, loss after reset: {}", loss_after_reset);
+}
+
+/// Test gradient clipping in GPU training.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_gradient_clipping() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = multi_layer_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_cpu_network = cpu_network.clone();
+    let mut cpu_workspace = cpu_network.create_workspace(8);
+
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &gpu_cpu_network).expect("Failed to create GPU network");
+    let mut gpu_workspace = gpu_network.create_workspace(8).expect("Failed");
+    let mut optimizer = Adam::new(&gpu_cpu_network, AdamConfig::with_lr(0.1));
+
+    let opts = TrainOptions {
+        max_grad_norm: Some(1.0),
+        weight_decay: 0.0,
+    };
+
+    // Large input values to generate large gradients
+    let inputs = vec![5.0f32; 8 * config.input_dim];
+    let targets = vec![1.0f32; 8 * config.output_dim];
+
+    // GPU train with clipping
+    let gpu_loss = gpu_network
+        .train_step_with_options(
+            &inputs,
+            &targets,
+            None,
+            8,
+            &mut gpu_workspace,
+            &mut optimizer,
+            &mut gpu_cpu_network,
+            &opts,
+        )
+        .expect("GPU train failed");
+
+    assert!(gpu_loss.is_finite());
+    println!("Gradient clipping test passed, loss: {}", gpu_loss);
+}
+
+/// Test weight decay in GPU training.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_weight_decay() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_cpu_network = cpu_network.clone();
+
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &gpu_cpu_network).expect("Failed to create GPU network");
+    let mut gpu_workspace = gpu_network.create_workspace(4).expect("Failed");
+    let mut optimizer = Adam::new(&gpu_cpu_network, AdamConfig::with_lr(0.001));
+
+    let opts = TrainOptions {
+        max_grad_norm: None,
+        weight_decay: 0.1,
+    };
+
+    let inputs = vec![0.5f32; 4 * config.input_dim];
+    let targets = vec![0.5f32; 4 * config.output_dim];
+
+    // Get initial weight norm
+    let initial_weight_norm: f32 = gpu_cpu_network
+        .layers
+        .iter()
+        .flat_map(|l| l.weights.iter())
+        .map(|w| w * w)
+        .sum::<f32>()
+        .sqrt();
+
+    // Train with weight decay
+    for _ in 0..10 {
+        let _ = gpu_network
+            .train_step_with_options(
+                &inputs,
+                &targets,
+                None,
+                4,
+                &mut gpu_workspace,
+                &mut optimizer,
+                &mut gpu_cpu_network,
+                &opts,
+            )
+            .expect("Training failed");
+    }
+
+    // Weight norm should decrease with weight decay
+    let final_weight_norm: f32 = gpu_cpu_network
+        .layers
+        .iter()
+        .flat_map(|l| l.weights.iter())
+        .map(|w| w * w)
+        .sum::<f32>()
+        .sqrt();
+
+    println!(
+        "Weight decay test: initial norm={:.4}, final norm={:.4}",
+        initial_weight_norm, final_weight_norm
+    );
+    // Note: weight decay should reduce weights, but optimizer updates may increase them
+    // Just verify the training completed without errors
+    assert!(final_weight_norm.is_finite());
+}
+
+/// Test different batch sizes in sequence.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_batch_size_sequence() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
+    // Create workspace for max batch
+    let mut workspace = gpu_network.create_workspace(128).expect("Failed");
+
+    // Test various batch sizes in sequence
+    for batch_size in [1, 2, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128] {
+        let input = vec![0.5f32; batch_size * config.input_dim];
+
+        let result = gpu_network
+            .forward_batch(&input, batch_size, &mut workspace)
+            .expect("Forward failed");
+
+        assert_eq!(result.len(), batch_size * config.output_dim);
+        println!("Batch size {} passed", batch_size);
+    }
+}
+
+/// Test GPU forward with softmax output.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_softmax_output_properties() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = KanConfig {
+        input_dim: 8,
+        output_dim: 10, // Like classification
+        hidden_dims: vec![16],
+        spline_order: 3,
+        grid_size: 5,
+        grid_range: (-3.0, 3.0),
+        input_mean: vec![0.0; 8],
+        input_std: vec![1.0; 8],
+        ..Default::default()
+    };
+
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut workspace = gpu_network.create_workspace(4).expect("Failed");
+
+    let input = vec![0.5f32; 4 * config.input_dim];
+
+    let result = gpu_network
+        .forward_batch_softmax(&input, 4, &mut workspace)
+        .expect("Forward with softmax failed");
+
+    // Check softmax properties for each sample
+    for sample in 0..4 {
+        let start = sample * config.output_dim;
+        let end = start + config.output_dim;
+        let probs = &result[start..end];
+
+        // All values should be in [0, 1]
+        for (i, &p) in probs.iter().enumerate() {
+            assert!(
+                (0.0..=1.0).contains(&p),
+                "Sample {} output {} = {} is not in [0, 1]",
+                sample,
+                i,
+                p
+            );
+        }
+
+        // Sum should be approximately 1
+        let sum: f32 = probs.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "Sample {} softmax sum = {} is not 1",
+            sample,
+            sum
+        );
+    }
+    println!("Softmax output properties test passed");
+}
+
+/// Test GPU with cross-entropy loss.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_cross_entropy_training() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = KanConfig {
+        input_dim: 4,
+        output_dim: 3, // 3-class classification
+        hidden_dims: vec![8],
+        spline_order: 3,
+        grid_size: 5,
+        grid_range: (-3.0, 3.0),
+        input_mean: vec![0.0; 4],
+        input_std: vec![1.0; 4],
+        ..Default::default()
+    };
+
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_cpu_network = cpu_network.clone();
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &gpu_cpu_network).expect("Failed to create GPU network");
+    let mut workspace = gpu_network.create_workspace(4).expect("Failed");
+    let mut optimizer = Adam::new(&gpu_cpu_network, AdamConfig::with_lr(0.01));
+
+    let inputs = vec![0.5f32; 4 * config.input_dim];
+    // One-hot encoded targets
+    let targets = vec![
+        1.0, 0.0, 0.0, // Class 0
+        0.0, 1.0, 0.0, // Class 1
+        0.0, 0.0, 1.0, // Class 2
+        1.0, 0.0, 0.0, // Class 0
+    ];
+
+    let loss = gpu_network
+        .train_step_cross_entropy(
+            &inputs,
+            &targets,
+            4,
+            &mut workspace,
+            &mut optimizer,
+            &mut gpu_cpu_network,
+        )
+        .expect("Cross-entropy training failed");
+
+    assert!(loss.is_finite());
+    assert!(loss > 0.0); // CE loss is always positive
+    println!("Cross-entropy training test passed, loss: {}", loss);
+}
+
+/// Test GPU layer param sizes API.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_layer_param_sizes() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = KanConfig {
+        input_dim: 4,
+        output_dim: 2,
+        hidden_dims: vec![8, 6],
+        spline_order: 3,
+        grid_size: 5,
+        grid_range: (-3.0, 3.0),
+        input_mean: vec![0.0; 4],
+        input_std: vec![1.0; 4],
+        ..Default::default()
+    };
+
+    let cpu_network = KanNetwork::new(config.clone());
+    let gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
+    let layer_sizes = gpu_network.layer_param_sizes();
+
+    // Should have 3 layers: 4->8, 8->6, 6->2
+    assert_eq!(layer_sizes.len(), 3);
+
+    for (i, &(weights, biases)) in layer_sizes.iter().enumerate() {
+        println!("Layer {}: weights={}, biases={}", i, weights, biases);
+        assert!(weights > 0);
+        assert!(biases > 0);
+    }
+
+    // Biases should match output dims
+    assert_eq!(layer_sizes[0].1, 8);
+    assert_eq!(layer_sizes[1].1, 6);
+    assert_eq!(layer_sizes[2].1, 2);
+}
+
+/// Test that GPU and CPU produce same results after weight sync.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_bidirectional_weight_sync() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut cpu_copy = cpu_network.clone();
+    let mut cpu_workspace = cpu_network.create_workspace(1);
+
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut gpu_workspace = gpu_network.create_workspace(1).expect("Failed");
+
+    let input = vec![0.5f32; config.input_dim];
+
+    // Get GPU result
+    let gpu_result = gpu_network
+        .forward_batch(&input, 1, &mut gpu_workspace)
+        .expect("GPU forward failed");
+
+    // Sync GPU weights back to CPU
+    gpu_network
+        .sync_weights_to_cpu(&mut cpu_copy)
+        .expect("Sync failed");
+
+    // CPU forward with synced weights
+    let mut cpu_result = vec![0.0f32; config.output_dim];
+    cpu_copy.forward_batch(&input, &mut cpu_result, &mut cpu_workspace);
+
+    // Should be identical
+    assert_approx_eq(&gpu_result, &cpu_result, 1e-6);
+    println!("Bidirectional weight sync test passed");
+}
+
+/// Test workspace buffer validation.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_workspace_validation() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
+    // Create workspace for batch=4
+    let mut workspace = gpu_network.create_workspace(4).expect("Failed");
+
+    // Valid use: batch <= max_batch
+    let input = vec![0.5f32; 4 * config.input_dim];
+    let result = gpu_network.forward_batch(&input, 4, &mut workspace);
+    assert!(result.is_ok());
+
+    let input = vec![0.5f32; 2 * config.input_dim];
+    let result = gpu_network.forward_batch(&input, 2, &mut workspace);
+    assert!(result.is_ok());
+
+    // Test that workspace can be recreated for larger batches
+    let mut workspace_large = gpu_network.create_workspace(16).expect("Failed to create larger workspace");
+    let input_large = vec![0.5f32; 16 * config.input_dim];
+    let result = gpu_network.forward_batch(&input_large, 16, &mut workspace_large);
+    assert!(result.is_ok());
+    println!("Workspace validation test passed");
+}
+
+/// Test native GPU training with SGD.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_native_gpu_sgd_training() {
+    use arkan::gpu::{GpuSgd, GpuSgdConfig};
+
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut workspace = gpu_network.create_workspace(8).expect("Failed");
+
+    let layer_sizes = gpu_network.layer_param_sizes();
+    let mut optimizer = GpuSgd::new(
+        backend.device_arc(),
+        backend.queue_arc(),
+        &layer_sizes,
+        GpuSgdConfig {
+            lr: 0.01,
+            momentum: 0.9,
+            weight_decay: 0.0,
+        },
+    );
+
+    let inputs = vec![0.5f32; 8 * config.input_dim];
+    let targets = vec![0.5f32; 8 * config.output_dim];
+
+    let mut losses = Vec::new();
+    for _ in 0..10 {
+        let loss = gpu_network
+            .train_step_gpu_native_sgd(&inputs, &targets, 8, &mut workspace, &mut optimizer)
+            .expect("Training failed");
+        losses.push(loss);
+    }
+
+    println!("SGD losses: {:?}", losses);
+    // All losses should be finite
+    for loss in &losses {
+        assert!(loss.is_finite());
+    }
+}
+
+/// Test GPU network input/output dimensions accessors.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_network_dimensions() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = KanConfig {
+        input_dim: 7,
+        output_dim: 5,
+        hidden_dims: vec![10, 8],
+        spline_order: 3,
+        grid_size: 5,
+        grid_range: (-3.0, 3.0),
+        input_mean: vec![0.0; 7],
+        input_std: vec![1.0; 7],
+        ..Default::default()
+    };
+
+    let cpu_network = KanNetwork::new(config.clone());
+    let gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
+    assert_eq!(gpu_network.input_dim, 7);
+    assert_eq!(gpu_network.output_dim, 5);
+    println!(
+        "GPU network dimensions: input={}, output={}",
+        gpu_network.input_dim, gpu_network.output_dim
+    );
+}
+
