@@ -146,16 +146,16 @@ ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
 
 | Batch Size | ArKan (Time) | ArKan (Throughput) | PyTorch (Time) | PyTorch (Throughput) | Вывод |
 | :---- | :---- | :---- | :---- | :---- | :---- |
-| **1** | **30.5 µs** | **0.69 M elems/s** | 990.0 µs | 0.02 M elems/s | **Rust быстрее в 32x** (Low Latency) |
-| 16 | 454.8 µs | 0.74 M elems/s | 1.67 ms | 0.20 M elems/s | Rust быстрее в 3.7x |
-| 64 | 1.95 ms | 0.69 M elems/s | 3.27 ms | 0.41 M elems/s | Rust быстрее в 1.7x |
-| 256 | 7.29 ms | 0.74 M elems/s | 9.65 ms | 0.56 M elems/s | Rust быстрее в 1.3x
+| **1** | **26.7 µs** | **0.79 M elems/s** | 1.45 ms | 0.01 M elems/s | **Rust быстрее в 54x** (Low Latency) |
+| 16 | 427 µs | 0.79 M elems/s | 2.58 ms | 0.13 M elems/s | Rust быстрее в 6.0x |
+| 64 | 1.70 ms | 0.79 M elems/s | 4.30 ms | 0.31 M elems/s | Rust быстрее в 2.5x |
+| 256 | 6.82 ms | 0.79 M elems/s | 11.7 ms | 0.46 M elems/s | Rust быстрее в 1.7x
 
 ### **Анализ производительности**
 
-1. **Small Batch Dominance:** На единичных запросах (`batch=1`) ArKan **опережает** PyTorch за счет отсутствия оверхеда интерпретатора и абстракций. Это позволяет совершать \~33,000 инференсов в секунду против \~1,000 у PyTorch.  
-2. **Mid-Batch Performance:** На средних батчах (16-64) ArKan сохраняет преимущество в 1.7x-3.7x, демонстрируя хорошую масштабируемость.  
-3. **Throughput Scaling:** На больших батчах (256+) ArKan сохраняет преимущество 1.3x благодаря zero-allocation архитектуре и эффективному использованию кэша.
+1. **Small Batch Dominance:** На единичных запросах (`batch=1`) ArKan **опережает** PyTorch за счет отсутствия оверхеда интерпретатора и абстракций. Это позволяет совершать \~37,000 инференсов в секунду против \~700 у PyTorch.  
+2. **Mid-Batch Performance:** На средних батчах (16-64) ArKan сохраняет преимущество в 2.5x-6.0x, демонстрируя хорошую масштабируемость.  
+3. **Throughput Scaling:** На больших батчах (256+) ArKan сохраняет преимущество 1.7x благодаря zero-allocation архитектуре и эффективному использованию кэша.
 4. **Zero-Allocation Training:** Весь training loop (forward + backward + update) работает без аллокаций при прогретом Workspace.
 
 ## **Сравнение с аналогами (Prior Art)**
@@ -406,16 +406,16 @@ Comparison of ArKan (Rust) vs. optimized vectorized PyTorch implementation (CPU)
 
 | Batch Size | ArKan (Time) | ArKan (Throughput) | PyTorch (Time) | PyTorch (Throughput) | Conclusion |
 | :---- | :---- | :---- | :---- | :---- | :---- |
-| **1** | **30.5 µs** | **0.69 M elems/s** | 990.0 µs | 0.02 M elems/s | **Rust is 32x faster** (Low Latency) |
-| 16 | 454.8 µs | 0.74 M elems/s | 1.67 ms | 0.20 M elems/s | Rust is 3.7x faster |
-| 64 | 1.95 ms | 0.69 M elems/s | 3.27 ms | 0.41 M elems/s | Rust is 1.7x faster |
-| 256 | 7.29 ms | 0.74 M elems/s | 9.65 ms | 0.56 M elems/s | Rust is 1.3x faster
+| **1** | **26.7 µs** | **0.79 M elems/s** | 1.45 ms | 0.01 M elems/s | **Rust is 54x faster** (Low Latency) |
+| 16 | 427 µs | 0.79 M elems/s | 2.58 ms | 0.13 M elems/s | Rust is 6.0x faster |
+| 64 | 1.70 ms | 0.79 M elems/s | 4.30 ms | 0.31 M elems/s | Rust is 2.5x faster |
+| 256 | 6.82 ms | 0.79 M elems/s | 11.7 ms | 0.46 M elems/s | Rust is 1.7x faster
 
 ### **Performance Analysis**
 
-1. **Small Batch Dominance:** On single requests (`batch=1`), ArKan **outperforms** PyTorch due to the lack of interpreter overhead and abstractions. This allows for \~33,000 inferences per second vs \~1,000 for PyTorch.  
-2. **Mid-Batch Performance:** On medium batches (16-64), ArKan maintains a 1.7x-3.7x advantage, showing good scalability.  
-3. **Throughput Scaling:** On large batches (256+), ArKan maintains 1.3x advantage due to zero-allocation architecture and efficient cache utilization.
+1. **Small Batch Dominance:** On single requests (`batch=1`), ArKan **outperforms** PyTorch due to the lack of interpreter overhead and abstractions. This allows for \~37,000 inferences per second vs \~700 for PyTorch.  
+2. **Mid-Batch Performance:** On medium batches (16-64), ArKan maintains a 2.5x-6.0x advantage, showing good scalability.  
+3. **Throughput Scaling:** On large batches (256+), ArKan maintains 1.7x advantage due to zero-allocation architecture and efficient cache utilization.
 4. **Zero-Allocation Training:** The entire training loop (forward + backward + update) runs without allocations on a warmed-up Workspace.
 
 ## **Comparison with Analogues (Prior Art)**

@@ -474,18 +474,30 @@ The crossover point where GPU becomes faster than CPU depends on batch size:
 
 Compare ArKan GPU with PyTorch-based KAN implementations (CUDA):
 
-| Implementation | Forward (batch=64) | Train Step | Notes |
+| Implementation | Forward (batch=64) | Train Step (Adam) | Notes |
 |----------------|-------------------|------------|-------|
-| **ArKan GPU (wgpu)** | **1.18 ms** | **3.04 ms** | WebGPU (Vulkan/DX12/Metal), Native training |
-| efficient-kan (PyTorch CUDA) | ~1.5 ms | ~5 ms | Native B-spline |
-| fast-kan (PyTorch CUDA) | ~0.5 ms | ~3 ms | RBF approximation |
-| ArKan-style (PyTorch CUDA) | ~2 ms | ~8 ms | Custom B-spline |
+| **fast-kan (PyTorch CUDA)** | **0.58 ms** | **1.78 ms** | RBF approximation (fastest) |
+| **ArKan GPU (wgpu)** | **1.18 ms** | **3.04 ms** | WebGPU (Vulkan), Native training |
+| efficient-kan (PyTorch CUDA) | 1.62 ms | 3.70 ms | Native B-spline |
+| ArKan-style (PyTorch CUDA) | 3.63 ms | N/A | Custom B-spline (reference) |
 
-**ArKan v0.3.0 is now competitive with PyTorch CUDA** thanks to native GPU training.
+**ArKan v0.3.0 is competitive with PyTorch CUDA!** Faster than efficient-kan, ~2x slower than fast-kan (which uses RBF approximation instead of true B-splines).
+
+### Latency Percentiles (batch=1, GPU forward)
+
+| Implementation | Min | P50 | P90 | P99 | Max |
+|----------------|-----|-----|-----|-----|-----|
+| **ArKan (wgpu)** | 220 µs | 254 µs | 275 µs | 310 µs | 520 µs |
+| fast-kan (CUDA) | 392 µs | 451 µs | 522 µs | 947 µs | 1.43 ms |
+| efficient-kan (CUDA) | 1.16 ms | 1.36 ms | 1.63 ms | 2.32 ms | 17.5 ms |
+| ArKan-style (CUDA) | 3.17 ms | 3.65 ms | 4.21 ms | 5.09 ms | 16.3 ms |
+
+**Key insight:** ArKan wgpu has the lowest and most consistent latency for single samples!
 
 To run PyTorch GPU comparison:
 ```bash
-pip install torch efficient-kan
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install git+https://github.com/Blealtan/efficient-kan.git
 pip install git+https://github.com/ZiyaoLi/fast-kan.git
 python scripts/bench_pytorch_gpu.py
 ```
