@@ -33,14 +33,17 @@ use crate::gpu::{exceeds_vram_limit, GpuTensor, MAX_VRAM_ALLOC};
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use arkan::gpu::{GpuWorkspace, WgpuBackend};
+/// ```rust,no_run
+/// use arkan::gpu::{GpuWorkspace, WgpuBackend, WgpuOptions};
 ///
-/// let backend = WgpuBackend::init(Default::default())?;
-/// let mut workspace = GpuWorkspace::new(&backend, 64, 21, 64)?;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let backend = WgpuBackend::init(WgpuOptions::default())?;
+/// let mut workspace = GpuWorkspace::new(&backend.device, 64, 21, 64)?;
 ///
 /// // Resize for different batch size
-/// workspace.ensure_capacity(&backend, 128)?;
+/// workspace.ensure_capacity(&backend.device, 128)?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct GpuWorkspace {
     /// Input buffer [batch, in_dim].

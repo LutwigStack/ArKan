@@ -12,9 +12,10 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use arkan::gpu::{WgpuBackend, WgpuOptions, GpuTensor};
 //!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Initialize the backend
 //! let backend = WgpuBackend::init(WgpuOptions::default())?;
 //!
@@ -24,6 +25,8 @@
 //!
 //! // Download data from GPU
 //! let result = tensor.download(&backend.device, &backend.queue)?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Memory Management
@@ -41,12 +44,15 @@
 //! - [`GpuWorkspace`] — GPU workspace with resize policy
 //! - [`GpuLayer`] — GPU layer implementation with bind groups
 //! - [`GpuNetwork`] — GPU network with forward/backward passes
+//! - [`shaders`] — Dynamic shader generation for variable spline orders
+//! - [`optimizer`] — GPU-accelerated optimizers (Adam, SGD)
 
 mod backend;
 mod layer;
 mod network;
+pub mod optimizer;
 mod pipeline;
-mod shaders;
+pub mod shaders;
 mod tensor;
 mod uniforms;
 mod workspace;
@@ -54,7 +60,15 @@ mod workspace;
 pub use backend::{PowerPreference, WgpuBackend, WgpuOptions};
 pub use layer::GpuLayer;
 pub use network::GpuNetwork;
+pub use optimizer::{
+    AdamUniforms, GpuAdam, GpuAdamConfig, GpuAdamLayerState, GpuSgd, GpuSgdConfig,
+    GpuSgdLayerState, SgdUniforms,
+};
 pub use pipeline::{workgroup_count, PipelineCache, WORKGROUP_SIZE};
+pub use shaders::{
+    generate_backward_input_shader, generate_backward_weights_shader, generate_forward_shader,
+    generate_forward_training_shader, ADAM_SHADER, GRAD_CLIP_SHADER, SGD_SHADER,
+};
 pub use tensor::{GpuTensor, GpuTensorView};
 pub use uniforms::LayerUniforms;
 pub use workspace::GpuWorkspace;

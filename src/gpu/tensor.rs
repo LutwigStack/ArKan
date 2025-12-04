@@ -39,16 +39,21 @@ fn infer_got_shape(data_len: usize, expected_shape: &[usize]) -> Vec<usize> {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use arkan::gpu::GpuTensor;
+/// ```rust,no_run
+/// use arkan::gpu::{GpuTensor, WgpuBackend, WgpuOptions};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let backend = WgpuBackend::init(WgpuOptions::default())?;
 ///
 /// // Create a tensor from CPU data
 /// let data = vec![1.0f32, 2.0, 3.0, 4.0];
-/// let tensor = GpuTensor::upload(&device, &queue, &data, vec![2, 2])?;
+/// let tensor = GpuTensor::upload(&backend.device, &backend.queue, &data, vec![2, 2])?;
 ///
 /// // Download data back to CPU
-/// let result = tensor.download(&device, &queue)?;
+/// let result = tensor.download(&backend.device, &backend.queue)?;
 /// assert_eq!(result, data);
+/// # Ok(())
+/// # }
 /// ```
 pub struct GpuTensor {
     /// The underlying wgpu buffer.
@@ -376,14 +381,19 @@ impl std::fmt::Debug for GpuTensor {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use arkan::gpu::{GpuTensor, GpuTensorView};
+/// ```rust,no_run
+/// use arkan::gpu::{GpuTensor, GpuTensorView, WgpuBackend, WgpuOptions};
 ///
-/// let tensor = GpuTensor::upload(&device, &queue, &data, vec![batch, features])?;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let backend = WgpuBackend::init(WgpuOptions::default())?;
+/// let data = vec![1.0f32; 64];
+/// let tensor = GpuTensor::upload(&backend.device, &backend.queue, &data, vec![8, 8])?;
 /// let view = tensor.view();
 ///
 /// // Use view in bind group
 /// let binding = view.as_entire_binding();
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct GpuTensorView<'a> {

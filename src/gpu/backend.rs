@@ -92,11 +92,14 @@ impl WgpuOptions {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use arkan::gpu::{WgpuBackend, WgpuOptions};
 ///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let backend = WgpuBackend::init(WgpuOptions::default())?;
 /// println!("Using GPU: {}", backend.adapter_info().name);
+/// # Ok(())
+/// # }
 /// ```
 pub struct WgpuBackend {
     /// The wgpu instance.

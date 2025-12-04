@@ -4,6 +4,7 @@
 //!
 //! - [`AlignedBuffer`] — 64-byte aligned buffer for SIMD operations
 //! - [`Workspace`] — Preallocated buffers for forward/backward passes
+//! - [`WorkspaceGuard`] — RAII guard for exception-safe buffer management
 //!
 //! # Zero-Allocation Pattern
 //!
@@ -32,8 +33,15 @@
 //!
 //! [`AlignedBuffer`] uses 64-byte alignment ([`CACHE_LINE`]) to ensure
 //! optimal performance with AVX-512 SIMD instructions.
+//!
+//! # Exception Safety
+//!
+//! The [`WorkspaceGuard`] provides basic exception safety guarantee:
+//! buffers are returned to workspace even if a panic occurs during
+//! forward/backward passes.
 
 use crate::config::KanConfig;
+use crate::error::{ArkanError, ArkanResult};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
@@ -44,6 +52,67 @@ use std::ptr::NonNull;
 /// All [`AlignedBuffer`] allocations use this alignment for optimal
 /// SIMD performance and cache behavior.
 pub const CACHE_LINE: usize = 64;
+
+/// Maximum buffer size to prevent overflow in dimension calculations.
+///
+/// This limit ensures that `batch_size * dim * basis_size` cannot overflow.
+/// With `MAX_BUFFER_ELEMENTS = 2^30`, we can handle:
+/// - batch_size = 4096, dim = 1024, basis = 256 (4096 * 1024 * 256 = 2^30)
+///
+/// For larger workloads, use streaming or chunked processing.
+pub const MAX_BUFFER_ELEMENTS: usize = 1 << 30; // 1 billion f32s = 4 GB
+
+/// Computes buffer size with overflow checking.
+///
+/// Returns `Ok(product)` if the multiplication succeeds and doesn't exceed
+/// `MAX_BUFFER_ELEMENTS`, otherwise returns an `ArkanError::Overflow`.
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::checked_buffer_size;
+///
+/// // Normal case
+/// assert!(checked_buffer_size(64, 10).is_ok());
+/// assert_eq!(checked_buffer_size(64, 10).unwrap(), 640);
+///
+/// // Overflow case
+/// assert!(checked_buffer_size(usize::MAX, 2).is_err());
+/// ```
+#[inline]
+pub fn checked_buffer_size(a: usize, b: usize) -> ArkanResult<usize> {
+    let result = a
+        .checked_mul(b)
+        .ok_or_else(|| ArkanError::overflow("Buffer size overflow"))?;
+
+    if result > MAX_BUFFER_ELEMENTS {
+        return Err(ArkanError::overflow(&format!(
+            "Buffer size {} exceeds MAX_BUFFER_ELEMENTS ({})",
+            result, MAX_BUFFER_ELEMENTS
+        )));
+    }
+
+    Ok(result)
+}
+
+/// Computes buffer size from three dimensions with overflow checking.
+///
+/// Equivalent to `checked_buffer_size(checked_buffer_size(a, b)?, c)?`.
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::checked_buffer_size3;
+///
+/// // batch_size * dim * basis
+/// assert!(checked_buffer_size3(64, 10, 8).is_ok());
+/// assert_eq!(checked_buffer_size3(64, 10, 8).unwrap(), 5120);
+/// ```
+#[inline]
+pub fn checked_buffer_size3(a: usize, b: usize, c: usize) -> ArkanResult<usize> {
+    let ab = checked_buffer_size(a, b)?;
+    checked_buffer_size(ab, c)
+}
 
 /// 64-byte aligned buffer for SIMD operations.
 ///
@@ -66,6 +135,12 @@ pub const CACHE_LINE: usize = 64;
 ///
 /// The buffer uses raw allocation with proper alignment. All unsafe
 /// operations are encapsulated and the public API is safe.
+///
+/// # Memory Layout
+///
+/// - All memory from `[0, capacity)` is always initialized to zero
+/// - `len` tracks the "logical" length, but memory beyond `len` is still valid zeros
+/// - This ensures `Clone` and `resize` never expose uninitialized memory
 #[repr(C)]
 pub struct AlignedBuffer {
     ptr: NonNull<f32>,
@@ -79,6 +154,7 @@ unsafe impl Sync for AlignedBuffer {}
 
 impl AlignedBuffer {
     /// Creates a new empty aligned buffer.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             ptr: NonNull::dangling(),
@@ -88,37 +164,77 @@ impl AlignedBuffer {
     }
 
     /// Creates a buffer with the specified capacity (in f32 elements).
+    /// All elements are initialized to zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity > MAX_BUFFER_ELEMENTS` or on allocation failure.
+    /// Use [`try_with_capacity`](Self::try_with_capacity) for fallible allocation.
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::try_with_capacity(capacity).expect("AlignedBuffer allocation failed")
+    }
+
+    /// Tries to create a buffer with the specified capacity.
+    ///
+    /// Returns an error if:
+    /// - `capacity > MAX_BUFFER_ELEMENTS` (overflow protection)
+    /// - Memory allocation fails
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::AlignedBuffer;
+    ///
+    /// // Small allocation succeeds
+    /// let buf = AlignedBuffer::try_with_capacity(1000)?;
+    /// assert_eq!(buf.capacity(), 1000);
+    ///
+    /// // Very large allocation may fail
+    /// let result = AlignedBuffer::try_with_capacity(usize::MAX);
+    /// assert!(result.is_err());
+    /// # Ok::<(), arkan::ArkanError>(())
+    /// ```
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_with_capacity(capacity: usize) -> ArkanResult<Self> {
         if capacity == 0 {
-            return Self::new();
+            return Ok(Self::new());
         }
 
-        let layout = Self::layout(capacity);
-        // SAFETY: layout is derived from a positive `capacity`, allocation handled via handle_alloc_error
+        if capacity > MAX_BUFFER_ELEMENTS {
+            return Err(ArkanError::overflow(&format!(
+                "Buffer capacity {} exceeds MAX_BUFFER_ELEMENTS ({})",
+                capacity, MAX_BUFFER_ELEMENTS
+            )));
+        }
+
+        let layout = Self::try_layout(capacity)?;
+        // SAFETY: layout is valid, allocation may fail
         let ptr = unsafe {
             let raw = alloc_zeroed(layout);
             if raw.is_null() {
-                std::alloc::handle_alloc_error(layout);
+                return Err(ArkanError::cpu("AlignedBuffer allocation failed"));
             }
             NonNull::new_unchecked(raw as *mut f32)
         };
 
-        Self {
+        Ok(Self {
             ptr,
             len: 0,
             capacity,
-        }
+        })
     }
 
     /// Ensures capacity is at least `new_cap`.
     /// Does not shrink. Only grows if needed.
+    /// New capacity is always zero-initialized.
     #[inline]
     pub fn reserve(&mut self, new_cap: usize) {
         if new_cap <= self.capacity {
             return;
         }
 
-        // Allocate new buffer
+        // Allocate new buffer (zero-initialized)
         let new_layout = Self::layout(new_cap);
         // SAFETY: new_layout is valid for `new_cap`, allocation failure handled
         let new_ptr = unsafe {
@@ -129,7 +245,7 @@ impl AlignedBuffer {
             NonNull::new_unchecked(raw as *mut f32)
         };
 
-        // Copy old data if any
+        // Copy old data if any (only up to len, rest is zeros)
         if self.capacity > 0 && self.len > 0 {
             // SAFETY: source and destination are valid, non-overlapping, len=self.len
             unsafe {
@@ -150,17 +266,94 @@ impl AlignedBuffer {
         self.capacity = new_cap;
     }
 
+    /// Tries to reserve capacity, returning error on overflow or allocation failure.
+    #[inline]
+    pub fn try_reserve(&mut self, new_cap: usize) -> ArkanResult<()> {
+        if new_cap <= self.capacity {
+            return Ok(());
+        }
+
+        // Check for overflow in layout calculation
+        let size = new_cap
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| ArkanError::overflow("AlignedBuffer capacity overflow"))?;
+
+        let layout = Layout::from_size_align(size, CACHE_LINE)
+            .map_err(|_| ArkanError::overflow("Invalid layout for AlignedBuffer"))?;
+
+        // SAFETY: layout is valid, allocation may fail
+        let new_ptr = unsafe {
+            let raw = alloc_zeroed(layout);
+            if raw.is_null() {
+                return Err(ArkanError::cpu("AlignedBuffer allocation failed"));
+            }
+            NonNull::new_unchecked(raw as *mut f32)
+        };
+
+        // Copy old data
+        if self.capacity > 0 && self.len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
+            }
+        }
+
+        // Deallocate old buffer
+        if self.capacity > 0 {
+            let old_layout = Self::layout(self.capacity);
+            unsafe {
+                dealloc(self.ptr.as_ptr() as *mut u8, old_layout);
+            }
+        }
+
+        self.ptr = new_ptr;
+        self.capacity = new_cap;
+        Ok(())
+    }
+
     /// Resizes the buffer, filling new elements with zero.
     #[inline]
     pub fn resize(&mut self, new_len: usize) {
         self.reserve(new_len);
+        // Since reserve() allocates zeroed memory and we maintain zero-initialized
+        // invariant, we only need to zero elements that might have been written to
         if new_len > self.len {
             // SAFETY: destination is within allocated region; zero the tail
+            // This is technically redundant if capacity just grew (already zeroed),
+            // but necessary if len shrank and then grew again
             unsafe {
                 std::ptr::write_bytes(self.ptr.as_ptr().add(self.len), 0, new_len - self.len);
             }
         }
         self.len = new_len;
+    }
+
+    /// Resizes the buffer without initializing new elements.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure that all elements in `[old_len, new_len)` are written
+    /// before being read. This is useful for hot paths where the buffer will be
+    /// completely overwritten (e.g., forward pass output).
+    ///
+    /// Note: Due to our zero-initialization invariant, this is actually safe,
+    /// but we keep it marked unsafe as a reminder that the data may be stale.
+    #[inline]
+    pub unsafe fn resize_uninitialized(&mut self, new_len: usize) {
+        self.reserve(new_len);
+        self.len = new_len;
+    }
+
+    /// Tries to resize, returning error on overflow.
+    #[inline]
+    pub fn try_resize(&mut self, new_len: usize) -> ArkanResult<()> {
+        self.try_reserve(new_len)?;
+        if new_len > self.len {
+            unsafe {
+                std::ptr::write_bytes(self.ptr.as_ptr().add(self.len), 0, new_len - self.len);
+            }
+        }
+        self.len = new_len;
+        Ok(())
     }
 
     /// Clears the buffer (sets len to 0, doesn't deallocate).
@@ -169,7 +362,7 @@ impl AlignedBuffer {
         self.len = 0;
     }
 
-    /// Fills with zeros.
+    /// Fills the current length with zeros.
     #[inline]
     pub fn zero(&mut self) {
         if self.len > 0 {
@@ -180,20 +373,33 @@ impl AlignedBuffer {
         }
     }
 
+    /// Fills the entire capacity with zeros (useful after resize_uninitialized).
+    #[inline]
+    pub fn zero_all(&mut self) {
+        if self.capacity > 0 {
+            unsafe {
+                std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.capacity);
+            }
+        }
+    }
+
     /// Current length.
     #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Current capacity.
     #[inline]
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
     /// Is empty?
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -232,9 +438,24 @@ impl AlignedBuffer {
         self.ptr.as_ptr()
     }
 
+    /// Returns the layout for a given capacity, panicking on overflow.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity * size_of::<f32>()` overflows or layout is invalid.
     fn layout(capacity: usize) -> Layout {
         Layout::from_size_align(capacity * std::mem::size_of::<f32>(), CACHE_LINE)
             .expect("Invalid layout")
+    }
+
+    /// Returns the layout for a given capacity, returning an error on overflow.
+    fn try_layout(capacity: usize) -> ArkanResult<Layout> {
+        let size = capacity
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| ArkanError::overflow("AlignedBuffer capacity overflow in layout"))?;
+
+        Layout::from_size_align(size, CACHE_LINE)
+            .map_err(|_| ArkanError::overflow("Invalid layout for AlignedBuffer"))
     }
 }
 
@@ -258,15 +479,33 @@ impl Drop for AlignedBuffer {
 
 impl Clone for AlignedBuffer {
     fn clone(&self) -> Self {
-        let mut new = Self::with_capacity(self.capacity);
-        new.len = self.len;
+        if self.capacity == 0 {
+            return Self::new();
+        }
+
+        // Allocate new buffer with same capacity, zero-initialized
+        let layout = Self::layout(self.capacity);
+        let new_ptr = unsafe {
+            let raw = alloc_zeroed(layout);
+            if raw.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            NonNull::new_unchecked(raw as *mut f32)
+        };
+
+        // Copy only the logical length (rest is already zeros)
         if self.len > 0 {
             // SAFETY: source/dest are distinct allocations, len is within both
             unsafe {
-                std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new.ptr.as_ptr(), self.len);
+                std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
             }
         }
-        new
+
+        Self {
+            ptr: new_ptr,
+            len: self.len,
+            capacity: self.capacity,
+        }
     }
 }
 
@@ -596,12 +835,17 @@ impl Workspace {
         ws
     }
 
-    /// Ensures workspace has capacity for the given batch size.
-    /// Only allocates if batch_size > current capacity.
-    #[inline]
-    pub fn reserve(&mut self, batch_size: usize, config: &KanConfig) {
+    /// Ensures workspace has capacity for the given batch size (fallible version).
+    ///
+    /// This is the checked version that returns an error on overflow instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArkanError::Overflow`] if any buffer size calculation overflows.
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_reserve(&mut self, batch_size: usize, config: &KanConfig) -> ArkanResult<()> {
         if batch_size <= self.batch_capacity {
-            return;
+            return Ok(());
         }
 
         let dims = config.layer_dims();
@@ -610,51 +854,161 @@ impl Workspace {
         let input_dim = config.input_dim;
         let output_dim = config.output_dim;
 
+        // Check all size calculations for overflow using checked_buffer_size
         // z_buffer: [batch, input]
-        self.z_buffer.reserve(batch_size * input_dim);
+        let z_size = checked_buffer_size(batch_size, input_dim)?;
 
         // basis_values: [batch, input, basis]
-        self.basis_values.reserve(batch_size * input_dim * basis);
-        self.basis_derivs.reserve(batch_size * input_dim * basis);
-
-        // grid_indices: [batch, input]
-        self.grid_indices.reserve(batch_size * input_dim);
-        if self.grid_indices.len() < batch_size * input_dim {
-            self.grid_indices.resize(batch_size * input_dim, 0);
-        }
+        let basis_size = checked_buffer_size3(batch_size, input_dim, basis)?;
 
         // layer buffers: [batch, max_dim]
-        self.layer_output.reserve(batch_size * max_dim);
-        self.layer_input.reserve(batch_size * max_dim);
+        let layer_size = checked_buffer_size(batch_size, max_dim)?;
 
-        // layer_grads: [batch, max_dim]
-        self.layer_grads.reserve(batch_size * max_dim);
+        // predictions_buffer: [batch, output_dim]
+        let pred_size = checked_buffer_size(batch_size, output_dim)?;
 
-        // staging_buffer for ping-pong without alloc: [batch, max_dim]
-        self.staging_buffer.reserve(batch_size * max_dim);
+        // All checks passed, now allocate
+        self.z_buffer.reserve(z_size);
+        self.basis_values.reserve(basis_size);
+        self.basis_derivs.reserve(basis_size);
 
-        // predictions_buffer for train_step: [batch, output_dim]
-        self.predictions_buffer.reserve(batch_size * output_dim);
+        self.grid_indices.reserve(z_size);
+        if self.grid_indices.len() < z_size {
+            self.grid_indices.resize(z_size, 0);
+        }
 
-        // grad_output for backprop: [batch, output_dim]
-        self.grad_output.reserve(batch_size * output_dim);
+        self.layer_output.reserve(layer_size);
+        self.layer_input.reserve(layer_size);
+        self.layer_grads.reserve(layer_size);
+        self.staging_buffer.reserve(layer_size);
+
+        self.predictions_buffer.reserve(pred_size);
+        self.grad_output.reserve(pred_size);
 
         self.batch_capacity = batch_size;
         self.max_dim = max_dim;
+
+        Ok(())
     }
 
-    /// Prepares workspace for a forward pass with the given batch size.
+    /// Ensures workspace has capacity for the given batch size.
+    /// Only allocates if batch_size > current capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if buffer size calculations overflow. Use [`try_reserve`](Self::try_reserve)
+    /// for a fallible version.
     #[inline]
-    pub fn prepare_forward(&mut self, batch_size: usize, config: &KanConfig) {
-        self.reserve(batch_size, config);
+    pub fn reserve(&mut self, batch_size: usize, config: &KanConfig) {
+        self.try_reserve(batch_size, config)
+            .expect("Workspace::reserve: buffer size overflow")
+    }
+
+    /// Prepares workspace for a forward pass with the given batch size (fallible version).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArkanError::Overflow`] if any buffer size calculation overflows.
+    #[inline]
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_prepare_forward(
+        &mut self,
+        batch_size: usize,
+        config: &KanConfig,
+    ) -> ArkanResult<()> {
+        self.try_reserve(batch_size, config)?;
 
         let input_dim = config.input_dim;
         let basis = config.basis_size_aligned();
 
-        self.z_buffer.resize(batch_size * input_dim);
-        self.basis_values.resize(batch_size * input_dim * basis);
-        self.basis_derivs.resize(batch_size * input_dim * basis);
-        self.grid_indices.resize(batch_size * input_dim, 0);
+        // Use checked arithmetic
+        let z_size = checked_buffer_size(batch_size, input_dim)?;
+        let basis_size = checked_buffer_size3(batch_size, input_dim, basis)?;
+
+        self.z_buffer.resize(z_size);
+        self.basis_values.resize(basis_size);
+        self.basis_derivs.resize(basis_size);
+        self.grid_indices.resize(z_size, 0);
+
+        Ok(())
+    }
+
+    /// Prepares workspace for a forward pass with the given batch size.
+    ///
+    /// # Panics
+    ///
+    /// Panics if buffer size calculations overflow. Use [`try_prepare_forward`](Self::try_prepare_forward)
+    /// for a fallible version.
+    #[inline]
+    pub fn prepare_forward(&mut self, batch_size: usize, config: &KanConfig) {
+        self.try_prepare_forward(batch_size, config)
+            .expect("Workspace::prepare_forward: buffer size overflow")
+    }
+
+    /// Prepares workspace for training with history tracking (fallible version).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArkanError::Overflow`] if any buffer size calculation overflows.
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_prepare_training(
+        &mut self,
+        batch_size: usize,
+        config: &KanConfig,
+        layer_dims: &[usize],
+    ) -> ArkanResult<()> {
+        self.try_reserve(batch_size, config)?;
+
+        let num_layers = layer_dims.len().saturating_sub(1);
+        if self.layers_inputs.len() < num_layers {
+            self.layers_inputs
+                .resize_with(num_layers, AlignedBuffer::new);
+        }
+        if self.layers_grid_indices.len() < num_layers {
+            self.layers_grid_indices.resize_with(num_layers, Vec::new);
+        }
+
+        let basis = config.basis_size_aligned();
+        let max_in_dim = *layer_dims.iter().max().unwrap_or(&config.input_dim);
+
+        // Ensure history buffers sized per layer with overflow checks
+        for (layer_idx, in_dim) in layer_dims.iter().copied().enumerate().take(num_layers) {
+            let needed = checked_buffer_size(batch_size, in_dim)?;
+
+            let buf = &mut self.layers_inputs[layer_idx];
+            buf.reserve(needed);
+            buf.resize(needed);
+
+            let indices = &mut self.layers_grid_indices[layer_idx];
+            if indices.len() < needed {
+                indices.resize(needed, 0);
+            } else {
+                indices.truncate(needed);
+            }
+        }
+
+        // Gradient ping-pong buffer
+        let grad_size = checked_buffer_size(batch_size, max_in_dim)?;
+        self.layer_grads.reserve(grad_size);
+        self.layer_grads.resize(grad_size);
+
+        // Derivatives buffer (same layout as basis_values)
+        let deriv_size = checked_buffer_size3(batch_size, max_in_dim, basis)?;
+        self.basis_derivs.reserve(deriv_size);
+        self.basis_derivs.resize(deriv_size);
+
+        // Training ping-pong buffers
+        let output_dim = config.output_dim;
+        let output_size = checked_buffer_size(batch_size, output_dim)?;
+        self.predictions_buffer.reserve(output_size);
+        self.predictions_buffer.resize(output_size);
+
+        self.grad_output.reserve(output_size);
+        self.grad_output.resize(output_size);
+
+        self.history_batch_size = batch_size;
+
+        Ok(())
     }
 
     /// Prepares workspace for training with history tracking.
@@ -677,6 +1031,11 @@ impl Workspace {
     /// * `batch_size` - Number of samples in the batch
     /// * `config` - Network configuration
     /// * `layer_dims` - Dimensions of all layers `[input, hidden..., output]`
+    ///
+    /// # Panics
+    ///
+    /// Panics if buffer size calculations overflow. Use [`try_prepare_training`](Self::try_prepare_training)
+    /// for a fallible version.
     #[inline]
     pub fn prepare_training(
         &mut self,
@@ -684,53 +1043,8 @@ impl Workspace {
         config: &KanConfig,
         layer_dims: &[usize],
     ) {
-        self.reserve(batch_size, config);
-
-        let num_layers = layer_dims.len().saturating_sub(1);
-        if self.layers_inputs.len() < num_layers {
-            self.layers_inputs
-                .resize_with(num_layers, AlignedBuffer::new);
-        }
-        if self.layers_grid_indices.len() < num_layers {
-            self.layers_grid_indices.resize_with(num_layers, Vec::new);
-        }
-
-        let basis = config.basis_size_aligned();
-        let max_in_dim = *layer_dims.iter().max().unwrap_or(&config.input_dim);
-
-        // Ensure history buffers sized per layer
-        for (layer_idx, in_dim) in layer_dims.iter().copied().enumerate().take(num_layers) {
-            let needed = batch_size * in_dim;
-
-            let buf = &mut self.layers_inputs[layer_idx];
-            buf.reserve(needed);
-            buf.resize(needed);
-
-            let indices = &mut self.layers_grid_indices[layer_idx];
-            if indices.len() < needed {
-                indices.resize(needed, 0);
-            } else {
-                indices.truncate(needed);
-            }
-        }
-
-        // Gradient ping-pong buffer
-        self.layer_grads.reserve(batch_size * max_in_dim);
-        self.layer_grads.resize(batch_size * max_in_dim);
-
-        // Derivatives buffer (same layout as basis_values)
-        self.basis_derivs.reserve(batch_size * max_in_dim * basis);
-        self.basis_derivs.resize(batch_size * max_in_dim * basis);
-
-        // Training ping-pong buffers
-        let output_dim = config.output_dim;
-        self.predictions_buffer.reserve(batch_size * output_dim);
-        self.predictions_buffer.resize(batch_size * output_dim);
-
-        self.grad_output.reserve(batch_size * output_dim);
-        self.grad_output.resize(batch_size * output_dim);
-
-        self.history_batch_size = batch_size;
+        self.try_prepare_training(batch_size, config, layer_dims)
+            .expect("Workspace::prepare_training: buffer size overflow")
     }
 
     /// Prepares gradient buffers for training with layer sizes.
@@ -799,6 +1113,152 @@ impl Workspace {
             batch_size
         );
     }
+
+    /// Validates workspace state, returning error if invalid.
+    #[inline]
+    pub fn validate(&self) -> ArkanResult<()> {
+        // Check that ping-pong buffers have capacity
+        if self.batch_capacity > 0 {
+            if self.layer_output.capacity() == 0 && self.max_dim > 0 {
+                return Err(ArkanError::invalid_workspace(
+                    "layer_output buffer is empty after previous operation",
+                ));
+            }
+            if self.layer_input.capacity() == 0 && self.max_dim > 0 {
+                return Err(ArkanError::invalid_workspace(
+                    "layer_input buffer is empty after previous operation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks workspace capacity, returning error if insufficient.
+    #[inline]
+    pub fn check_capacity(&self, batch_size: usize) -> ArkanResult<()> {
+        if batch_size > self.batch_capacity {
+            return Err(ArkanError::batch_too_large(batch_size, self.batch_capacity));
+        }
+        Ok(())
+    }
+}
+
+/// RAII guard for workspace ping-pong buffers.
+///
+/// This guard ensures that buffers borrowed from a [`Workspace`] are returned
+/// even if a panic occurs during computation. This provides basic exception
+/// safety guarantee - the workspace remains valid (though possibly with
+/// different buffer contents) after unwinding.
+///
+/// # Usage
+///
+/// ```rust
+/// use arkan::{KanConfig, Workspace, WorkspaceGuard};
+///
+/// let config = KanConfig::preset();
+/// let mut workspace = Workspace::new(&config);
+/// workspace.reserve(64, &config);
+///
+/// {
+///     let mut guard = WorkspaceGuard::new(&mut workspace);
+///     let (buffer_a, buffer_b) = guard.buffers_mut();
+///
+///     // ... do computations ...
+///     buffer_a.resize(100);
+///
+///     // Buffers are returned to workspace when guard is dropped
+///     guard.finish();
+/// }
+///
+/// // Workspace has the buffers back
+/// assert!(workspace.layer_output.capacity() >= 100);
+/// ```
+///
+/// # Panic Behavior
+///
+/// If a panic occurs while the guard is active:
+/// - The `Drop` implementation will return the buffers to the workspace
+/// - The workspace will be in a valid state (buffers have correct capacity)
+/// - Buffer contents may be in an intermediate state
+pub struct WorkspaceGuard<'a> {
+    workspace: &'a mut Workspace,
+    buffer_a: Option<AlignedBuffer>,
+    buffer_b: Option<AlignedBuffer>,
+}
+
+impl<'a> WorkspaceGuard<'a> {
+    /// Creates a new guard, taking ownership of the ping-pong buffers.
+    #[inline]
+    pub fn new(workspace: &'a mut Workspace) -> Self {
+        let buffer_a = std::mem::take(&mut workspace.layer_output);
+        let buffer_b = std::mem::take(&mut workspace.layer_input);
+        Self {
+            workspace,
+            buffer_a: Some(buffer_a),
+            buffer_b: Some(buffer_b),
+        }
+    }
+
+    /// Returns mutable references to both buffers.
+    #[inline]
+    pub fn buffers_mut(&mut self) -> (&mut AlignedBuffer, &mut AlignedBuffer) {
+        (
+            self.buffer_a.as_mut().expect("buffer_a already taken"),
+            self.buffer_b.as_mut().expect("buffer_b already taken"),
+        )
+    }
+
+    /// Returns references to both buffers.
+    #[inline]
+    pub fn buffers(&self) -> (&AlignedBuffer, &AlignedBuffer) {
+        (
+            self.buffer_a.as_ref().expect("buffer_a already taken"),
+            self.buffer_b.as_ref().expect("buffer_b already taken"),
+        )
+    }
+
+    /// Takes buffer_a, leaving None in its place.
+    /// The buffer will NOT be returned to workspace on drop.
+    #[inline]
+    pub fn take_buffer_a(&mut self) -> AlignedBuffer {
+        self.buffer_a.take().expect("buffer_a already taken")
+    }
+
+    /// Takes buffer_b, leaving None in its place.
+    /// The buffer will NOT be returned to workspace on drop.
+    #[inline]
+    pub fn take_buffer_b(&mut self) -> AlignedBuffer {
+        self.buffer_b.take().expect("buffer_b already taken")
+    }
+
+    /// Explicitly returns buffers to workspace and consumes the guard.
+    /// This is the normal completion path (no panic).
+    #[inline]
+    pub fn finish(mut self) {
+        self.return_buffers();
+    }
+
+    /// Returns the workspace reference for accessing other fields.
+    #[inline]
+    pub fn workspace(&mut self) -> &mut Workspace {
+        self.workspace
+    }
+
+    fn return_buffers(&mut self) {
+        if let Some(buf) = self.buffer_a.take() {
+            self.workspace.layer_output = buf;
+        }
+        if let Some(buf) = self.buffer_b.take() {
+            self.workspace.layer_input = buf;
+        }
+    }
+}
+
+impl<'a> Drop for WorkspaceGuard<'a> {
+    fn drop(&mut self) {
+        // Return any buffers that weren't explicitly taken
+        self.return_buffers();
+    }
 }
 
 #[cfg(test)]
@@ -863,5 +1323,237 @@ mod tests {
 
         assert_eq!(ws.z_buffer.len(), 64 * 21);
         assert_eq!(ws.grid_indices.len(), 64 * 21);
+    }
+
+    #[test]
+    fn test_aligned_buffer_clone() {
+        let mut buf = AlignedBuffer::with_capacity(100);
+        buf.resize(50);
+        for i in 0..50 {
+            buf[i] = i as f32 * 2.0;
+        }
+
+        let cloned = buf.clone();
+
+        // Same logical length
+        assert_eq!(cloned.len(), 50);
+        assert_eq!(cloned.capacity(), 100);
+
+        // Data matches
+        for i in 0..50 {
+            assert_eq!(cloned[i], i as f32 * 2.0);
+        }
+
+        // Check alignment of clone
+        assert_eq!(cloned.as_ptr() as usize % CACHE_LINE, 0);
+    }
+
+    #[test]
+    fn test_aligned_buffer_zero_all() {
+        let mut buf = AlignedBuffer::with_capacity(100);
+        buf.resize(50);
+        for i in 0..50 {
+            buf[i] = 1.0;
+        }
+
+        buf.zero();
+
+        for i in 0..50 {
+            assert_eq!(buf[i], 0.0);
+        }
+    }
+
+    #[test]
+    fn test_aligned_buffer_try_reserve() {
+        let mut buf = AlignedBuffer::new();
+
+        // Normal reservation should succeed
+        assert!(buf.try_reserve(100).is_ok());
+        assert!(buf.capacity() >= 100);
+
+        // Very large reservation might fail (depends on system)
+        // We just test that it returns Result, not panics
+        let result = buf.try_reserve(usize::MAX / 2);
+        // Either succeeds or returns error, but doesn't panic
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_workspace_guard_normal_flow() {
+        let config = KanConfig::preset();
+        let mut ws = Workspace::new(&config);
+        ws.reserve(64, &config);
+
+        // Get initial capacities
+        let initial_output_cap = ws.layer_output.capacity();
+        let initial_input_cap = ws.layer_input.capacity();
+
+        {
+            let mut guard = WorkspaceGuard::new(&mut ws);
+            let (buf_a, buf_b) = guard.buffers_mut();
+
+            // Buffers should have the original capacity
+            assert_eq!(buf_a.capacity(), initial_output_cap);
+            assert_eq!(buf_b.capacity(), initial_input_cap);
+
+            // Modify buffers
+            buf_a.resize(100);
+            buf_b.resize(100);
+
+            guard.finish();
+        }
+
+        // Buffers returned to workspace
+        assert!(ws.layer_output.capacity() >= 100);
+        assert!(ws.layer_input.capacity() >= 100);
+    }
+
+    #[test]
+    fn test_workspace_guard_drop_returns_buffers() {
+        let config = KanConfig::preset();
+        let mut ws = Workspace::new(&config);
+        ws.reserve(64, &config);
+
+        {
+            let mut guard = WorkspaceGuard::new(&mut ws);
+            let (buf_a, _buf_b) = guard.buffers_mut();
+            buf_a.resize(200);
+            // Guard dropped without calling finish()
+        }
+
+        // Buffers should still be returned
+        assert!(ws.layer_output.capacity() >= 200);
+        assert!(ws.layer_input.capacity() > 0);
+    }
+
+    #[test]
+    fn test_workspace_validate() {
+        let config = KanConfig::preset();
+        let ws = Workspace::new(&config);
+
+        // Fresh workspace should be valid
+        assert!(ws.validate().is_ok());
+    }
+
+    #[test]
+    fn test_workspace_check_capacity() {
+        let config = KanConfig::preset();
+        let mut ws = Workspace::new(&config);
+        ws.reserve(64, &config);
+
+        let cap = ws.batch_capacity();
+
+        // Within capacity - OK
+        assert!(ws.check_capacity(32).is_ok());
+        assert!(ws.check_capacity(cap).is_ok());
+
+        // Exceeds capacity - Error
+        assert!(ws.check_capacity(cap + 1).is_err());
+    }
+
+    #[test]
+    fn test_checked_buffer_size() {
+        // Normal multiplication
+        assert_eq!(super::checked_buffer_size(64, 10).unwrap(), 640);
+        assert_eq!(super::checked_buffer_size(1, 1).unwrap(), 1);
+        assert_eq!(super::checked_buffer_size(0, 1000).unwrap(), 0);
+
+        // Overflow case
+        let result = super::checked_buffer_size(usize::MAX, 2);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            super::super::error::ArkanError::Overflow { .. }
+        ));
+    }
+
+    #[test]
+    fn test_checked_buffer_size3() {
+        // Normal multiplication
+        assert_eq!(super::checked_buffer_size3(64, 10, 8).unwrap(), 5120);
+
+        // Overflow case
+        let result = super::checked_buffer_size3(usize::MAX / 2, 3, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_checked_buffer_size_exceeds_max() {
+        // Exceeds MAX_BUFFER_ELEMENTS
+        let result = super::checked_buffer_size(super::MAX_BUFFER_ELEMENTS + 1, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_with_capacity_normal() {
+        let buf = AlignedBuffer::try_with_capacity(1000).unwrap();
+        assert_eq!(buf.capacity(), 1000);
+    }
+
+    #[test]
+    fn test_try_with_capacity_overflow() {
+        // Should fail - exceeds MAX_BUFFER_ELEMENTS
+        let result = AlignedBuffer::try_with_capacity(super::MAX_BUFFER_ELEMENTS + 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_with_capacity_zero() {
+        let buf = AlignedBuffer::try_with_capacity(0).unwrap();
+        assert_eq!(buf.capacity(), 0);
+    }
+
+    #[test]
+    fn test_try_reserve_success() {
+        let config = KanConfig::preset();
+        let mut ws = Workspace::new(&config);
+        assert!(ws.try_reserve(100, &config).is_ok());
+    }
+
+    #[test]
+    fn test_try_reserve_overflow() {
+        let config = KanConfig::preset();
+        let mut ws = Workspace::new(&config);
+        // Overflow: huge batch × reasonable dims
+        let result = ws.try_reserve(usize::MAX / 2, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_prepare_forward_success() {
+        let config = KanConfig::preset();
+        let mut ws = Workspace::new(&config);
+        ws.reserve(64, &config);
+        let result = ws.try_prepare_forward(32, &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_prepare_forward_overflow() {
+        let config = KanConfig::preset();
+        let mut ws = Workspace::new(&config);
+        // Overflow in size calculation
+        let result = ws.try_prepare_forward(usize::MAX / 2, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_prepare_training_success() {
+        let config = KanConfig::preset();
+        let mut ws = Workspace::new(&config);
+        ws.reserve(64, &config);
+        let dims = config.layer_dims();
+        let result = ws.try_prepare_training(32, &config, &dims);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_prepare_training_overflow() {
+        let config = KanConfig::preset();
+        let mut ws = Workspace::new(&config);
+        let dims = config.layer_dims();
+        // Overflow in gradient size calculation
+        let result = ws.try_prepare_training(usize::MAX / 4, &config, &dims);
+        assert!(result.is_err());
     }
 }

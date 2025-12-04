@@ -5,12 +5,15 @@
 use crate::error::ArkanResult;
 use crate::gpu::layer::GpuLayer;
 use crate::gpu::shaders;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Cached compute pipelines for different operations.
 pub struct PipelineCache {
     device: Arc<wgpu::Device>,
-    /// Forward pass pipeline
+    /// Forward pass pipelines cached by spline order (2-5)
+    forward_pipelines: HashMap<usize, wgpu::ComputePipeline>,
+    /// Forward pass pipeline (legacy, order=3 only)
     forward_pipeline: Option<wgpu::ComputePipeline>,
     /// Forward simple pipeline (alternative implementation)
     forward_simple_pipeline: Option<wgpu::ComputePipeline>,
@@ -43,6 +46,7 @@ impl PipelineCache {
     pub fn new(device: Arc<wgpu::Device>) -> Self {
         Self {
             device,
+            forward_pipelines: HashMap::new(),
             forward_pipeline: None,
             forward_simple_pipeline: None,
             softmax_pipeline: None,
@@ -58,7 +62,23 @@ impl PipelineCache {
         }
     }
 
-    /// Gets or creates the forward pass pipeline.
+    /// Gets or creates the forward pass pipeline for a specific spline order.
+    ///
+    /// Uses dynamically generated WGSL shaders optimized for the given order.
+    /// Pipelines are cached by order for reuse.
+    pub fn get_forward_pipeline_for_order(
+        &mut self,
+        layer_layout: &wgpu::BindGroupLayout,
+        order: usize,
+    ) -> ArkanResult<&wgpu::ComputePipeline> {
+        // Check cache first
+        if !self.forward_pipelines.contains_key(&order) {
+            self.create_forward_pipeline_for_order(layer_layout, order)?;
+        }
+        Ok(self.forward_pipelines.get(&order).unwrap())
+    }
+
+    /// Gets or creates the forward pass pipeline (legacy, order=3 only).
     pub fn get_forward_pipeline(
         &mut self,
         layer_layout: &wgpu::BindGroupLayout,
@@ -127,6 +147,58 @@ impl PipelineCache {
 
         self.forward_layout = Some(layout);
         self.forward_pipeline = Some(pipeline);
+
+        Ok(())
+    }
+
+    /// Creates a forward pipeline for a specific spline order using dynamic shader generation.
+    fn create_forward_pipeline_for_order(
+        &mut self,
+        layer_layout: &wgpu::BindGroupLayout,
+        order: usize,
+    ) -> ArkanResult<()> {
+        // Create workspace layout if needed
+        if self.workspace_layout.is_none() {
+            self.workspace_layout =
+                Some(GpuLayer::create_workspace_bind_group_layout(&self.device));
+        }
+
+        // Generate shader for specific order
+        let shader_source = shaders::generate_forward_shader(order)?;
+
+        // Create shader module
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(&format!("Forward Shader Order {}", order)),
+                source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            });
+
+        // Create or reuse pipeline layout
+        if self.forward_layout.is_none() {
+            let layout = self
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Forward Pipeline Layout"),
+                    bind_group_layouts: &[layer_layout, self.workspace_layout.as_ref().unwrap()],
+                    push_constant_ranges: &[],
+                });
+            self.forward_layout = Some(layout);
+        }
+
+        // Create compute pipeline
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(&format!("Forward Pipeline Order {}", order)),
+                layout: Some(self.forward_layout.as_ref().unwrap()),
+                module: &shader,
+                entry_point: Some("forward_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        self.forward_pipelines.insert(order, pipeline);
 
         Ok(())
     }
@@ -657,6 +729,7 @@ impl PipelineCache {
 impl std::fmt::Debug for PipelineCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PipelineCache")
+            .field("forward_orders_cached", &self.forward_pipelines.keys().collect::<Vec<_>>())
             .field("has_forward", &self.forward_pipeline.is_some())
             .field(
                 "has_forward_simple",

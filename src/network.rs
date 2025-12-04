@@ -52,10 +52,24 @@
 
 use crate::buffer::Workspace;
 use crate::config::KanConfig;
+use crate::error::{ArkanError, ArkanResult};
 use crate::layer::KanLayer;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+
+/// Magic bytes for serialized network files.
+///
+/// Used to identify ArKan model files and distinguish from other formats.
+#[cfg(feature = "serde")]
+const SERIALIZATION_MAGIC: &[u8; 5] = b"ARKAN";
+
+/// Current serialization format version.
+///
+/// Incremented when the format changes in a backwards-incompatible way.
+/// - v1: Initial versioned format (ArKan 0.3.0+)
+#[cfg(feature = "serde")]
+const SERIALIZATION_VERSION: u32 = 1;
 
 /// Complete KAN network with multiple layers.
 ///
@@ -147,6 +161,7 @@ impl KanNetwork {
     ///
     /// assert_eq!(network.num_layers(), 3); // 2 hidden + 1 output
     /// ```
+    #[must_use = "this creates a new network without modifying anything"]
     pub fn new(config: KanConfig) -> Self {
         let layer_dims = config.layer_dims();
         let mut layers = Vec::with_capacity(layer_dims.len() - 1);
@@ -439,6 +454,10 @@ impl KanNetwork {
             // Borrow-safety: `std::mem::take` moves buffers out of workspace,
             // allowing us to have mutable references to both without aliasing.
             // This is the key trick for zero-allocation multi-layer forward.
+            //
+            // Panic safety: We use a scope + explicit return at the end.
+            // If panic occurs, buffers are lost but workspace remains valid
+            // (empty buffers). Caller should recreate workspace after panic.
             let mut buffer_a = std::mem::take(&mut workspace.layer_output);
             let mut buffer_b = std::mem::take(&mut workspace.layer_input);
             buffer_a.resize(ping_pong_size);
@@ -489,6 +508,69 @@ impl KanNetwork {
             workspace.layer_output = buffer_a;
             workspace.layer_input = buffer_b;
         }
+    }
+
+    /// Forward pass with Result return type for better error handling.
+    ///
+    /// This is the Result-returning version of [`forward_batch`](Self::forward_batch).
+    /// Use this when you want explicit error handling instead of panics.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data `[batch_size * input_dim]`
+    /// * `output` - Output buffer `[batch_size * output_dim]` (will be overwritten)
+    /// * `workspace` - Pre-allocated workspace
+    ///
+    /// # Errors
+    ///
+    /// Returns `ArkanError::ShapeMismatch` if input/output lengths don't match expected dimensions.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let config = KanConfig::preset();
+    /// let network = KanNetwork::new(config.clone());
+    /// let mut workspace = network.create_workspace(64);
+    ///
+    /// let batch_size = 64;
+    /// let input = vec![0.5f32; batch_size * config.input_dim];
+    /// let mut output = vec![0.0f32; batch_size * config.output_dim];
+    ///
+    /// network.try_forward_batch(&input, &mut output, &mut workspace)?;
+    /// # Ok::<(), arkan::ArkanError>(())
+    /// ```
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_forward_batch(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        workspace: &mut Workspace,
+    ) -> ArkanResult<()> {
+        let batch_size = input.len() / self.config.input_dim;
+
+        // Validate input length
+        let expected_input_len = batch_size * self.config.input_dim;
+        if input.len() != expected_input_len {
+            return Err(ArkanError::shape_mismatch(
+                &[expected_input_len],
+                &[input.len()],
+            ));
+        }
+
+        // Validate output length
+        let expected_output_len = batch_size * self.config.output_dim;
+        if output.len() != expected_output_len {
+            return Err(ArkanError::shape_mismatch(
+                &[expected_output_len],
+                &[output.len()],
+            ));
+        }
+
+        // Delegate to forward_batch (which now has guaranteed valid sizes)
+        self.forward_batch(input, output, workspace);
+        Ok(())
     }
 
     /// Forward pass for training: stores per-layer normalized inputs and grid indices.
@@ -849,6 +931,142 @@ impl KanNetwork {
         loss
     }
 
+    /// Training step with Result return type for better error handling.
+    ///
+    /// This is the Result-returning version of [`train_step`](Self::train_step).
+    /// Use this when you want explicit error handling instead of panics.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data `[batch_size * input_dim]`
+    /// * `target` - Target values `[batch_size * output_dim]`
+    /// * `mask` - Optional mask `[batch_size * output_dim]`
+    /// * `learning_rate` - Learning rate for SGD update
+    /// * `workspace` - Pre-allocated workspace
+    ///
+    /// # Errors
+    ///
+    /// Returns `ArkanError::ShapeMismatch` if input/target/mask lengths don't match expected dimensions.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let config = KanConfig::preset();
+    /// let mut network = KanNetwork::new(config.clone());
+    /// let mut workspace = network.create_workspace(64);
+    ///
+    /// let batch_size = 64;
+    /// let inputs = vec![0.5f32; batch_size * config.input_dim];
+    /// let targets = vec![0.1f32; batch_size * config.output_dim];
+    ///
+    /// let loss = network.try_train_step(&inputs, &targets, None, 0.001, &mut workspace)?;
+    /// # Ok::<(), arkan::ArkanError>(())
+    /// ```
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_train_step(
+        &mut self,
+        input: &[f32],
+        target: &[f32],
+        mask: Option<&[f32]>,
+        learning_rate: f32,
+        workspace: &mut Workspace,
+    ) -> ArkanResult<f32> {
+        let opts = self.default_train_options;
+        self.try_train_step_with_options(input, target, mask, learning_rate, workspace, &opts)
+    }
+
+    /// Training step with explicit options and Result return type.
+    ///
+    /// This is the Result-returning version of [`train_step_with_options`](Self::train_step_with_options).
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data `[batch_size * input_dim]`
+    /// * `target` - Target values `[batch_size * output_dim]`
+    /// * `mask` - Optional mask `[batch_size * output_dim]`
+    /// * `learning_rate` - Learning rate for SGD update
+    /// * `workspace` - Pre-allocated workspace
+    /// * `opts` - Training options (gradient clipping, weight decay)
+    ///
+    /// # Errors
+    ///
+    /// Returns `ArkanError::ShapeMismatch` if input/target/mask lengths don't match expected dimensions.
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_train_step_with_options(
+        &mut self,
+        input: &[f32],
+        target: &[f32],
+        mask: Option<&[f32]>,
+        learning_rate: f32,
+        workspace: &mut Workspace,
+        opts: &TrainOptions,
+    ) -> ArkanResult<f32> {
+        let batch_size = input.len() / self.config.input_dim;
+
+        // Validate input length
+        let expected_input_len = batch_size * self.config.input_dim;
+        if input.len() != expected_input_len {
+            return Err(ArkanError::shape_mismatch(
+                &[expected_input_len],
+                &[input.len()],
+            ));
+        }
+
+        // Validate target length
+        let expected_target_len = batch_size * self.config.output_dim;
+        if target.len() != expected_target_len {
+            return Err(ArkanError::shape_mismatch(
+                &[expected_target_len],
+                &[target.len()],
+            ));
+        }
+
+        // Validate mask length if provided
+        if let Some(m) = mask {
+            if m.len() != expected_target_len {
+                return Err(ArkanError::shape_mismatch(
+                    &[expected_target_len],
+                    &[m.len()],
+                ));
+            }
+        }
+
+        // Delegate to train_step_with_options (which now has guaranteed valid sizes)
+        Ok(self.train_step_with_options(input, target, mask, learning_rate, workspace, opts))
+    }
+
+    /// Creates a workspace sized for this network (fallible version).
+    ///
+    /// The workspace is preallocated for the given maximum batch size.
+    /// Reuse this workspace across all forward/backward calls to achieve
+    /// zero-allocation inference and training.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_batch` - Maximum batch size you'll use with this workspace
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArkanError::Overflow`] if buffer size calculations overflow.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let network = KanNetwork::new(KanConfig::preset());
+    /// let mut workspace = network.try_create_workspace(64)?;
+    /// # Ok::<(), arkan::ArkanError>(())
+    /// ```
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_create_workspace(&self, max_batch: usize) -> ArkanResult<Workspace> {
+        let mut ws = Workspace::new(&self.config);
+        ws.try_reserve(max_batch, &self.config)?;
+        Ok(ws)
+    }
+
     /// Creates a workspace sized for this network.
     ///
     /// The workspace is preallocated for the given maximum batch size.
@@ -858,6 +1076,11 @@ impl KanNetwork {
     /// # Arguments
     ///
     /// * `max_batch` - Maximum batch size you'll use with this workspace
+    ///
+    /// # Panics
+    ///
+    /// Panics if buffer size calculations overflow. Use [`try_create_workspace`](Self::try_create_workspace)
+    /// for a fallible version.
     ///
     /// # Example
     ///
@@ -872,44 +1095,121 @@ impl KanNetwork {
     /// // Can be used for any batch size <= 64
     /// // Workspace will grow automatically if needed, but that causes allocation
     /// ```
+    #[must_use = "this creates a new workspace without modifying anything"]
     pub fn create_workspace(&self, max_batch: usize) -> Workspace {
-        let mut ws = Workspace::new(&self.config);
-        ws.reserve(max_batch, &self.config);
-        ws
+        self.try_create_workspace(max_batch)
+            .expect("KanNetwork::create_workspace: buffer size overflow")
     }
 
-    /// Saves network to bytes using bincode.
+    /// Saves network to bytes using bincode with version header.
+    ///
+    /// The format includes:
+    /// - Magic bytes: `ARKAN` (5 bytes)
+    /// - Version: u32 (4 bytes)
+    /// - Network data: bincode serialized
     ///
     /// Requires the `serde` feature.
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use arkan::{KanConfig, KanNetwork};
     ///
     /// let network = KanNetwork::new(KanConfig::preset());
     /// let bytes = network.to_bytes().unwrap();
-    /// std::fs::write("model.bin", &bytes).unwrap();
+    ///
+    /// // Bytes start with magic header "ARKAN"
+    /// assert_eq!(&bytes[..5], b"ARKAN");
     /// ```
     #[cfg(feature = "serde")]
     pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
-        bincode::serialize(self)
+        use std::io::Write;
+
+        let mut bytes = Vec::new();
+        // Magic bytes
+        bytes.write_all(SERIALIZATION_MAGIC).map_err(|e| {
+            bincode::Error::from(bincode::ErrorKind::Io(e))
+        })?;
+        // Version
+        bytes.write_all(&SERIALIZATION_VERSION.to_le_bytes()).map_err(|e| {
+            bincode::Error::from(bincode::ErrorKind::Io(e))
+        })?;
+        // Network data
+        let network_bytes = bincode::serialize(self)?;
+        bytes.extend(network_bytes);
+        Ok(bytes)
     }
 
-    /// Loads network from bytes.
+    /// Loads network from bytes with version validation.
     ///
     /// Requires the `serde` feature.
     ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Magic bytes don't match
+    /// - Version is incompatible
+    /// - Deserialization fails
+    ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// use arkan::KanNetwork;
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
     ///
-    /// let bytes = std::fs::read("model.bin").unwrap();
-    /// let network = KanNetwork::from_bytes(&bytes).unwrap();
+    /// // Create network and serialize
+    /// let original = KanNetwork::new(KanConfig::preset());
+    /// let bytes = original.to_bytes().unwrap();
+    ///
+    /// // Deserialize
+    /// let loaded = KanNetwork::from_bytes(&bytes).unwrap();
+    /// assert_eq!(loaded.param_count(), original.param_count());
     /// ```
     #[cfg(feature = "serde")]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        const HEADER_SIZE: usize = SERIALIZATION_MAGIC.len() + 4; // magic + version
+
+        if bytes.len() < HEADER_SIZE {
+            return Err(bincode::Error::from(bincode::ErrorKind::Custom(
+                "Invalid file: too short for header".to_string(),
+            )));
+        }
+
+        // Check magic bytes
+        if &bytes[..SERIALIZATION_MAGIC.len()] != SERIALIZATION_MAGIC {
+            return Err(bincode::Error::from(bincode::ErrorKind::Custom(
+                "Invalid file: wrong magic bytes (not an ArKan model)".to_string(),
+            )));
+        }
+
+        // Check version
+        let version_bytes: [u8; 4] = bytes[SERIALIZATION_MAGIC.len()..HEADER_SIZE]
+            .try_into()
+            .unwrap();
+        let version = u32::from_le_bytes(version_bytes);
+
+        if version != SERIALIZATION_VERSION {
+            return Err(bincode::Error::from(bincode::ErrorKind::Custom(
+                format!(
+                    "Incompatible model version: expected {}, got {}",
+                    SERIALIZATION_VERSION, version
+                ),
+            )));
+        }
+
+        // Deserialize network data
+        bincode::deserialize(&bytes[HEADER_SIZE..])
+    }
+
+    /// Loads network from bytes without version check (legacy format).
+    ///
+    /// Use this to load models saved with ArKan < 0.3.0.
+    ///
+    /// # Warning
+    ///
+    /// This method is provided for backwards compatibility only.
+    /// New code should use [`from_bytes`](Self::from_bytes).
+    #[cfg(feature = "serde")]
+    pub fn from_bytes_legacy(bytes: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(bytes)
     }
 }
@@ -1255,5 +1555,297 @@ mod tests {
 
         assert_eq!(before_w, network.layers[0].weights);
         assert_eq!(before_b, network.layers[0].bias);
+    }
+
+    #[test]
+    fn test_try_forward_batch_ok() {
+        let config = KanConfig::preset();
+        let network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(4);
+
+        let batch_size = 4;
+        let input = vec![0.5f32; batch_size * config.input_dim];
+        let mut output = vec![0.0f32; batch_size * config.output_dim];
+
+        let result = network.try_forward_batch(&input, &mut output, &mut workspace);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_forward_batch_input_mismatch() {
+        let config = KanConfig::preset();
+        let network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(4);
+
+        let batch_size = 4;
+        // Wrong input size (missing one element)
+        let input = vec![0.5f32; batch_size * config.input_dim - 1];
+        let mut output = vec![0.0f32; batch_size * config.output_dim];
+
+        let result = network.try_forward_batch(&input, &mut output, &mut workspace);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ArkanError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn test_try_forward_batch_output_mismatch() {
+        let config = KanConfig::preset();
+        let network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(4);
+
+        let batch_size = 4;
+        let input = vec![0.5f32; batch_size * config.input_dim];
+        // Wrong output size
+        let mut output = vec![0.0f32; batch_size * config.output_dim - 1];
+
+        let result = network.try_forward_batch(&input, &mut output, &mut workspace);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ArkanError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn test_try_train_step_ok() {
+        let config = KanConfig::preset();
+        let mut network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(4);
+
+        let batch_size = 4;
+        let input = vec![0.5f32; batch_size * config.input_dim];
+        let target = vec![0.1f32; batch_size * config.output_dim];
+
+        let result = network.try_train_step(&input, &target, None, 0.001, &mut workspace);
+        assert!(result.is_ok());
+        assert!(result.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_try_train_step_input_mismatch() {
+        let config = KanConfig::preset();
+        let mut network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(4);
+
+        let batch_size = 4;
+        // Wrong input size
+        let input = vec![0.5f32; batch_size * config.input_dim + 1];
+        let target = vec![0.1f32; batch_size * config.output_dim];
+
+        let result = network.try_train_step(&input, &target, None, 0.001, &mut workspace);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ArkanError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn test_try_train_step_target_mismatch() {
+        let config = KanConfig::preset();
+        let mut network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(4);
+
+        let batch_size = 4;
+        let input = vec![0.5f32; batch_size * config.input_dim];
+        // Wrong target size
+        let target = vec![0.1f32; batch_size * config.output_dim - 2];
+
+        let result = network.try_train_step(&input, &target, None, 0.001, &mut workspace);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ArkanError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn test_try_train_step_mask_mismatch() {
+        let config = KanConfig::preset();
+        let mut network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(4);
+
+        let batch_size = 4;
+        let input = vec![0.5f32; batch_size * config.input_dim];
+        let target = vec![0.1f32; batch_size * config.output_dim];
+        // Wrong mask size
+        let mask = vec![1.0f32; batch_size * config.output_dim + 1];
+
+        let result = network.try_train_step(&input, &target, Some(&mask), 0.001, &mut workspace);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ArkanError::ShapeMismatch { .. }));
+    }
+
+    // ==================== Edge-case tests ====================
+
+    #[test]
+    fn test_batch_size_zero() {
+        // Empty batch should work without panic
+        let config = KanConfig::preset();
+        let network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(1);
+
+        let input: Vec<f32> = vec![];
+        let mut output: Vec<f32> = vec![];
+
+        // Should not panic
+        network.forward_batch(&input, &mut output, &mut workspace);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_batch_size_one() {
+        // Single sample batch
+        let config = KanConfig::preset();
+        let network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(1);
+
+        let input = vec![0.5f32; config.input_dim];
+        let mut output = vec![0.0f32; config.output_dim];
+
+        network.forward_batch(&input, &mut output, &mut workspace);
+        assert!(output.iter().all(|&x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_spline_order_2() {
+        // Quadratic splines (order 2)
+        let config = KanConfig {
+            input_dim: 4,
+            output_dim: 2,
+            hidden_dims: vec![8],
+            grid_size: 5,
+            spline_order: 2,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 4],
+            input_std: vec![1.0; 4],
+            ..Default::default()
+        };
+
+        let network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(4);
+
+        let input = vec![0.5f32; 4 * config.input_dim];
+        let mut output = vec![0.0f32; 4 * config.output_dim];
+
+        network.forward_batch(&input, &mut output, &mut workspace);
+        assert!(output.iter().all(|&x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_spline_order_4() {
+        // Quartic splines (order 4)
+        let config = KanConfig {
+            input_dim: 4,
+            output_dim: 2,
+            hidden_dims: vec![8],
+            grid_size: 5,
+            spline_order: 4,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 4],
+            input_std: vec![1.0; 4],
+            ..Default::default()
+        };
+
+        let network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(4);
+
+        let input = vec![0.5f32; 4 * config.input_dim];
+        let mut output = vec![0.0f32; 4 * config.output_dim];
+
+        network.forward_batch(&input, &mut output, &mut workspace);
+        assert!(output.iter().all(|&x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_no_hidden_layers() {
+        // Direct input -> output (single layer)
+        let config = KanConfig {
+            input_dim: 10,
+            output_dim: 5,
+            hidden_dims: vec![],
+            grid_size: 5,
+            spline_order: 3,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 10],
+            input_std: vec![1.0; 10],
+            ..Default::default()
+        };
+
+        let network = KanNetwork::new(config.clone());
+        assert_eq!(network.num_layers(), 1);
+
+        let mut workspace = network.create_workspace(2);
+        let input = vec![0.5f32; 2 * config.input_dim];
+        let mut output = vec![0.0f32; 2 * config.output_dim];
+
+        network.forward_batch(&input, &mut output, &mut workspace);
+        assert!(output.iter().all(|&x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_deep_network() {
+        // Many hidden layers
+        let config = KanConfig {
+            input_dim: 4,
+            output_dim: 2,
+            hidden_dims: vec![8, 8, 8, 8, 8], // 5 hidden layers
+            grid_size: 3,
+            spline_order: 2,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 4],
+            input_std: vec![1.0; 4],
+            ..Default::default()
+        };
+
+        let network = KanNetwork::new(config.clone());
+        assert_eq!(network.num_layers(), 6); // 5 hidden + 1 output
+
+        let mut workspace = network.create_workspace(2);
+        let input = vec![0.5f32; 2 * config.input_dim];
+        let mut output = vec![0.0f32; 2 * config.output_dim];
+
+        network.forward_batch(&input, &mut output, &mut workspace);
+        assert!(output.iter().all(|&x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_extreme_inputs() {
+        // Very large/small inputs
+        let config = KanConfig::preset();
+        let network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(1);
+
+        // Large positive
+        let input = vec![100.0f32; config.input_dim];
+        let mut output = vec![0.0f32; config.output_dim];
+        network.forward_batch(&input, &mut output, &mut workspace);
+        assert!(output.iter().all(|&x| x.is_finite()));
+
+        // Large negative
+        let input = vec![-100.0f32; config.input_dim];
+        network.forward_batch(&input, &mut output, &mut workspace);
+        assert!(output.iter().all(|&x| x.is_finite()));
+
+        // Near zero
+        let input = vec![1e-10f32; config.input_dim];
+        network.forward_batch(&input, &mut output, &mut workspace);
+        assert!(output.iter().all(|&x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_workspace_reuse() {
+        // Same workspace for different batch sizes
+        let config = KanConfig::preset();
+        let network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(64);
+
+        // Small batch
+        let input1 = vec![0.5f32; 4 * config.input_dim];
+        let mut output1 = vec![0.0f32; 4 * config.output_dim];
+        network.forward_batch(&input1, &mut output1, &mut workspace);
+
+        // Larger batch
+        let input2 = vec![0.5f32; 32 * config.input_dim];
+        let mut output2 = vec![0.0f32; 32 * config.output_dim];
+        network.forward_batch(&input2, &mut output2, &mut workspace);
+
+        // Same small batch again
+        let mut output3 = vec![0.0f32; 4 * config.output_dim];
+        network.forward_batch(&input1, &mut output3, &mut workspace);
+
+        // Results should be reproducible
+        assert_eq!(output1, output3);
     }
 }

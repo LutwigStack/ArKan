@@ -22,13 +22,14 @@ use wgpu::util::DeviceExt;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use arkan::{KanConfig, KanNetwork};
-/// use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork};
+/// use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork, GpuWorkspace};
 ///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// // Create CPU network
 /// let config = KanConfig::preset();
-/// let cpu_network = KanNetwork::new(config);
+/// let cpu_network = KanNetwork::new(config.clone());
 ///
 /// // Initialize GPU backend
 /// let backend = WgpuBackend::init(WgpuOptions::default())?;
@@ -36,9 +37,14 @@ use wgpu::util::DeviceExt;
 /// // Create GPU network from CPU network
 /// let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)?;
 ///
+/// // Create workspace
+/// let mut workspace = GpuWorkspace::new(&backend.device, 1, config.input_dim, config.output_dim)?;
+///
 /// // Forward pass on GPU
-/// let input = vec![0.5f32; 21];
-/// let output = gpu_network.forward_batch(&input, 1)?;
+/// let input = vec![0.5f32; config.input_dim];
+/// let output = gpu_network.forward_batch(&input, 1, &mut workspace)?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct GpuNetwork {
     /// Reference to the wgpu backend.
@@ -57,6 +63,8 @@ pub struct GpuNetwork {
     pub output_dim: usize,
     /// Layer dimensions.
     layer_dims: Vec<usize>,
+    /// B-spline order (2-5).
+    spline_order: usize,
 
     /// Workspace bind group layout.
     workspace_layout: wgpu::BindGroupLayout,
@@ -90,6 +98,7 @@ impl GpuNetwork {
         // Get dimensions
         let input_dim = cpu_network.config.input_dim;
         let output_dim = cpu_network.config.output_dim;
+        let spline_order = cpu_network.config.spline_order;
 
         // layer_dims: [input_dim, hidden_0, hidden_1, ..., output_dim]
         // Used for intermediate buffer sizing
@@ -107,6 +116,7 @@ impl GpuNetwork {
             input_dim,
             output_dim,
             layer_dims,
+            spline_order,
             workspace_layout,
         })
     }
@@ -223,10 +233,10 @@ impl GpuNetwork {
         // Update batch size in uniforms
         layer.update_batch_size(&self.queue, batch_size);
 
-        // Get or create pipeline
+        // Get or create pipeline for this spline order
         let pipeline = self
             .pipeline_cache
-            .get_forward_simple_pipeline(&layer.bind_group_layout)?;
+            .get_forward_pipeline_for_order(&layer.bind_group_layout, self.spline_order)?;
 
         // Create workspace bind group
         let workspace_bg =
@@ -289,10 +299,10 @@ impl GpuNetwork {
         // Get bind group layout reference for pipeline creation
         let bind_group_layout = &self.layers[layer_idx].bind_group_layout;
 
-        // Get pipeline
+        // Get pipeline for this spline order
         let pipeline = self
             .pipeline_cache
-            .get_forward_simple_pipeline(bind_group_layout)?;
+            .get_forward_pipeline_for_order(bind_group_layout, self.spline_order)?;
 
         // Create command encoder
         let mut encoder = self
@@ -340,11 +350,23 @@ impl GpuNetwork {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use arkan::{KanConfig, KanNetwork};
+    /// # use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork, GpuWorkspace};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let config = KanConfig::preset();
+    /// # let cpu_network = KanNetwork::new(config.clone());
+    /// # let backend = WgpuBackend::init(WgpuOptions::default())?;
+    /// # let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)?;
+    /// # let mut workspace = GpuWorkspace::new(&backend.device, 1, config.input_dim, config.output_dim)?;
+    /// # let inputs = vec![0.5f32; config.input_dim];
+    /// # let batch_size = 1;
     /// // Forward pass followed by softmax
     /// let logits = gpu_network.forward_batch(&inputs, batch_size, &mut workspace)?;
     /// gpu_network.apply_softmax(batch_size, &mut workspace)?;
-    /// let probabilities = workspace.download_output(&device, &queue, batch_size)?;
+    /// let probabilities = workspace.download_output(&backend.device, &backend.queue, batch_size)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn apply_softmax(
         &mut self,

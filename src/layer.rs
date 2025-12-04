@@ -120,10 +120,10 @@ pub struct KanLayer {
 }
 
 impl KanLayer {
-    /// Creates a new KAN layer with the given dimensions.
+    /// Creates a new KAN layer with the given dimensions (fallible version).
     ///
-    /// Initializes weights using Xavier-like initialization scaled by 0.1.
-    /// Bias terms are initialized to zero.
+    /// This is the fallible version of [`new`](Self::new) that returns an error
+    /// instead of panicking on invalid inputs or overflow conditions.
     ///
     /// # Arguments
     ///
@@ -131,9 +131,10 @@ impl KanLayer {
     /// * `out_dim` - Output dimension (must be positive)
     /// * `config` - Network configuration containing spline parameters
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `in_dim` or `out_dim` is zero.
+    /// Returns [`ArkanError::Config`] if dimensions are zero.
+    /// Returns [`ArkanError::Overflow`] if weight count overflows.
     ///
     /// # Example
     ///
@@ -141,11 +142,27 @@ impl KanLayer {
     /// use arkan::{KanConfig, KanLayer};
     ///
     /// let config = KanConfig::preset();
-    /// let layer = KanLayer::new(10, 20, &config);
+    /// let layer = KanLayer::try_new(10, 20, &config).expect("valid config");
     /// ```
-    pub fn new(in_dim: usize, out_dim: usize, config: &KanConfig) -> Self {
-        assert!(in_dim > 0, "Input dimension must be positive");
-        assert!(out_dim > 0, "Output dimension must be positive");
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_new(
+        in_dim: usize,
+        out_dim: usize,
+        config: &KanConfig,
+    ) -> Result<Self, crate::ArkanError> {
+        use crate::config::ConfigError;
+        use crate::ArkanError;
+
+        if in_dim == 0 {
+            return Err(ArkanError::Config(ConfigError::InvalidDimension(
+                "input dimension must be positive",
+            )));
+        }
+        if out_dim == 0 {
+            return Err(ArkanError::Config(ConfigError::InvalidDimension(
+                "output dimension must be positive",
+            )));
+        }
 
         let order = config.spline_order;
         let grid_size = config.grid_size;
@@ -153,11 +170,33 @@ impl KanLayer {
         let grid_range = config.grid_range;
 
         // Global basis: one B-spline per knot interval that can be active
-        let global_basis_size = grid_size + order;
+        let global_basis_size = grid_size
+            .checked_add(order)
+            .ok_or_else(|| ArkanError::Overflow("grid_size + order overflow".into()))?;
 
         // Local: only order+1 functions are non-zero at any point
-        let local_basis_size = order + 1;
+        let local_basis_size = order + 1; // order <= 5, safe
         let basis_aligned = (local_basis_size + simd_width - 1) & !(simd_width - 1);
+
+        // Calculate total weights with overflow checks BEFORE allocating
+        let total_weights = out_dim
+            .checked_mul(in_dim)
+            .and_then(|x| x.checked_mul(global_basis_size))
+            .ok_or_else(|| {
+                ArkanError::Overflow(format!(
+                    "weight count overflow: {} * {} * {}",
+                    out_dim, in_dim, global_basis_size
+                ))
+            })?;
+
+        // Check against practical limits (avoid OOM)
+        const MAX_WEIGHTS: usize = 1 << 30; // ~1 billion weights, ~4GB
+        if total_weights > MAX_WEIGHTS {
+            return Err(ArkanError::Overflow(format!(
+                "weight count {} exceeds maximum {}",
+                total_weights, MAX_WEIGHTS
+            )));
+        }
 
         let knots = compute_knots(grid_size, order, grid_range);
 
@@ -173,7 +212,6 @@ impl KanLayer {
         };
 
         // Initialize weights with small random values (Xavier-like)
-        let total_weights = out_dim * in_dim * global_basis_size;
         let scale = (2.0 / (in_dim + out_dim) as f32).sqrt() * 0.1;
         let mut rng: SmallRng = if let Some(seed) = config.init_seed {
             SmallRng::seed_from_u64(seed)
@@ -186,7 +224,7 @@ impl KanLayer {
 
         let bias = vec![0.0; out_dim];
 
-        Self {
+        Ok(Self {
             in_dim,
             out_dim,
             order,
@@ -201,11 +239,40 @@ impl KanLayer {
             weights,
             bias,
             simd_width,
-        }
+        })
+    }
+
+    /// Creates a new KAN layer with the given dimensions.
+    ///
+    /// Initializes weights using Xavier-like initialization scaled by 0.1.
+    /// Bias terms are initialized to zero.
+    ///
+    /// # Arguments
+    ///
+    /// * `in_dim` - Input dimension (must be positive)
+    /// * `out_dim` - Output dimension (must be positive)
+    /// * `config` - Network configuration containing spline parameters
+    ///
+    /// # Panics
+    ///
+    /// Panics if `in_dim` or `out_dim` is zero, or if weight count overflows.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanLayer};
+    ///
+    /// let config = KanConfig::preset();
+    /// let layer = KanLayer::new(10, 20, &config);
+    /// ```
+    #[must_use = "this creates a new layer without modifying anything"]
+    pub fn new(in_dim: usize, out_dim: usize, config: &KanConfig) -> Self {
+        Self::try_new(in_dim, out_dim, config).expect("KanLayer::new failed")
     }
 
     /// Creates layer from config (alias for [`new`](Self::new)).
     #[inline]
+    #[must_use]
     pub fn from_config(in_dim: usize, out_dim: usize, config: &KanConfig) -> Self {
         Self::new(in_dim, out_dim, config)
     }
@@ -380,6 +447,88 @@ impl KanLayer {
 
         // Accumulate outputs
         self.accumulate_batch(workspace, outputs, batch_size);
+    }
+
+    /// Forward pass for a single input sample (fallible version).
+    ///
+    /// This is the fallible version of [`forward_single`](Self::forward_single)
+    /// that validates buffer sizes and returns an error instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArkanError::ShapeMismatch`] if buffer sizes don't match expected dimensions.
+    #[inline]
+    pub fn try_forward_single(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        basis_buf: &mut [f32],
+    ) -> crate::ArkanResult<()> {
+        use crate::ArkanError;
+
+        if input.len() != self.in_dim {
+            return Err(ArkanError::shape_mismatch(
+                &[self.in_dim],
+                &[input.len()],
+            ));
+        }
+        if output.len() != self.out_dim {
+            return Err(ArkanError::shape_mismatch(
+                &[self.out_dim],
+                &[output.len()],
+            ));
+        }
+        if basis_buf.len() < self.basis_aligned {
+            return Err(ArkanError::shape_mismatch(
+                &[self.basis_aligned],
+                &[basis_buf.len()],
+            ));
+        }
+
+        self.forward_single(input, output, basis_buf);
+        Ok(())
+    }
+
+    /// Forward pass for a batch of samples (fallible version).
+    ///
+    /// This is the fallible version of [`forward_batch`](Self::forward_batch)
+    /// that validates buffer sizes and returns an error instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArkanError::ShapeMismatch`] if input/output sizes don't match expected dimensions.
+    #[inline]
+    pub fn try_forward_batch(
+        &self,
+        inputs: &[f32],
+        outputs: &mut [f32],
+        workspace: &mut Workspace,
+    ) -> crate::ArkanResult<()> {
+        use crate::ArkanError;
+
+        if inputs.is_empty() {
+            return Ok(());
+        }
+
+        if inputs.len() % self.in_dim != 0 {
+            return Err(ArkanError::shape_mismatch(
+                &[self.in_dim],
+                &[inputs.len()],
+            ));
+        }
+
+        let batch_size = inputs.len() / self.in_dim;
+        let expected_output_len = batch_size * self.out_dim;
+
+        if outputs.len() != expected_output_len {
+            return Err(ArkanError::shape_mismatch(
+                &[expected_output_len],
+                &[outputs.len()],
+            ));
+        }
+
+        self.forward_batch(inputs, outputs, workspace);
+        Ok(())
     }
 
     /// Accumulates outputs for a batch (internal helper).
@@ -853,5 +1002,147 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_try_new_success() {
+        let config = make_config(3, 5);
+        let result = KanLayer::try_new(4, 8, &config);
+        assert!(result.is_ok());
+        let layer = result.unwrap();
+        assert_eq!(layer.in_dim, 4);
+        assert_eq!(layer.out_dim, 8);
+    }
+
+    #[test]
+    fn test_try_new_zero_in_dim() {
+        let config = make_config(3, 5);
+        let result = KanLayer::try_new(0, 8, &config);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, crate::ArkanError::Config(_)));
+    }
+
+    #[test]
+    fn test_try_new_zero_out_dim() {
+        let config = make_config(3, 5);
+        let result = KanLayer::try_new(4, 0, &config);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, crate::ArkanError::Config(_)));
+    }
+
+    #[test]
+    fn test_try_new_overflow() {
+        let config = make_config(3, 5);
+        // Dimensions that would exceed MAX_WEIGHTS (~1 billion)
+        // 100_000 * 100_000 * 8 = 80 billion > MAX_WEIGHTS
+        let result = KanLayer::try_new(100_000, 100_000, &config);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, crate::ArkanError::Overflow(_)));
+    }
+
+    #[test]
+    fn test_try_new_multiplication_overflow() {
+        let config = make_config(3, 5);
+        // Extreme dimensions that overflow usize multiplication
+        let result = KanLayer::try_new(usize::MAX / 2, usize::MAX / 2, &config);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, crate::ArkanError::Overflow(_)));
+    }
+
+    #[test]
+    fn test_try_forward_single_success() {
+        let config = make_config(3, 5);
+        let layer = KanLayer::new(4, 8, &config);
+        let input = vec![0.1, 0.2, 0.3, 0.4];
+        let mut output = vec![0.0; 8];
+        let mut basis_buf = vec![0.0; layer.basis_aligned()];
+
+        let result = layer.try_forward_single(&input, &mut output, &mut basis_buf);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_forward_single_input_mismatch() {
+        let config = make_config(3, 5);
+        let layer = KanLayer::new(4, 8, &config);
+        let input = vec![0.1, 0.2, 0.3]; // Wrong size: 3 instead of 4
+        let mut output = vec![0.0; 8];
+        let mut basis_buf = vec![0.0; layer.basis_aligned()];
+
+        let result = layer.try_forward_single(&input, &mut output, &mut basis_buf);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::ArkanError::ShapeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_try_forward_single_output_mismatch() {
+        let config = make_config(3, 5);
+        let layer = KanLayer::new(4, 8, &config);
+        let input = vec![0.1, 0.2, 0.3, 0.4];
+        let mut output = vec![0.0; 5]; // Wrong size: 5 instead of 8
+        let mut basis_buf = vec![0.0; layer.basis_aligned()];
+
+        let result = layer.try_forward_single(&input, &mut output, &mut basis_buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_forward_batch_success() {
+        let config = make_config(3, 5);
+        let layer = KanLayer::new(4, 8, &config);
+        let mut workspace = crate::buffer::Workspace::new(&config);
+
+        let inputs = vec![0.1; 4 * 10]; // batch_size = 10
+        let mut outputs = vec![0.0; 8 * 10];
+
+        let result = layer.try_forward_batch(&inputs, &mut outputs, &mut workspace);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_forward_batch_input_not_divisible() {
+        let config = make_config(3, 5);
+        let layer = KanLayer::new(4, 8, &config);
+        let mut workspace = crate::buffer::Workspace::new(&config);
+
+        let inputs = vec![0.1; 4 * 10 + 1]; // Not divisible by in_dim
+        let mut outputs = vec![0.0; 8 * 10];
+
+        let result = layer.try_forward_batch(&inputs, &mut outputs, &mut workspace);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_forward_batch_output_mismatch() {
+        let config = make_config(3, 5);
+        let layer = KanLayer::new(4, 8, &config);
+        let mut workspace = crate::buffer::Workspace::new(&config);
+
+        let inputs = vec![0.1; 4 * 10];
+        let mut outputs = vec![0.0; 8 * 5]; // Wrong: expects 8*10
+
+        let result = layer.try_forward_batch(&inputs, &mut outputs, &mut workspace);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_forward_batch_empty() {
+        let config = make_config(3, 5);
+        let layer = KanLayer::new(4, 8, &config);
+        let mut workspace = crate::buffer::Workspace::new(&config);
+
+        let inputs: Vec<f32> = vec![];
+        let mut outputs: Vec<f32> = vec![];
+
+        // Empty input should return Ok
+        let result = layer.try_forward_batch(&inputs, &mut outputs, &mut workspace);
+        assert!(result.is_ok());
     }
 }

@@ -139,8 +139,14 @@ pub mod gpu;
 
 // Re-exports for convenience
 pub use baked::BakedModel;
-pub use buffer::{AlignedBuffer, Tensor, TensorView, Workspace, CACHE_LINE};
-pub use config::{ConfigError, KanConfig, LayerConfig, DEFAULT_GRID_SIZE, EPSILON};
+pub use buffer::{
+    checked_buffer_size, checked_buffer_size3, AlignedBuffer, Tensor, TensorView, Workspace,
+    WorkspaceGuard, CACHE_LINE, MAX_BUFFER_ELEMENTS,
+};
+pub use config::{
+    ConfigError, KanConfig, KanConfigBuilder, LayerConfig, DEFAULT_GRID_SIZE, EPSILON,
+    MAX_GPU_SPLINE_ORDER, MAX_SPLINE_ORDER, MIN_GPU_SPLINE_ORDER,
+};
 pub use error::{ArkanError, ArkanResult};
 pub use layer::KanLayer;
 pub use loss::{masked_cross_entropy, masked_mse, masked_softmax, poker_combined_loss, softmax};
