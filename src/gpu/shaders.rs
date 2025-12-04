@@ -1269,8 +1269,7 @@ const ACTIVE_BASIS_COUNT: u32 = 6u;
 /// Generates the basis derivative function for backward pass.
 fn generate_basis_derivative(order: usize) -> String {
     match order {
-        2 => {
-            r#"
+        2 => r#"
 // Quadratic B-spline derivatives (order=2)
 fn bspline_deriv(t: f32) -> vec3<f32> {
     let omt = 1.0 - t;
@@ -1287,10 +1286,8 @@ fn get_deriv_value(deriv: vec3<f32>, idx: u32) -> f32 {
     else { return deriv.z; }
 }
 "#
-            .to_string()
-        }
-        3 => {
-            r#"
+        .to_string(),
+        3 => r#"
 // Cubic B-spline derivatives (order=3)
 fn bspline_deriv(t: f32) -> vec4<f32> {
     let t2 = t * t;
@@ -1311,10 +1308,8 @@ fn get_deriv_value(deriv: vec4<f32>, idx: u32) -> f32 {
     else { return deriv.w; }
 }
 "#
-            .to_string()
-        }
-        4 => {
-            r#"
+        .to_string(),
+        4 => r#"
 // Quartic B-spline derivatives (order=4)
 fn bspline_deriv(t: f32) -> array<f32, 5> {
     let t2 = t * t;
@@ -1336,10 +1331,8 @@ fn get_deriv_value(deriv: array<f32, 5>, idx: u32) -> f32 {
     return deriv[idx];
 }
 "#
-            .to_string()
-        }
-        5 => {
-            r#"
+        .to_string(),
+        5 => r#"
 // Quintic B-spline derivatives (order=5)
 fn bspline_deriv(t: f32) -> array<f32, 6> {
     let t2 = t * t;
@@ -1364,8 +1357,7 @@ fn get_deriv_value(deriv: array<f32, 6>, idx: u32) -> f32 {
     return deriv[idx];
 }
 "#
-            .to_string()
-        }
+        .to_string(),
         _ => panic!("Unsupported spline order: {}", order),
     }
 }

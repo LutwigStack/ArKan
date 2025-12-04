@@ -25,7 +25,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::cell::RefCell;
 
 #[cfg(feature = "gpu")]
-use arkan::gpu::{GpuAdamConfig, GpuAdam, GpuNetwork, WgpuBackend, WgpuOptions};
+use arkan::gpu::{GpuAdam, GpuAdamConfig, GpuNetwork, WgpuBackend, WgpuOptions};
 #[cfg(feature = "gpu")]
 use arkan::optimizer::{Adam, AdamConfig, SGD};
 #[cfg(feature = "gpu")]

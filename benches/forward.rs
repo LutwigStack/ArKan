@@ -110,7 +110,11 @@ fn bench_try_overhead(c: &mut Criterion) {
     // Fallible version
     group.bench_function("try_forward_batch", |b| {
         b.iter(|| {
-            let _ = network.try_forward_batch(black_box(&inputs), black_box(&mut outputs), &mut workspace);
+            let _ = network.try_forward_batch(
+                black_box(&inputs),
+                black_box(&mut outputs),
+                &mut workspace,
+            );
         });
     });
 
@@ -139,5 +143,11 @@ fn bench_workspace_creation(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_forward, bench_train_step, bench_try_overhead, bench_workspace_creation);
+criterion_group!(
+    benches,
+    bench_forward,
+    bench_train_step,
+    bench_try_overhead,
+    bench_workspace_creation
+);
 criterion_main!(benches);

@@ -180,9 +180,9 @@ impl ArkanError {
 
     /// Creates a configuration error with a message.
     pub fn config_msg<S: AsRef<str>>(msg: S) -> Self {
-        ArkanError::Config(ConfigError::InvalidDimension(
-            Cow::Owned(msg.as_ref().to_string())
-        ))
+        ArkanError::Config(ConfigError::InvalidDimension(Cow::Owned(
+            msg.as_ref().to_string(),
+        )))
     }
 
     /// Creates an overflow error.
@@ -267,7 +267,9 @@ mod tests {
 
     #[test]
     fn test_config_error() {
-        let err = ArkanError::config(ConfigError::InvalidDimension(Cow::Borrowed("test dimension")));
+        let err = ArkanError::config(ConfigError::InvalidDimension(Cow::Borrowed(
+            "test dimension",
+        )));
         assert!(err.to_string().contains("Configuration error"));
     }
 }

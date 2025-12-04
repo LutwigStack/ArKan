@@ -784,7 +784,10 @@ impl PipelineCache {
 impl std::fmt::Debug for PipelineCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PipelineCache")
-            .field("forward_orders_cached", &self.forward_pipelines.keys().collect::<Vec<_>>())
+            .field(
+                "forward_orders_cached",
+                &self.forward_pipelines.keys().collect::<Vec<_>>(),
+            )
             .field("has_forward", &self.forward_pipeline.is_some())
             .field(
                 "has_forward_simple",

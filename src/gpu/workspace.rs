@@ -328,9 +328,10 @@ impl GpuWorkspace {
 
         // Allocate grad_output if needed (uses max_dim for intermediate gradient propagation)
         // Use map_or to avoid unwrap on Option
-        let needs_grad_output_realloc = self.grad_output.as_ref().map_or(true, |g| {
-            g.shape[0] < batch_size || g.shape[1] < max_dim
-        });
+        let needs_grad_output_realloc = self
+            .grad_output
+            .as_ref()
+            .map_or(true, |g| g.shape[0] < batch_size || g.shape[1] < max_dim);
         if needs_grad_output_realloc {
             self.grad_output = Some(GpuTensor::storage_read_write(
                 device,
@@ -340,9 +341,10 @@ impl GpuWorkspace {
         }
 
         // Allocate grad_input (max dim across layers for reuse)
-        let needs_grad_input_realloc = self.grad_input.as_ref().map_or(true, |g| {
-            g.shape[0] < batch_size
-        });
+        let needs_grad_input_realloc = self
+            .grad_input
+            .as_ref()
+            .map_or(true, |g| g.shape[0] < batch_size);
         if needs_grad_input_realloc {
             self.grad_input = Some(GpuTensor::storage_read_write(
                 device,
@@ -672,7 +674,9 @@ impl GpuWorkspace {
         {
             return self.cached_training_bind_groups[layer_idx]
                 .as_ref()
-                .ok_or_else(|| ArkanError::buffer("Cache inconsistency: expected training bind group"));
+                .ok_or_else(|| {
+                    ArkanError::buffer("Cache inconsistency: expected training bind group")
+                });
         }
 
         // Get buffers
@@ -746,7 +750,9 @@ impl GpuWorkspace {
         if self.cached_training_bind_groups[layer_idx].is_some() {
             return self.cached_training_bind_groups[layer_idx]
                 .as_ref()
-                .ok_or_else(|| ArkanError::buffer("Cache inconsistency: expected training layer bind group"));
+                .ok_or_else(|| {
+                    ArkanError::buffer("Cache inconsistency: expected training layer bind group")
+                });
         }
 
         // Determine input and output buffers (same routing as forward)

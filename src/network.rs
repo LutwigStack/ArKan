@@ -553,11 +553,7 @@ impl KanNetwork {
                 let layer = &self.layers[0];
                 let out_size = checked_buffer_size(batch_size, layer.out_dim)?;
                 buffer_a.try_resize(out_size)?;
-                layer.forward_batch(
-                    input,
-                    &mut buffer_a.as_mut_slice()[..out_size],
-                    workspace,
-                );
+                layer.forward_batch(input, &mut buffer_a.as_mut_slice()[..out_size], workspace);
             }
 
             let mut current_is_a = true;
@@ -717,8 +713,7 @@ impl KanNetwork {
                 );
 
                 // Save normalized inputs and grid indices for backward
-                let hist_in =
-                    &mut workspace.layers_inputs[layer_idx].as_mut_slice()[..in_size];
+                let hist_in = &mut workspace.layers_inputs[layer_idx].as_mut_slice()[..in_size];
                 hist_in.copy_from_slice(workspace.z_buffer.as_slice());
 
                 let hist_idx = &mut workspace.layers_grid_indices[layer_idx][..in_size];
@@ -1208,13 +1203,13 @@ impl KanNetwork {
 
         let mut bytes = Vec::new();
         // Magic bytes
-        bytes.write_all(SERIALIZATION_MAGIC).map_err(|e| {
-            bincode::Error::from(bincode::ErrorKind::Io(e))
-        })?;
+        bytes
+            .write_all(SERIALIZATION_MAGIC)
+            .map_err(|e| bincode::Error::from(bincode::ErrorKind::Io(e)))?;
         // Version
-        bytes.write_all(&SERIALIZATION_VERSION.to_le_bytes()).map_err(|e| {
-            bincode::Error::from(bincode::ErrorKind::Io(e))
-        })?;
+        bytes
+            .write_all(&SERIALIZATION_VERSION.to_le_bytes())
+            .map_err(|e| bincode::Error::from(bincode::ErrorKind::Io(e)))?;
         // Network data
         let network_bytes = bincode::serialize(self)?;
         bytes.extend(network_bytes);
@@ -1269,12 +1264,10 @@ impl KanNetwork {
         let version = u32::from_le_bytes(version_bytes);
 
         if version != SERIALIZATION_VERSION {
-            return Err(bincode::Error::from(bincode::ErrorKind::Custom(
-                format!(
-                    "Incompatible model version: expected {}, got {}",
-                    SERIALIZATION_VERSION, version
-                ),
-            )));
+            return Err(bincode::Error::from(bincode::ErrorKind::Custom(format!(
+                "Incompatible model version: expected {}, got {}",
+                SERIALIZATION_VERSION, version
+            ))));
         }
 
         // Deserialize network data
@@ -1665,7 +1658,10 @@ mod tests {
 
         let result = network.try_forward_batch(&input, &mut output, &mut workspace);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ArkanError::ShapeMismatch { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ArkanError::ShapeMismatch { .. }
+        ));
     }
 
     #[test]
@@ -1681,7 +1677,10 @@ mod tests {
 
         let result = network.try_forward_batch(&input, &mut output, &mut workspace);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ArkanError::ShapeMismatch { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ArkanError::ShapeMismatch { .. }
+        ));
     }
 
     #[test]
@@ -1712,7 +1711,10 @@ mod tests {
 
         let result = network.try_train_step(&input, &target, None, 0.001, &mut workspace);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ArkanError::ShapeMismatch { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ArkanError::ShapeMismatch { .. }
+        ));
     }
 
     #[test]
@@ -1728,7 +1730,10 @@ mod tests {
 
         let result = network.try_train_step(&input, &target, None, 0.001, &mut workspace);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ArkanError::ShapeMismatch { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ArkanError::ShapeMismatch { .. }
+        ));
     }
 
     #[test]
@@ -1745,7 +1750,10 @@ mod tests {
 
         let result = network.try_train_step(&input, &target, Some(&mask), 0.001, &mut workspace);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ArkanError::ShapeMismatch { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ArkanError::ShapeMismatch { .. }
+        ));
     }
 
     // ==================== Edge-case tests ====================
@@ -1940,12 +1948,12 @@ mod tests {
         // Create a very large input that would overflow
         // Using a calculation that would exceed MAX_BUFFER_ELEMENTS
         let _huge_batch = usize::MAX / 4;
-        
+
         // We can't actually allocate this, but try_forward_batch should
         // return an error before trying to allocate
         let small_input = vec![0.5f32; config.input_dim]; // batch=1
         let mut small_output = vec![0.0f32; config.output_dim];
-        
+
         // This should succeed
         let result = network.try_forward_batch(&small_input, &mut small_output, &mut workspace);
         assert!(result.is_ok());
@@ -1955,7 +1963,7 @@ mod tests {
     fn test_try_train_step_overflow() {
         // Overflow in train step should return error
         use crate::buffer::checked_buffer_size;
-        
+
         // This tests the overflow detection logic
         let result = checked_buffer_size(usize::MAX, 2);
         assert!(result.is_err());
@@ -2020,7 +2028,9 @@ mod tests {
         invalid_bytes[5..9].copy_from_slice(&99u32.to_le_bytes()); // Wrong version (99)
 
         let result = KanNetwork::from_bytes(&invalid_bytes);
-        let err = result.err().expect("Expected error for incompatible version");
+        let err = result
+            .err()
+            .expect("Expected error for incompatible version");
 
         let err_msg = format!("{}", err);
         assert!(

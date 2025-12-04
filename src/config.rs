@@ -334,10 +334,14 @@ impl KanConfig {
     #[must_use]
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.input_dim == 0 {
-            return Err(ConfigError::InvalidDimension(Cow::Borrowed("input_dim must be > 0")));
+            return Err(ConfigError::InvalidDimension(Cow::Borrowed(
+                "input_dim must be > 0",
+            )));
         }
         if self.output_dim == 0 {
-            return Err(ConfigError::InvalidDimension(Cow::Borrowed("output_dim must be > 0")));
+            return Err(ConfigError::InvalidDimension(Cow::Borrowed(
+                "output_dim must be > 0",
+            )));
         }
         if self.grid_size == 0 || self.grid_size > 16 {
             return Err(ConfigError::InvalidGridSize(self.grid_size));
@@ -614,10 +618,14 @@ impl KanConfigBuilder {
     pub fn build(self) -> Result<KanConfig, ConfigError> {
         let input_dim = self
             .input_dim
-            .ok_or(ConfigError::InvalidDimension(Cow::Borrowed("input_dim not set")))?;
+            .ok_or(ConfigError::InvalidDimension(Cow::Borrowed(
+                "input_dim not set",
+            )))?;
         let output_dim = self
             .output_dim
-            .ok_or(ConfigError::InvalidDimension(Cow::Borrowed("output_dim not set")))?;
+            .ok_or(ConfigError::InvalidDimension(Cow::Borrowed(
+                "output_dim not set",
+            )))?;
 
         let input_mean = self.input_mean.unwrap_or_else(|| vec![0.0; input_dim]);
         let input_std = self
@@ -727,17 +735,13 @@ mod tests {
 
     #[test]
     fn test_builder_missing_input_dim() {
-        let result = KanConfig::builder()
-            .output_dim(5)
-            .build();
+        let result = KanConfig::builder().output_dim(5).build();
         assert!(result.is_err());
     }
 
     #[test]
     fn test_builder_missing_output_dim() {
-        let result = KanConfig::builder()
-            .input_dim(10)
-            .build();
+        let result = KanConfig::builder().input_dim(10).build();
         assert!(result.is_err());
     }
 

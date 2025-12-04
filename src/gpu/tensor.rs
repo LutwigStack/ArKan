@@ -221,11 +221,7 @@ impl GpuTensor {
     /// # Errors
     ///
     /// Returns `ArkanError::BatchTooLarge` if the data size exceeds `MAX_VRAM_ALLOC`.
-    pub fn storage_rw(
-        device: &wgpu::Device,
-        data: &[f32],
-        shape: Vec<usize>,
-    ) -> ArkanResult<Self> {
+    pub fn storage_rw(device: &wgpu::Device, data: &[f32], shape: Vec<usize>) -> ArkanResult<Self> {
         let expected_len: usize = shape.iter().product();
         if data.len() != expected_len {
             let got_shape = infer_got_shape(data.len(), &shape);
@@ -594,11 +590,11 @@ mod tests {
     #[test]
     fn test_exceeds_vram_limit() {
         use crate::gpu::MAX_VRAM_ALLOC;
-        
+
         // Below limit
         assert!(!exceeds_vram_limit(1024));
         assert!(!exceeds_vram_limit(MAX_VRAM_ALLOC));
-        
+
         // Above limit
         assert!(exceeds_vram_limit(MAX_VRAM_ALLOC + 1));
     }

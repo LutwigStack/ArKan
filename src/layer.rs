@@ -487,16 +487,10 @@ impl KanLayer {
         use crate::ArkanError;
 
         if input.len() != self.in_dim {
-            return Err(ArkanError::shape_mismatch(
-                &[self.in_dim],
-                &[input.len()],
-            ));
+            return Err(ArkanError::shape_mismatch(&[self.in_dim], &[input.len()]));
         }
         if output.len() != self.out_dim {
-            return Err(ArkanError::shape_mismatch(
-                &[self.out_dim],
-                &[output.len()],
-            ));
+            return Err(ArkanError::shape_mismatch(&[self.out_dim], &[output.len()]));
         }
         if basis_buf.len() < self.basis_aligned {
             return Err(ArkanError::shape_mismatch(
@@ -524,18 +518,15 @@ impl KanLayer {
         outputs: &mut [f32],
         workspace: &mut Workspace,
     ) -> crate::ArkanResult<()> {
-        use crate::ArkanError;
         use crate::buffer::checked_buffer_size;
+        use crate::ArkanError;
 
         if inputs.is_empty() {
             return Ok(());
         }
 
         if inputs.len() % self.in_dim != 0 {
-            return Err(ArkanError::shape_mismatch(
-                &[self.in_dim],
-                &[inputs.len()],
-            ));
+            return Err(ArkanError::shape_mismatch(&[self.in_dim], &[inputs.len()]));
         }
 
         let batch_size = inputs.len() / self.in_dim;

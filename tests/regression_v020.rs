@@ -106,7 +106,10 @@ fn test_workspace_wide_hidden_layer() {
 
     // This should not panic due to undersized workspace
     let result = network.try_forward_batch(&input, &mut output, &mut workspace);
-    assert!(result.is_ok(), "Forward pass should succeed with wide hidden layer");
+    assert!(
+        result.is_ok(),
+        "Forward pass should succeed with wide hidden layer"
+    );
 }
 
 #[test]
@@ -184,7 +187,11 @@ fn test_workspace_prepare_idempotent() {
     // Multiple prepares should be fine
     for batch_size in [1, 10, 1, 100, 1] {
         let result = workspace.try_prepare_forward(batch_size, &config);
-        assert!(result.is_ok(), "Prepare should succeed for batch_size={}", batch_size);
+        assert!(
+            result.is_ok(),
+            "Prepare should succeed for batch_size={}",
+            batch_size
+        );
     }
 }
 
@@ -473,7 +480,11 @@ fn test_p1_zero_alloc_inference_path() {
         let mut output = vec![0.0f32; config.output_dim * batch_size];
 
         let result = network.try_forward_batch(&input, &mut output, &mut workspace);
-        assert!(result.is_ok(), "Batch {} should succeed with pre-sized workspace", batch_size);
+        assert!(
+            result.is_ok(),
+            "Batch {} should succeed with pre-sized workspace",
+            batch_size
+        );
     }
 }
 
@@ -509,7 +520,10 @@ fn test_p0_config_validation_safety() {
         hidden_dims: vec![0], // Invalid!
         ..Default::default()
     };
-    assert!(config.validate().is_err(), "Zero hidden dim should be invalid");
+    assert!(
+        config.validate().is_err(),
+        "Zero hidden dim should be invalid"
+    );
 
     // Mismatched normalization vectors
     let config = KanConfig {
@@ -519,7 +533,10 @@ fn test_p0_config_validation_safety() {
         input_std: vec![1.0; 10],
         ..Default::default()
     };
-    assert!(config.validate().is_err(), "Mismatched input_mean should be invalid");
+    assert!(
+        config.validate().is_err(),
+        "Mismatched input_mean should be invalid"
+    );
 
     // Zero/negative std - now warns but succeeds (values will be clamped to EPSILON)
     let config = KanConfig {
@@ -530,7 +547,10 @@ fn test_p0_config_validation_safety() {
         ..Default::default()
     };
     // Should succeed with warning, not error
-    assert!(config.validate().is_ok(), "Zero input_std should warn but not fail");
+    assert!(
+        config.validate().is_ok(),
+        "Zero input_std should warn but not fail"
+    );
 
     // Negative std also warns but succeeds
     let config = KanConfig {
@@ -540,7 +560,10 @@ fn test_p0_config_validation_safety() {
         input_std: vec![-1.0, 1.0], // Negative - will be clamped
         ..Default::default()
     };
-    assert!(config.validate().is_ok(), "Negative input_std should warn but not fail");
+    assert!(
+        config.validate().is_ok(),
+        "Negative input_std should warn but not fail"
+    );
 }
 
 /// P1: Grid size edge cases

@@ -71,7 +71,6 @@ pub struct GpuLayer {
 
     // ==================== Training Buffers ====================
     // These are allocated on-demand when init_training() is called.
-
     /// Gradient buffer for weights (same layout as weights).
     /// `None` until `init_training()` is called.
     pub grad_weights: Option<GpuTensor>,
@@ -369,14 +368,17 @@ impl GpuLayer {
                 &grad_weights_zeros,
                 vec![self.out_dim * self.in_dim * self.basis_vec4s * 4],
             )
-            .map_err(|e| ArkanError::buffer(format!("Failed to create grad_weights buffer: {}", e)))?,
+            .map_err(|e| {
+                ArkanError::buffer(format!("Failed to create grad_weights buffer: {}", e))
+            })?,
         );
 
         // Gradient for bias
         let grad_bias_zeros = vec![0.0f32; self.out_dim];
         self.grad_bias = Some(
-            GpuTensor::storage_rw(device, &grad_bias_zeros, vec![self.out_dim])
-                .map_err(|e| ArkanError::buffer(format!("Failed to create grad_bias buffer: {}", e)))?,
+            GpuTensor::storage_rw(device, &grad_bias_zeros, vec![self.out_dim]).map_err(|e| {
+                ArkanError::buffer(format!("Failed to create grad_bias buffer: {}", e))
+            })?,
         );
 
         Ok(())
@@ -425,7 +427,11 @@ impl GpuLayer {
         Ok(&self
             .grad_weights
             .as_ref()
-            .ok_or_else(|| ArkanError::invalid_workspace("Training not initialized. Call init_training() first."))?
+            .ok_or_else(|| {
+                ArkanError::invalid_workspace(
+                    "Training not initialized. Call init_training() first.",
+                )
+            })?
             .buffer)
     }
 
@@ -440,7 +446,11 @@ impl GpuLayer {
         Ok(&self
             .grad_bias
             .as_ref()
-            .ok_or_else(|| ArkanError::invalid_workspace("Training not initialized. Call init_training() first."))?
+            .ok_or_else(|| {
+                ArkanError::invalid_workspace(
+                    "Training not initialized. Call init_training() first.",
+                )
+            })?
             .buffer)
     }
 

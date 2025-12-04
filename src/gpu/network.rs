@@ -188,10 +188,11 @@ impl GpuNetwork {
         };
 
         // Compile forward pipeline for current spline order
-        if self.pipeline_cache.get_forward_pipeline_for_order(
-            &first_layer.bind_group_layout,
-            self.spline_order,
-        ).is_ok() {
+        if self
+            .pipeline_cache
+            .get_forward_pipeline_for_order(&first_layer.bind_group_layout, self.spline_order)
+            .is_ok()
+        {
             compiled += 1;
         }
 
@@ -253,7 +254,9 @@ impl GpuNetwork {
     /// Returns true if training buffers are initialized.
     #[inline]
     pub fn is_training_initialized(&self) -> bool {
-        self.layers.first().map_or(true, |l| l.is_training_initialized())
+        self.layers
+            .first()
+            .map_or(true, |l| l.is_training_initialized())
     }
 
     /// Zeros all gradient buffers.
@@ -835,10 +838,9 @@ impl GpuNetwork {
 
         // Get or create pipeline
         let bind_group_layout = &layer.bind_group_layout;
-        let pipeline = self.pipeline_cache.get_forward_training_pipeline_for_order(
-            bind_group_layout,
-            self.spline_order,
-        )?;
+        let pipeline = self
+            .pipeline_cache
+            .get_forward_training_pipeline_for_order(bind_group_layout, self.spline_order)?;
 
         // Create training bind group for this layer's I/O
         let training_bg = workspace.get_or_create_training_layer_bind_group(
@@ -1032,7 +1034,7 @@ impl GpuNetwork {
         );
 
         // Create backward workspace bind group (Group 1)
-        // SAFETY: We need to extend the lifetime of backward_workspace_layout to use it 
+        // SAFETY: We need to extend the lifetime of backward_workspace_layout to use it
         // after mutable borrows of self. This is safe because:
         // 1. backward_workspace_layout is stored in pipeline_cache and never deallocated
         // 2. The underlying wgpu::BindGroupLayout is immutable once created
