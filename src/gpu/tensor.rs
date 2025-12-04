@@ -543,5 +543,63 @@ impl GpuTensor {
 
 #[cfg(test)]
 mod tests {
-    // Tests require GPU device, run with: cargo test --features gpu -- --ignored
+    use super::*;
+
+    #[test]
+    fn test_infer_got_shape_exact() {
+        // When data fits perfectly into shape dimensions
+        let shape = vec![4, 8];
+        let got = infer_got_shape(32, &shape); // 32 = 4 * 8
+        assert_eq!(got, vec![4, 8]);
+    }
+
+    #[test]
+    fn test_infer_got_shape_short() {
+        // When data is shorter than expected
+        let shape = vec![4, 8];
+        let got = infer_got_shape(24, &shape); // 24 < 32
+        assert_eq!(got, vec![3, 8]); // 24 / 8 = 3
+    }
+
+    #[test]
+    fn test_infer_got_shape_long() {
+        // When data is longer than expected
+        let shape = vec![4, 8];
+        let got = infer_got_shape(40, &shape); // 40 > 32
+        assert_eq!(got, vec![5, 8]); // 40 / 8 = 5
+    }
+
+    #[test]
+    fn test_infer_got_shape_not_divisible() {
+        // When data length is not divisible by last dimension
+        let shape = vec![4, 8];
+        let got = infer_got_shape(25, &shape); // 25 not divisible by 8
+        assert_eq!(got, vec![25]); // Falls back to [len]
+    }
+
+    #[test]
+    fn test_infer_got_shape_scalar() {
+        let shape = vec![1];
+        let got = infer_got_shape(1, &shape);
+        assert_eq!(got, vec![1]);
+    }
+
+    #[test]
+    fn test_infer_got_shape_empty() {
+        let shape = vec![4, 8];
+        let got = infer_got_shape(0, &shape);
+        assert_eq!(got, vec![0, 8]);
+    }
+
+    #[test]
+    fn test_exceeds_vram_limit() {
+        use crate::gpu::MAX_VRAM_ALLOC;
+        
+        // Below limit
+        assert!(!exceeds_vram_limit(1024));
+        assert!(!exceeds_vram_limit(MAX_VRAM_ALLOC));
+        
+        // Above limit
+        assert!(exceeds_vram_limit(MAX_VRAM_ALLOC + 1));
+    }
 }
