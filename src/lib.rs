@@ -28,6 +28,11 @@
 //! // Preallocate workspace (reuse across calls for zero-alloc)
 //! let mut workspace = network.create_workspace(64);
 //!
+
+// Allow manual divisibility checks (x % y == 0) - is_multiple_of is nightly-only
+// This lint may not exist in older clippy versions, so we allow unknown lints
+#![allow(unknown_lints)]
+#![allow(clippy::manual_is_multiple_of)]
 //! // Single inference (~30 µs)
 //! let input = vec![0.5f32; config.input_dim];
 //! let mut output = vec![0.0f32; config.output_dim];
@@ -121,7 +126,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
-#![doc(html_root_url = "https://docs.rs/arkan/0.2.0")]
+#![doc(html_root_url = "https://docs.rs/arkan/0.3.0")]
 
 pub mod baked;
 pub mod buffer;
@@ -138,9 +143,16 @@ pub mod spline;
 pub mod gpu;
 
 // Re-exports for convenience
+#[allow(deprecated)]
 pub use baked::BakedModel;
-pub use buffer::{AlignedBuffer, Tensor, TensorView, Workspace, CACHE_LINE};
-pub use config::{ConfigError, KanConfig, LayerConfig, DEFAULT_GRID_SIZE, EPSILON};
+pub use buffer::{
+    checked_buffer_size, checked_buffer_size3, AlignedBuffer, Tensor, TensorView, Workspace,
+    WorkspaceGuard, CACHE_LINE, MAX_BUFFER_ELEMENTS,
+};
+pub use config::{
+    ConfigError, KanConfig, KanConfigBuilder, LayerConfig, DEFAULT_GRID_SIZE, EPSILON,
+    MAX_GPU_SPLINE_ORDER, MAX_SPLINE_ORDER, MIN_GPU_SPLINE_ORDER,
+};
 pub use error::{ArkanError, ArkanResult};
 pub use layer::KanLayer;
 pub use loss::{masked_cross_entropy, masked_mse, masked_softmax, poker_combined_loss, softmax};

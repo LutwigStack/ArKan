@@ -39,16 +39,21 @@ fn infer_got_shape(data_len: usize, expected_shape: &[usize]) -> Vec<usize> {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use arkan::gpu::GpuTensor;
+/// ```rust,no_run
+/// use arkan::gpu::{GpuTensor, WgpuBackend, WgpuOptions};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let backend = WgpuBackend::init(WgpuOptions::default())?;
 ///
 /// // Create a tensor from CPU data
 /// let data = vec![1.0f32, 2.0, 3.0, 4.0];
-/// let tensor = GpuTensor::upload(&device, &queue, &data, vec![2, 2])?;
+/// let tensor = GpuTensor::upload(&backend.device, &backend.queue, &data, vec![2, 2])?;
 ///
 /// // Download data back to CPU
-/// let result = tensor.download(&device, &queue)?;
+/// let result = tensor.download(&backend.device, &backend.queue)?;
 /// assert_eq!(result, data);
+/// # Ok(())
+/// # }
 /// ```
 pub struct GpuTensor {
     /// The underlying wgpu buffer.
@@ -92,7 +97,7 @@ impl GpuTensor {
             });
         }
 
-        let size_bytes = (data.len() * std::mem::size_of::<f32>()) as u64;
+        let size_bytes = std::mem::size_of_val(data) as u64;
 
         if exceeds_vram_limit(size_bytes) {
             return Err(ArkanError::batch_too_large(
@@ -179,7 +184,7 @@ impl GpuTensor {
             });
         }
 
-        let size_bytes = (data.len() * std::mem::size_of::<f32>()) as u64;
+        let size_bytes = std::mem::size_of_val(data) as u64;
 
         if exceeds_vram_limit(size_bytes) {
             return Err(ArkanError::batch_too_large(
@@ -206,6 +211,48 @@ impl GpuTensor {
     /// Creates a GPU tensor for use as storage (read-write in shaders).
     pub fn storage_read_write(device: &wgpu::Device, shape: Vec<usize>) -> ArkanResult<Self> {
         Self::uninit(device, shape, wgpu::BufferUsages::empty())
+    }
+
+    /// Creates a GPU tensor for use as read-write storage, initialized with data.
+    ///
+    /// This is useful for gradient buffers that need to be both read and written
+    /// by compute shaders, and initialized with zeros.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ArkanError::BatchTooLarge` if the data size exceeds `MAX_VRAM_ALLOC`.
+    pub fn storage_rw(device: &wgpu::Device, data: &[f32], shape: Vec<usize>) -> ArkanResult<Self> {
+        let expected_len: usize = shape.iter().product();
+        if data.len() != expected_len {
+            let got_shape = infer_got_shape(data.len(), &shape);
+            return Err(ArkanError::ShapeMismatch {
+                expected: shape,
+                got: got_shape,
+            });
+        }
+
+        let size_bytes = std::mem::size_of_val(data) as u64;
+
+        if exceeds_vram_limit(size_bytes) {
+            return Err(ArkanError::batch_too_large(
+                data.len(),
+                (MAX_VRAM_ALLOC / std::mem::size_of::<f32>() as u64) as usize,
+            ));
+        }
+
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("GpuTensor (storage rw)"),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        Ok(Self {
+            buffer,
+            shape,
+            capacity_bytes: size_bytes,
+        })
     }
 
     /// Downloads tensor data from GPU to CPU.
@@ -376,14 +423,19 @@ impl std::fmt::Debug for GpuTensor {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use arkan::gpu::{GpuTensor, GpuTensorView};
+/// ```rust,no_run
+/// use arkan::gpu::{GpuTensor, GpuTensorView, WgpuBackend, WgpuOptions};
 ///
-/// let tensor = GpuTensor::upload(&device, &queue, &data, vec![batch, features])?;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let backend = WgpuBackend::init(WgpuOptions::default())?;
+/// let data = vec![1.0f32; 64];
+/// let tensor = GpuTensor::upload(&backend.device, &backend.queue, &data, vec![8, 8])?;
 /// let view = tensor.view();
 ///
 /// // Use view in bind group
 /// let binding = view.as_entire_binding();
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct GpuTensorView<'a> {
@@ -487,5 +539,63 @@ impl GpuTensor {
 
 #[cfg(test)]
 mod tests {
-    // Tests require GPU device, run with: cargo test --features gpu -- --ignored
+    use super::*;
+
+    #[test]
+    fn test_infer_got_shape_exact() {
+        // When data fits perfectly into shape dimensions
+        let shape = vec![4, 8];
+        let got = infer_got_shape(32, &shape); // 32 = 4 * 8
+        assert_eq!(got, vec![4, 8]);
+    }
+
+    #[test]
+    fn test_infer_got_shape_short() {
+        // When data is shorter than expected
+        let shape = vec![4, 8];
+        let got = infer_got_shape(24, &shape); // 24 < 32
+        assert_eq!(got, vec![3, 8]); // 24 / 8 = 3
+    }
+
+    #[test]
+    fn test_infer_got_shape_long() {
+        // When data is longer than expected
+        let shape = vec![4, 8];
+        let got = infer_got_shape(40, &shape); // 40 > 32
+        assert_eq!(got, vec![5, 8]); // 40 / 8 = 5
+    }
+
+    #[test]
+    fn test_infer_got_shape_not_divisible() {
+        // When data length is not divisible by last dimension
+        let shape = vec![4, 8];
+        let got = infer_got_shape(25, &shape); // 25 not divisible by 8
+        assert_eq!(got, vec![25]); // Falls back to [len]
+    }
+
+    #[test]
+    fn test_infer_got_shape_scalar() {
+        let shape = vec![1];
+        let got = infer_got_shape(1, &shape);
+        assert_eq!(got, vec![1]);
+    }
+
+    #[test]
+    fn test_infer_got_shape_empty() {
+        let shape = vec![4, 8];
+        let got = infer_got_shape(0, &shape);
+        assert_eq!(got, vec![0, 8]);
+    }
+
+    #[test]
+    fn test_exceeds_vram_limit() {
+        use crate::gpu::MAX_VRAM_ALLOC;
+
+        // Below limit
+        assert!(!exceeds_vram_limit(1024));
+        assert!(!exceeds_vram_limit(MAX_VRAM_ALLOC));
+
+        // Above limit
+        assert!(exceeds_vram_limit(MAX_VRAM_ALLOC + 1));
+    }
 }

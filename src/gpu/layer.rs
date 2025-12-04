@@ -30,6 +30,15 @@ use wgpu::util::DeviceExt;
 /// - Total vec4 count = out_dim * in_dim * basis_vec4s
 /// - basis_vec4s = ceil(basis_padded / 4)
 /// - Each vec4 contains 4 consecutive basis weights
+///
+/// # Training Support
+///
+/// When `init_training()` is called, gradient buffers are allocated:
+/// - `grad_weights`: accumulated gradients for weights
+/// - `grad_bias`: accumulated gradients for bias
+///
+/// These buffers are used by GPU-native optimizers ([`GpuAdam`], [`GpuSgd`])
+/// to update weights entirely on GPU without CPU transfers.
 pub struct GpuLayer {
     /// Weight tensor [out_dim, in_dim, basis_vec4s] stored as vec4.
     pub weights: GpuTensor,
@@ -59,6 +68,15 @@ pub struct GpuLayer {
     pub bind_group: wgpu::BindGroup,
     /// Bind group layout for static resources.
     pub bind_group_layout: wgpu::BindGroupLayout,
+
+    // ==================== Training Buffers ====================
+    // These are allocated on-demand when init_training() is called.
+    /// Gradient buffer for weights (same layout as weights).
+    /// `None` until `init_training()` is called.
+    pub grad_weights: Option<GpuTensor>,
+    /// Gradient buffer for bias.
+    /// `None` until `init_training()` is called.
+    pub grad_bias: Option<GpuTensor>,
 }
 
 impl GpuLayer {
@@ -86,7 +104,7 @@ impl GpuLayer {
         let order = cpu_layer.order;
         let global_basis_size = cpu_layer.global_basis_size;
         let basis_padded = pad_to_vec4(global_basis_size);
-        let basis_vec4s = (basis_padded + 3) / 4; // ceil division
+        let basis_vec4s = basis_padded.div_ceil(4); // ceil division
 
         // Pack weights into vec4 format
         // Each vec4 contains 4 consecutive basis weights
@@ -161,6 +179,8 @@ impl GpuLayer {
             basis_vec4s,
             bind_group,
             bind_group_layout,
+            grad_weights: None,
+            grad_bias: None,
         })
     }
 
@@ -308,6 +328,130 @@ impl GpuLayer {
     /// Returns the total parameter count.
     pub fn param_count(&self) -> usize {
         self.weight_count() + self.bias_count()
+    }
+
+    /// Returns the GPU memory used by weights in bytes.
+    pub fn weights_bytes(&self) -> usize {
+        self.weight_count() * std::mem::size_of::<f32>()
+    }
+
+    /// Returns the GPU memory used by bias in bytes.
+    pub fn bias_bytes(&self) -> usize {
+        self.bias_count() * std::mem::size_of::<f32>()
+    }
+
+    // ==================== Training Support ====================
+
+    /// Initializes gradient buffers for training.
+    ///
+    /// Call this once before using GPU-native training. Allocates:
+    /// - `grad_weights`: same size as weights buffer
+    /// - `grad_bias`: same size as bias buffer
+    ///
+    /// These buffers are used by [`GpuAdam`] and [`GpuSgd`] optimizers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArkanError::BufferError`] if buffer creation fails.
+    pub fn init_training(&mut self, device: &wgpu::Device) -> crate::ArkanResult<()> {
+        use crate::ArkanError;
+
+        if self.grad_weights.is_some() {
+            return Ok(()); // Already initialized
+        }
+
+        // Gradient for weights (same layout as weights: vec4 packed)
+        let grad_weights_zeros = vec![0.0f32; self.weight_count()];
+        self.grad_weights = Some(
+            GpuTensor::storage_rw(
+                device,
+                &grad_weights_zeros,
+                vec![self.out_dim * self.in_dim * self.basis_vec4s * 4],
+            )
+            .map_err(|e| {
+                ArkanError::buffer(format!("Failed to create grad_weights buffer: {}", e))
+            })?,
+        );
+
+        // Gradient for bias
+        let grad_bias_zeros = vec![0.0f32; self.out_dim];
+        self.grad_bias = Some(
+            GpuTensor::storage_rw(device, &grad_bias_zeros, vec![self.out_dim]).map_err(|e| {
+                ArkanError::buffer(format!("Failed to create grad_bias buffer: {}", e))
+            })?,
+        );
+
+        Ok(())
+    }
+
+    /// Returns true if training buffers are initialized.
+    #[inline]
+    pub fn is_training_initialized(&self) -> bool {
+        self.grad_weights.is_some()
+    }
+
+    /// Zeros the gradient buffers.
+    ///
+    /// Call this at the start of each training step before backward pass.
+    pub fn zero_grads(&self, queue: &wgpu::Queue) {
+        if let Some(ref gw) = self.grad_weights {
+            let zeros = vec![0.0f32; self.weight_count()];
+            gw.update(queue, &zeros);
+        }
+        if let Some(ref gb) = self.grad_bias {
+            let zeros = vec![0.0f32; self.out_dim];
+            gb.update(queue, &zeros);
+        }
+    }
+
+    /// Returns the weight buffer reference (for optimizer).
+    #[inline]
+    pub fn weights_buffer(&self) -> &wgpu::Buffer {
+        &self.weights.buffer
+    }
+
+    /// Returns the bias buffer reference (for optimizer).
+    #[inline]
+    pub fn bias_buffer(&self) -> &wgpu::Buffer {
+        &self.bias.buffer
+    }
+
+    /// Returns the grad_weights buffer reference (for optimizer).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArkanError::InvalidWorkspace`] if training is not initialized.
+    #[inline]
+    pub fn grad_weights_buffer(&self) -> crate::ArkanResult<&wgpu::Buffer> {
+        use crate::ArkanError;
+        Ok(&self
+            .grad_weights
+            .as_ref()
+            .ok_or_else(|| {
+                ArkanError::invalid_workspace(
+                    "Training not initialized. Call init_training() first.",
+                )
+            })?
+            .buffer)
+    }
+
+    /// Returns the grad_bias buffer reference (for optimizer).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArkanError::InvalidWorkspace`] if training is not initialized.
+    #[inline]
+    pub fn grad_bias_buffer(&self) -> crate::ArkanResult<&wgpu::Buffer> {
+        use crate::ArkanError;
+        Ok(&self
+            .grad_bias
+            .as_ref()
+            .ok_or_else(|| {
+                ArkanError::invalid_workspace(
+                    "Training not initialized. Call init_training() first.",
+                )
+            })?
+            .buffer)
     }
 
     // ==================== Backward Pass Support ====================

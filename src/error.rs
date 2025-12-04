@@ -20,7 +20,11 @@
 //! }
 //! ```
 
+use std::borrow::Cow;
+
 use thiserror::Error;
+
+use crate::config::ConfigError;
 
 /// Unified error type for ArKan operations.
 ///
@@ -108,11 +112,43 @@ pub enum ArkanError {
 
     /// Configuration error.
     #[error("Configuration error: {0}")]
-    Config(String),
+    Config(#[from] ConfigError),
+
+    /// Integer overflow in size calculations.
+    ///
+    /// This occurs when buffer size calculations overflow usize,
+    /// typically with very large batch sizes or dimensions.
+    #[error("Integer overflow: {0}")]
+    Overflow(String),
+
+    /// Workspace is in an invalid state.
+    ///
+    /// This can occur if a previous operation panicked and left
+    /// the workspace in an inconsistent state.
+    #[error("Invalid workspace state: {0}")]
+    InvalidWorkspace(String),
+
+    /// Unsupported spline order for GPU.
+    ///
+    /// GPU shaders only support spline orders 2-5.
+    #[cfg(feature = "gpu")]
+    #[error("Unsupported spline order {0}: GPU supports orders 2-5")]
+    UnsupportedOrder(usize),
 
     /// I/O error during model save/load operations.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Incompatible model version.
+    ///
+    /// The serialized model was created with an incompatible version.
+    #[error("Incompatible model version: expected {expected}, got {got}")]
+    IncompatibleVersion {
+        /// Expected version.
+        expected: u32,
+        /// Actual version found.
+        got: u32,
+    },
 }
 
 /// Result type alias for ArKan operations.
@@ -137,9 +173,37 @@ impl ArkanError {
         ArkanError::BatchTooLarge(requested, limit)
     }
 
-    /// Creates a configuration error.
-    pub fn config<S: Into<String>>(msg: S) -> Self {
-        ArkanError::Config(msg.into())
+    /// Creates a configuration error from a ConfigError.
+    pub fn config(err: ConfigError) -> Self {
+        ArkanError::Config(err)
+    }
+
+    /// Creates a configuration error with a message.
+    pub fn config_msg<S: AsRef<str>>(msg: S) -> Self {
+        ArkanError::Config(ConfigError::InvalidDimension(Cow::Owned(
+            msg.as_ref().to_string(),
+        )))
+    }
+
+    /// Creates an overflow error.
+    pub fn overflow<S: Into<String>>(msg: S) -> Self {
+        ArkanError::Overflow(msg.into())
+    }
+
+    /// Creates an invalid workspace error.
+    pub fn invalid_workspace<S: Into<String>>(msg: S) -> Self {
+        ArkanError::InvalidWorkspace(msg.into())
+    }
+
+    /// Creates an incompatible version error.
+    pub fn incompatible_version(expected: u32, got: u32) -> Self {
+        ArkanError::IncompatibleVersion { expected, got }
+    }
+
+    /// Creates an unsupported order error (GPU only).
+    #[cfg(feature = "gpu")]
+    pub fn unsupported_order(order: usize) -> Self {
+        ArkanError::UnsupportedOrder(order)
     }
 
     /// Creates a GPU validation error.
@@ -203,7 +267,9 @@ mod tests {
 
     #[test]
     fn test_config_error() {
-        let err = ArkanError::config("invalid config");
+        let err = ArkanError::config(ConfigError::InvalidDimension(Cow::Borrowed(
+            "test dimension",
+        )));
         assert!(err.to_string().contains("Configuration error"));
     }
 }

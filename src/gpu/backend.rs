@@ -92,11 +92,14 @@ impl WgpuOptions {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use arkan::gpu::{WgpuBackend, WgpuOptions};
 ///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let backend = WgpuBackend::init(WgpuOptions::default())?;
 /// println!("Using GPU: {}", backend.adapter_info().name);
+/// # Ok(())
+/// # }
 /// ```
 pub struct WgpuBackend {
     /// The wgpu instance.
@@ -317,7 +320,7 @@ impl WgpuBackend {
     ) -> ArkanResult<()> {
         // Calculate padded GPU buffer size (same as GpuLayer::from_cpu_layer)
         let basis_padded = crate::gpu::pad_to_vec4(global_basis_size);
-        let basis_vec4s = (basis_padded + 3) / 4;
+        let basis_vec4s = basis_padded.div_ceil(4);
         let gpu_weight_count = out_dim * in_dim * basis_vec4s * 4;
         let size_bytes = (gpu_weight_count * std::mem::size_of::<f32>()) as u64;
 

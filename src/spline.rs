@@ -42,13 +42,14 @@
 //! assert!((sum - 1.0).abs() < 1e-5);
 //! ```
 
-use crate::config::{KanConfig, EPSILON};
+use crate::config::{KanConfig, EPSILON, MAX_SPLINE_ORDER};
+use wide::f32x8;
 
 /// Maximum supported spline order (degree ≤ 7).
 ///
-/// Higher orders require more storage for the de Boor algorithm.
-const MAX_ORDER: usize = 7;
-use wide::f32x8;
+/// This is imported from config for consistency. Used for stack allocation
+/// in the Cox-de Boor algorithm.
+const MAX_ORDER: usize = MAX_SPLINE_ORDER;
 
 /// Computes uniform B-spline knot vector.
 ///
