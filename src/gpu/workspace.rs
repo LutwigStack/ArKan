@@ -446,9 +446,10 @@ impl GpuWorkspace {
         queue: &wgpu::Queue,
         layer_idx: usize,
     ) -> ArkanResult<Vec<f32>> {
-        let gb = self.grad_bias.get(layer_idx).ok_or_else(|| {
-            ArkanError::buffer(format!("grad_bias[{}] not allocated", layer_idx))
-        })?;
+        let gb = self
+            .grad_bias
+            .get(layer_idx)
+            .ok_or_else(|| ArkanError::buffer(format!("grad_bias[{}] not allocated", layer_idx)))?;
         gb.download(device, queue)
     }
 
@@ -581,7 +582,8 @@ impl GpuWorkspace {
                     .ok_or_else(|| ArkanError::buffer("No input buffer"))?
                     .buffer
                     .as_entire_binding(),
-                self.intermediates.first()
+                self.intermediates
+                    .first()
                     .ok_or_else(|| ArkanError::buffer("No intermediate buffer 0"))?
                     .buffer
                     .as_entire_binding(),
@@ -761,7 +763,8 @@ impl GpuWorkspace {
                     .ok_or_else(|| ArkanError::buffer("No input buffer"))?
                     .buffer
                     .as_entire_binding(),
-                self.intermediates.first()
+                self.intermediates
+                    .first()
                     .ok_or_else(|| ArkanError::buffer("No intermediate buffer 0"))?
                     .buffer
                     .as_entire_binding(),
