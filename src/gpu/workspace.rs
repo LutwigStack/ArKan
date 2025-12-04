@@ -500,6 +500,46 @@ impl GpuWorkspace {
         Ok(full_data[..used].to_vec())
     }
 
+    /// Copies grad_input to grad_output on GPU (no CPU round-trip).
+    ///
+    /// This is used during backward pass to propagate gradients between layers
+    /// without expensive GPU-to-CPU-to-GPU transfers.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - The wgpu device.
+    /// * `queue` - The wgpu queue.
+    /// * `batch_size` - Current batch size.
+    /// * `dim` - Dimension of the gradient (in_dim of current layer).
+    pub fn copy_grad_input_to_grad_output(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch_size: usize,
+        dim: usize,
+    ) -> ArkanResult<()> {
+        let grad_input = self
+            .grad_input
+            .as_ref()
+            .ok_or_else(|| ArkanError::buffer("grad_input not allocated"))?;
+        let grad_output = self
+            .grad_output
+            .as_ref()
+            .ok_or_else(|| ArkanError::buffer("grad_output not allocated"))?;
+
+        let copy_size = (batch_size * dim * std::mem::size_of::<f32>()) as u64;
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("copy_grad_input_to_grad_output"),
+        });
+
+        encoder.copy_buffer_to_buffer(&grad_input.buffer, 0, &grad_output.buffer, 0, copy_size);
+
+        queue.submit(std::iter::once(encoder.finish()));
+
+        Ok(())
+    }
+
     /// Gets or creates the bind group for input/output buffers.
     pub fn get_or_create_bind_group(
         &mut self,

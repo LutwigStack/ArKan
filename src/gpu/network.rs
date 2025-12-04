@@ -1568,6 +1568,12 @@ impl GpuNetwork {
     /// - Hybrid (`train_step_mse`): ~10ms at batch=64 (GPU forward + CPU backward/optimizer + sync)
     /// - Native (`train_step_gpu_native`): ~2ms at batch=64 (all on GPU)
     ///
+    /// # Important: Syncing Weights
+    ///
+    /// After training, weights exist **only on GPU**. You must call
+    /// [`sync_weights_to_cpu`] to transfer trained weights back to CPU
+    /// before saving or using the CPU network.
+    ///
     /// # Arguments
     ///
     /// * `input` - Input data [batch_size * input_dim].
@@ -1587,7 +1593,7 @@ impl GpuNetwork {
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let backend = arkan::gpu::WgpuBackend::init(Default::default())?;
-    /// # let cpu_net = arkan::KanNetwork::new(arkan::KanConfig::preset());
+    /// # let mut cpu_net = arkan::KanNetwork::new(arkan::KanConfig::preset());
     /// # let mut gpu_net = GpuNetwork::from_cpu(&backend, &cpu_net)?;
     /// # let mut workspace = gpu_net.create_workspace(64)?;
     /// // Create GPU optimizer
@@ -1608,9 +1614,14 @@ impl GpuNetwork {
     ///         &input, &target, 64, &mut workspace, &mut optimizer
     ///     )?;
     /// }
+    ///
+    /// // IMPORTANT: Sync weights back to CPU before saving!
+    /// gpu_net.sync_weights_to_cpu(&mut cpu_net)?;
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// [`sync_weights_to_cpu`]: Self::sync_weights_to_cpu
     pub fn train_step_gpu_native(
         &mut self,
         input: &[f32],
@@ -1684,6 +1695,165 @@ impl GpuNetwork {
         Ok(loss)
     }
 
+    /// Performs a complete training step on GPU with full options.
+    ///
+    /// Extended version of [`train_step_gpu_native`] that supports:
+    /// - Optional mask for ignoring certain outputs (padding, etc.)
+    /// - Gradient clipping via `max_grad_norm`
+    /// - Weight decay (already supported in optimizer config)
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data [batch_size * input_dim].
+    /// * `target` - Target data [batch_size * output_dim].
+    /// * `batch_size` - Number of samples in the batch.
+    /// * `mask` - Optional mask [batch_size * output_dim]. Only non-zero values contribute to loss.
+    /// * `workspace` - GPU workspace for training buffers.
+    /// * `optimizer` - GPU Adam optimizer.
+    /// * `options` - Training options (gradient clipping, weight decay).
+    ///
+    /// # Note
+    ///
+    /// Gradient clipping requires downloading gradients to CPU for norm calculation.
+    /// If performance is critical and you don't need clipping, use [`train_step_gpu_native`].
+    pub fn train_step_gpu_native_with_options(
+        &mut self,
+        input: &[f32],
+        target: &[f32],
+        batch_size: usize,
+        mask: Option<&[f32]>,
+        workspace: &mut GpuWorkspace,
+        optimizer: &mut GpuAdam,
+        options: &TrainOptions,
+    ) -> ArkanResult<f32> {
+        // Validate target shape
+        let expected_target_len = batch_size * self.output_dim;
+        if target.len() != expected_target_len {
+            return Err(ArkanError::shape_mismatch(
+                &[batch_size, self.output_dim],
+                &[target.len() / self.output_dim, self.output_dim],
+            ));
+        }
+
+        // 1. Forward pass with training data
+        let output = self.forward_batch_training(input, batch_size, workspace)?;
+
+        // 2. Compute loss and gradient with optional mask
+        let (loss, grad_output) = masked_mse(&output, target, mask);
+
+        // 3. Backward pass - gradients stay on GPU in workspace buffers
+        workspace.zero_grad_buffers(&self.queue);
+        self.backward_batch_gpu_only(&grad_output, batch_size, workspace)?;
+
+        // 4. Apply gradient clipping if requested
+        if let Some(max_norm) = options.max_grad_norm {
+            self.apply_gradient_clipping(workspace, max_norm)?;
+        }
+
+        // 5. GPU optimizer step - updates weights directly on GPU
+        let layer_params = self.get_layer_param_buffers();
+        let layer_grads = workspace.get_layer_grad_buffers();
+        optimizer.step(&layer_params, &layer_grads)?;
+
+        Ok(loss)
+    }
+
+    /// Applies gradient clipping to gradients in workspace.
+    ///
+    /// Computes L2 norm of all gradients and scales them down if norm > max_norm.
+    /// This requires downloading gradients to CPU for norm calculation.
+    fn apply_gradient_clipping(
+        &self,
+        workspace: &mut GpuWorkspace,
+        max_norm: f32,
+    ) -> ArkanResult<()> {
+        // Compute total L2 norm of all gradients
+        let mut total_sq_norm = 0.0f32;
+
+        let layer_grads = workspace.get_layer_grad_buffers();
+        let mut all_grads: Vec<Vec<f32>> = Vec::with_capacity(layer_grads.len() * 2);
+
+        for (weight_grad_buf, bias_grad_buf) in layer_grads.iter() {
+            // Download weight gradients
+            let weight_grads = self.download_buffer_f32(weight_grad_buf)?;
+            for &g in &weight_grads {
+                total_sq_norm += g * g;
+            }
+            all_grads.push(weight_grads);
+
+            // Download bias gradients
+            let bias_grads = self.download_buffer_f32(bias_grad_buf)?;
+            for &g in &bias_grads {
+                total_sq_norm += g * g;
+            }
+            all_grads.push(bias_grads);
+        }
+
+        let norm = total_sq_norm.sqrt();
+        if norm > max_norm && norm > 0.0 {
+            let scale = max_norm / norm;
+
+            // Scale and re-upload gradients
+            let mut grad_idx = 0;
+            for (weight_grad_buf, bias_grad_buf) in layer_grads.iter() {
+                // Scale weight gradients
+                let mut weight_grads = std::mem::take(&mut all_grads[grad_idx]);
+                for g in weight_grads.iter_mut() {
+                    *g *= scale;
+                }
+                self.upload_buffer_f32(weight_grad_buf, &weight_grads);
+                grad_idx += 1;
+
+                // Scale bias gradients
+                let mut bias_grads = std::mem::take(&mut all_grads[grad_idx]);
+                for g in bias_grads.iter_mut() {
+                    *g *= scale;
+                }
+                self.upload_buffer_f32(bias_grad_buf, &bias_grads);
+                grad_idx += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Helper to download f32 buffer from GPU.
+    fn download_buffer_f32(&self, buffer: &wgpu::Buffer) -> ArkanResult<Vec<f32>> {
+        let size = buffer.size() as usize;
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("download_staging"),
+            size: size as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("download_encoder"),
+        });
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging_buffer, 0, size as u64);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().map_err(|_| ArkanError::buffer("Failed to map buffer"))??;
+
+        let data = slice.get_mapped_range();
+        let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging_buffer.unmap();
+
+        Ok(result)
+    }
+
+    /// Helper to upload f32 data to GPU buffer.
+    fn upload_buffer_f32(&self, buffer: &wgpu::Buffer, data: &[f32]) {
+        self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
+    }
+
     /// Performs backward pass, keeping gradients on GPU (no download).
     ///
     /// This is an internal method used by native GPU training.
@@ -1727,14 +1897,14 @@ impl GpuNetwork {
             self.backward_layer_gpu(layer_idx, batch_size, workspace, compute_input_grad)?;
 
             // If not first layer, copy grad_input to grad_output for next iteration
+            // Use GPU-to-GPU copy to avoid expensive CPU round-trip
             if compute_input_grad {
-                let grad_input = workspace.download_grad_input(
+                workspace.copy_grad_input_to_grad_output(
                     &self.device,
                     &self.queue,
                     batch_size,
                     self.layers[layer_idx].in_dim,
                 )?;
-                workspace.upload_grad_output(&self.queue, &grad_input)?;
             }
         }
 
@@ -1774,7 +1944,33 @@ impl GpuNetwork {
 
     /// Downloads weights from GPU to CPU network.
     ///
-    /// Call this to get the trained weights back to the CPU after GPU training.
+    /// **IMPORTANT**: After native GPU training (`train_step_gpu_native` or
+    /// `train_step_gpu_native_with_options`), the trained weights exist only on GPU.
+    /// You **must** call this method to transfer them back to CPU before:
+    /// - Saving the model to disk
+    /// - Using the CPU network for inference
+    /// - Serializing the network
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use arkan::{KanConfig, KanNetwork};
+    /// # use arkan::gpu::{GpuNetwork, WgpuBackend};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let backend = WgpuBackend::init(Default::default())?;
+    /// # let mut cpu_net = KanNetwork::new(KanConfig::preset());
+    /// # let gpu_net = GpuNetwork::from_cpu(&backend, &cpu_net)?;
+    /// // After training on GPU...
+    /// gpu_net.sync_weights_to_cpu(&mut cpu_net)?;
+    ///
+    /// // Now cpu_net has the trained weights and can be saved/used
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Returns an error if CPU and GPU networks have different layer counts.
     pub fn sync_weights_to_cpu(&self, cpu_network: &mut KanNetwork) -> ArkanResult<()> {
         if cpu_network.layers.len() != self.layers.len() {
             return Err(ArkanError::validation(
