@@ -17,24 +17,28 @@
 
 ### **Математическая модель**
 
-В основе лежит теорема представления Колмогорова-Арнольда. Для слоя с $N\_{in}$ входами и $N\_{out}$ выходами преобразование выглядит так:
+В основе лежит теорема представления Колмогорова-Арнольда. Для слоя с `N_in` входами и `N_out` выходами преобразование выглядит так:
 
-$$x\_{l+1, j} \= \\sum\_{i=1}^{N\_{in}} \\phi\_{l, j, i}(x\_{l, i})$$
+```
+x[l+1, j] = Σᵢ φ[l,j,i](x[l, i])      где i = 1..N_in
+```
 
-Где $\\phi\_{l, j, i}$ — это обучаемая 1D-функция, которая связывает $i$-й нейрон входного слоя с $j$-м нейроном выходного.
+Где `φ[l,j,i]` — это обучаемая 1D-функция, которая связывает `i`-й нейрон входного слоя с `j`-м нейроном выходного.
 
 ### **Реализация в ArKan (B-Splines)**
 
-В данной библиотеке функции $\\phi$ параметризуются с помощью **B-сплайнов** (Basis splines). Это позволяет менять форму функции активации локально, сохраняя гладкость.
+В данной библиотеке функции `φ` параметризуются с помощью **B-сплайнов** (Basis splines). Это позволяет менять форму функции активации локально, сохраняя гладкость.
 
 Уравнение для конкретного веса в ArKan:
 
-$$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
+```
+φ(x) = Σᵢ cᵢ · Bᵢ(x)      где i = 1..(G+p)
+```
 
-* $B\_i(x)$ — базисные функции сплайна.  
-* $c\_i$ — обучаемые коэффициенты.  
-* $G$ — размер сетки (grid size).  
-* $p$ — порядок сплайна (spline order).
+* `Bᵢ(x)` — базисные функции сплайна.
+* `cᵢ` — обучаемые коэффициенты.
+* `G` — размер сетки (grid size).
+* `p` — порядок сплайна (spline order).
 
 ## **Ключевые возможности**
 
@@ -225,24 +229,28 @@ Unlike classical Multi-Layer Perceptrons (MLP), where activation functions are f
 
 ### **Mathematical Model**
 
-Based on the Kolmogorov-Arnold representation theorem. For a layer with $N\_{in}$ inputs and $N\_{out}$ outputs, the transformation looks like this:
+Based on the Kolmogorov-Arnold representation theorem. For a layer with `N_in` inputs and `N_out` outputs, the transformation looks like this:
 
-$$x\_{l+1, j} \= \\sum\_{i=1}^{N\_{in}} \\phi\_{l, j, i}(x\_{l, i})$$
+```
+x[l+1, j] = Σᵢ φ[l,j,i](x[l, i])      where i = 1..N_in
+```
 
-Where $\\phi\_{l, j, i}$ is a learnable 1D function connecting the $i$-th input neuron to the $j$-th output neuron.
+Where `φ[l,j,i]` is a learnable 1D function connecting the `i`-th input neuron to the `j`-th output neuron.
 
 ### **Implementation in ArKan (B-Splines)**
 
-In this library, $\\phi$ functions are parameterized using **B-Splines**. This allows modifying the shape of the activation function locally while maintaining smoothness.
+In this library, `φ` functions are parameterized using **B-Splines**. This allows modifying the shape of the activation function locally while maintaining smoothness.
 
 Equation for a specific weight in ArKan:
 
-$$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
+```
+φ(x) = Σᵢ cᵢ · Bᵢ(x)      where i = 1..(G+p)
+```
 
-* $B\_i(x)$ — B-spline basis functions.  
-* $c\_i$ — learnable coefficients.  
-* $G$ — grid size.  
-* $p$ — spline order.
+* `Bᵢ(x)` — B-spline basis functions.
+* `cᵢ` — learnable coefficients.
+* `G` — grid size.
+* `p` — spline order.
 
 ## **Key Features**
 
