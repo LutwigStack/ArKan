@@ -1,3 +1,136 @@
+# Rust build artifacts
 /target
+**/target/
 **/*.rs.bk
 Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.vs/
+*.sublime-workspace
+*.sublime-project
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# Debug files
+*.pdb
+*.dSYM/
+
+# Python (for benchmark scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+
+# Benchmark and profiling output
+perf.data
+perf.data.old
+flamegraph.svg
+*.perf
+cachegrind.out.*
+callgrind.out.*
+
+# Coverage
+*.gcno
+*.gcda
+*.gcov
+coverage/
+*.profraw
+*.profdata
+
+# Documentation build (keep source)
+/target/doc/
+
+# Criterion benchmark data (generated, large)
+# Keep report/ for HTML but ignore raw data
+target/criterion/**/base/
+target/criterion/**/new/
+target/criterion/**/change/
+target/criterion/**/*.json
+!target/criterion/report/
+
+# WGPU/GPU shader cache
+*.spv
+*.spirv
+shader_cache/
+
+# Binary artifacts
+*.exe
+*.dll
+*.dylib
+*.a
+*.lib
+*.rlib
+
+# Package files
+*.crate
+*.tar.gz
+*.zip
+
+# Editor backup files
+*~
+\#*\#
+.\#*
+
+# Local configuration
+.env
+.env.local
+*.local
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Rust analyzer
+rust-project.json
+
+# =============================================================================
+# Project-specific ignores
+# =============================================================================
+
+# Binary model files
+*.bin
+model.bin
+
+# MNIST dataset (downloaded separately, large files)
+examples/mnist/data/
+examples/**/data/
+
+# Generated test data (can be regenerated from scripts)
+tests/spline_test_data.json
+
+# Debug/investigation test files (temporary debugging aids)
+tests/debug_*.rs
+tests/*_debug.rs
+tests/*_investigation.rs
+
+# Example project lock files (use workspace Cargo.lock)
+examples/**/Cargo.lock
+
+# Comprehensive test examples (development only)
+examples/comprehensive_test.rs
+examples/gpu_comprehensive_test.rs

@@ -38,6 +38,8 @@ log = { version = "0.4", optional = true }
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rand_distr = "0.4"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 
 [features]
 default = []
@@ -85,3 +87,9 @@ required-features = ["gpu"]
 name = "gpu_backward"
 harness = false
 required-features = ["gpu"]
+
+[[example]]
+name = "gpu_comprehensive_test"
+required-features = ["gpu"]
+
+# game2048 is a separate project with its own Cargo.toml in examples/game2048/
