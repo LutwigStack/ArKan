@@ -13,6 +13,8 @@ pub struct PipelineCache {
     device: Arc<wgpu::Device>,
     /// Forward pass pipelines cached by spline order (2-5)
     forward_pipelines: HashMap<usize, wgpu::ComputePipeline>,
+    /// Forward training pipelines cached by spline order (2-5)
+    forward_training_pipelines: HashMap<usize, wgpu::ComputePipeline>,
     /// Forward pass pipeline (legacy, order=3 only)
     forward_pipeline: Option<wgpu::ComputePipeline>,
     /// Forward simple pipeline (alternative implementation)
@@ -47,6 +49,7 @@ impl PipelineCache {
         Self {
             device,
             forward_pipelines: HashMap::new(),
+            forward_training_pipelines: HashMap::new(),
             forward_pipeline: None,
             forward_simple_pipeline: None,
             softmax_pipeline: None,
@@ -87,6 +90,18 @@ impl PipelineCache {
             self.create_forward_pipeline(layer_layout)?;
         }
         Ok(self.forward_pipeline.as_ref().unwrap())
+    }
+
+    /// Gets or creates the forward training pipeline for a specific spline order.
+    pub fn get_forward_training_pipeline_for_order(
+        &mut self,
+        layer_layout: &wgpu::BindGroupLayout,
+        order: usize,
+    ) -> ArkanResult<&wgpu::ComputePipeline> {
+        if !self.forward_training_pipelines.contains_key(&order) {
+            self.create_forward_training_pipeline_for_order(layer_layout, order)?;
+        }
+        Ok(self.forward_training_pipelines.get(&order).unwrap())
     }
 
     /// Gets or creates the forward simple pipeline.
@@ -537,6 +552,46 @@ impl PipelineCache {
             });
 
         self.forward_training_pipeline = Some(pipeline);
+        Ok(())
+    }
+
+    /// Creates a forward training pipeline for a specific spline order.
+    fn create_forward_training_pipeline_for_order(
+        &mut self,
+        layer_layout: &wgpu::BindGroupLayout,
+        order: usize,
+    ) -> ArkanResult<()> {
+        let training_layout = self.get_training_workspace_layout();
+        let training_layout_ref = unsafe { &*(training_layout as *const _) };
+
+        let shader_source = shaders::generate_forward_training_shader(order)?;
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(&format!("Forward Training Shader Order {}", order)),
+                source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            });
+
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Forward Training Pipeline Layout"),
+                bind_group_layouts: &[layer_layout, training_layout_ref],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(&format!("Forward Training Pipeline Order {}", order)),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("forward_training_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        self.forward_training_pipelines.insert(order, pipeline);
         Ok(())
     }
 

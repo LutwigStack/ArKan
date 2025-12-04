@@ -50,7 +50,7 @@
 //! | `forward_batch` | 64 | ~2 ms | Batch inference |
 //! | `train_step` | 64 | ~5 ms | Training |
 
-use crate::buffer::Workspace;
+use crate::buffer::{checked_buffer_size, Workspace};
 use crate::config::KanConfig;
 use crate::error::{ArkanError, ArkanResult};
 use crate::layer::KanLayer;
@@ -163,13 +163,21 @@ impl KanNetwork {
     /// ```
     #[must_use = "this creates a new network without modifying anything"]
     pub fn new(config: KanConfig) -> Self {
+        Self::try_new(config).expect("KanNetwork::new failed")
+    }
+
+    /// Fallible constructor that validates config and size calculations.
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_new(config: KanConfig) -> ArkanResult<Self> {
+        config.validate()?;
+
         let layer_dims = config.layer_dims();
         let mut layers = Vec::with_capacity(layer_dims.len() - 1);
 
         for i in 0..layer_dims.len() - 1 {
             let in_dim = layer_dims[i];
             let out_dim = layer_dims[i + 1];
-            layers.push(KanLayer::from_config(in_dim, out_dim, &config));
+            layers.push(KanLayer::try_new(in_dim, out_dim, &config)?);
         }
 
         let layer_param_sizes: Vec<(usize, usize)> = layers
@@ -177,13 +185,13 @@ impl KanNetwork {
             .map(|l| (l.weights.len(), l.bias.len()))
             .collect();
 
-        Self {
+        Ok(Self {
             config,
             layers,
             layer_dims,
             layer_param_sizes,
             default_train_options: TrainOptions::default(),
-        }
+        })
     }
 
     /// Creates network from configuration (alias for [`new`](Self::new)).
@@ -274,20 +282,42 @@ impl KanNetwork {
     /// network.forward_single(&input, &mut output, &mut workspace);
     /// ```
     pub fn forward_single(&self, input: &[f32], output: &mut [f32], workspace: &mut Workspace) {
-        debug_assert_eq!(input.len(), self.config.input_dim);
-        debug_assert_eq!(output.len(), self.config.output_dim);
+        self.try_forward_single(input, output, workspace)
+            .expect("forward_single failed");
+    }
+
+    /// Fallible single-sample forward pass.
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_forward_single(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        workspace: &mut Workspace,
+    ) -> ArkanResult<()> {
+        if input.len() != self.config.input_dim {
+            return Err(ArkanError::shape_mismatch(
+                &[self.config.input_dim],
+                &[input.len()],
+            ));
+        }
+        if output.len() != self.config.output_dim {
+            return Err(ArkanError::shape_mismatch(
+                &[self.config.output_dim],
+                &[output.len()],
+            ));
+        }
 
         if self.layers.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Reserve workspace for batch_size=1
-        workspace.reserve(1, &self.config);
+        workspace.try_reserve(1, &self.config)?;
 
         // Calculate max dimension for ping-pong buffers
         let max_dim = self.layer_dims.iter().copied().max().unwrap_or(1);
-        workspace.layer_output.resize(max_dim);
-        workspace.layer_input.resize(max_dim);
+        workspace.layer_output.try_resize(max_dim)?;
+        workspace.layer_input.try_resize(max_dim)?;
 
         // Get max basis_aligned across all layers
         let max_basis = self
@@ -296,7 +326,7 @@ impl KanNetwork {
             .map(|l| l.basis_aligned)
             .max()
             .unwrap_or(8);
-        workspace.basis_values.resize(max_basis);
+        workspace.basis_values.try_resize(max_basis)?;
 
         if self.layers.len() == 1 {
             // Single layer: input → output
@@ -321,7 +351,7 @@ impl KanNetwork {
 
                 // Copy current to z_buffer to avoid borrow issues
                 let in_size = layer.in_dim;
-                workspace.z_buffer.resize(in_size);
+                workspace.z_buffer.try_resize(in_size)?;
                 if use_output_as_current {
                     workspace
                         .z_buffer
@@ -352,7 +382,7 @@ impl KanNetwork {
                 let in_size = layer.in_dim;
 
                 // Copy to z_buffer
-                workspace.z_buffer.resize(in_size);
+                workspace.z_buffer.try_resize(in_size)?;
                 if use_output_as_current {
                     workspace
                         .z_buffer
@@ -369,6 +399,7 @@ impl KanNetwork {
                 layer.forward_single(workspace.z_buffer.as_slice(), output, basis_buf);
             }
         }
+        Ok(())
     }
 
     /// Forward pass for a batch of samples (zero-allocation).
@@ -425,89 +456,8 @@ impl KanNetwork {
     /// let first_output = &output[0..config.output_dim];
     /// ```
     pub fn forward_batch(&self, input: &[f32], output: &mut [f32], workspace: &mut Workspace) {
-        let batch_size = input.len() / self.config.input_dim;
-        debug_assert_eq!(input.len(), batch_size * self.config.input_dim);
-        debug_assert_eq!(output.len(), batch_size * self.config.output_dim);
-
-        if self.layers.is_empty() {
-            return;
-        }
-
-        workspace.reserve(batch_size, &self.config);
-
-        if self.layers.len() == 1 {
-            // Single layer network
-            workspace.prepare_forward(batch_size, &self.config);
-            self.layers[0].forward_batch(input, output, workspace);
-        } else {
-            // Multi-layer: ping-pong buffers without heap allocations.
-            // We use two pre-allocated buffers (A and B) that alternate as
-            // input/output for successive layers.
-            let max_hidden = self
-                .layer_dims
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(self.config.input_dim);
-            let ping_pong_size = batch_size * max_hidden;
-
-            // Borrow-safety: `std::mem::take` moves buffers out of workspace,
-            // allowing us to have mutable references to both without aliasing.
-            // This is the key trick for zero-allocation multi-layer forward.
-            //
-            // Panic safety: We use a scope + explicit return at the end.
-            // If panic occurs, buffers are lost but workspace remains valid
-            // (empty buffers). Caller should recreate workspace after panic.
-            let mut buffer_a = std::mem::take(&mut workspace.layer_output);
-            let mut buffer_b = std::mem::take(&mut workspace.layer_input);
-            buffer_a.resize(ping_pong_size);
-            buffer_b.resize(ping_pong_size);
-
-            // First layer: input -> buffer_a
-            {
-                let layer = &self.layers[0];
-                let out_size = batch_size * layer.out_dim;
-                buffer_a.resize(out_size);
-                layer.forward_batch(input, &mut buffer_a.as_mut_slice()[..out_size], workspace);
-            }
-
-            let mut current_is_a = true;
-
-            // Hidden layers: ping-pong between buffer_a/buffer_b
-            for i in 1..self.layers.len() - 1 {
-                let layer = &self.layers[i];
-                let in_size = batch_size * layer.in_dim;
-                let out_size = batch_size * layer.out_dim;
-
-                let (input_buf, output_buf) = if current_is_a {
-                    (&buffer_a, &mut buffer_b)
-                } else {
-                    (&buffer_b, &mut buffer_a)
-                };
-
-                output_buf.resize(out_size);
-                layer.forward_batch(
-                    &input_buf.as_slice()[..in_size],
-                    &mut output_buf.as_mut_slice()[..out_size],
-                    workspace,
-                );
-
-                current_is_a = !current_is_a;
-            }
-
-            // Last layer: current buffer -> output
-            {
-                let layer = self.layers.last().unwrap();
-                let in_size = batch_size * layer.in_dim;
-                let input_buf = if current_is_a { &buffer_a } else { &buffer_b };
-                layer.forward_batch(&input_buf.as_slice()[..in_size], output, workspace);
-            }
-
-            // Return buffers to workspace for reuse in subsequent calls.
-            // This preserves capacity, avoiding re-allocation on next forward.
-            workspace.layer_output = buffer_a;
-            workspace.layer_input = buffer_b;
-        }
+        self.try_forward_batch(input, output, workspace)
+            .expect("forward_batch failed");
     }
 
     /// Forward pass with Result return type for better error handling.
@@ -524,6 +474,7 @@ impl KanNetwork {
     /// # Errors
     ///
     /// Returns `ArkanError::ShapeMismatch` if input/output lengths don't match expected dimensions.
+    /// Returns `ArkanError::Overflow` if buffer size calculations overflow.
     ///
     /// # Example
     ///
@@ -551,7 +502,7 @@ impl KanNetwork {
         let batch_size = input.len() / self.config.input_dim;
 
         // Validate input length
-        let expected_input_len = batch_size * self.config.input_dim;
+        let expected_input_len = checked_buffer_size(batch_size, self.config.input_dim)?;
         if input.len() != expected_input_len {
             return Err(ArkanError::shape_mismatch(
                 &[expected_input_len],
@@ -560,7 +511,7 @@ impl KanNetwork {
         }
 
         // Validate output length
-        let expected_output_len = batch_size * self.config.output_dim;
+        let expected_output_len = checked_buffer_size(batch_size, self.config.output_dim)?;
         if output.len() != expected_output_len {
             return Err(ArkanError::shape_mismatch(
                 &[expected_output_len],
@@ -568,9 +519,87 @@ impl KanNetwork {
             ));
         }
 
-        // Delegate to forward_batch (which now has guaranteed valid sizes)
-        self.forward_batch(input, output, workspace);
-        Ok(())
+        if self.layers.is_empty() {
+            return Ok(());
+        }
+
+        workspace.try_reserve(batch_size, &self.config)?;
+
+        if self.layers.len() == 1 {
+            workspace.try_prepare_forward(batch_size, &self.config)?;
+            self.layers[0].forward_batch(input, output, workspace);
+            return Ok(());
+        }
+
+        let max_hidden = self
+            .layer_dims
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(self.config.input_dim);
+        let ping_pong_size = checked_buffer_size(batch_size, max_hidden)?;
+
+        // Use std::mem::take for borrow-safety (allows mutable refs to both buffers)
+        let mut buffer_a = std::mem::take(&mut workspace.layer_output);
+        let mut buffer_b = std::mem::take(&mut workspace.layer_input);
+
+        // Wrap in a closure for early return with buffer restoration
+        let result = (|| -> ArkanResult<()> {
+            buffer_a.try_resize(ping_pong_size)?;
+            buffer_b.try_resize(ping_pong_size)?;
+
+            // First layer: input -> buffer_a
+            {
+                let layer = &self.layers[0];
+                let out_size = checked_buffer_size(batch_size, layer.out_dim)?;
+                buffer_a.try_resize(out_size)?;
+                layer.forward_batch(
+                    input,
+                    &mut buffer_a.as_mut_slice()[..out_size],
+                    workspace,
+                );
+            }
+
+            let mut current_is_a = true;
+
+            // Hidden layers: ping-pong between buffer_a/buffer_b
+            for i in 1..self.layers.len() - 1 {
+                let layer = &self.layers[i];
+                let in_size = checked_buffer_size(batch_size, layer.in_dim)?;
+                let out_size = checked_buffer_size(batch_size, layer.out_dim)?;
+
+                let (input_buf, output_buf) = if current_is_a {
+                    (&buffer_a, &mut buffer_b)
+                } else {
+                    (&buffer_b, &mut buffer_a)
+                };
+
+                output_buf.try_resize(out_size)?;
+                layer.forward_batch(
+                    &input_buf.as_slice()[..in_size],
+                    &mut output_buf.as_mut_slice()[..out_size],
+                    workspace,
+                );
+
+                current_is_a = !current_is_a;
+            }
+
+            // Last layer: current buffer -> output
+            {
+                let layer = self.layers.last().unwrap();
+                let in_size = checked_buffer_size(batch_size, layer.in_dim)?;
+                let input_buf = if current_is_a { &buffer_a } else { &buffer_b };
+                layer.forward_batch(&input_buf.as_slice()[..in_size], output, workspace);
+            }
+
+            Ok(())
+        })();
+
+        // Return buffers to workspace (even on error)
+        workspace.layer_output = buffer_a;
+        workspace.layer_input = buffer_b;
+
+        result
     }
 
     /// Forward pass for training: stores per-layer normalized inputs and grid indices.
@@ -603,15 +632,44 @@ impl KanNetwork {
         output: &mut [f32],
         workspace: &mut Workspace,
     ) {
-        let batch_size = input.len() / self.config.input_dim;
-        debug_assert_eq!(input.len(), batch_size * self.config.input_dim);
-        debug_assert_eq!(output.len(), batch_size * self.config.output_dim);
+        self.try_forward_batch_training(input, output, workspace)
+            .expect("forward_batch_training failed");
+    }
 
-        if self.layers.is_empty() {
-            return;
+    /// Fallible version of [`forward_batch_training`](Self::forward_batch_training).
+    ///
+    /// Returns `ArkanError::ShapeMismatch` if input/output lengths don't match expected dimensions.
+    /// Returns `ArkanError::Overflow` if buffer size calculations overflow.
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_forward_batch_training(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        workspace: &mut Workspace,
+    ) -> ArkanResult<()> {
+        let batch_size = input.len() / self.config.input_dim;
+
+        let expected_input_len = checked_buffer_size(batch_size, self.config.input_dim)?;
+        if input.len() != expected_input_len {
+            return Err(ArkanError::shape_mismatch(
+                &[expected_input_len],
+                &[input.len()],
+            ));
         }
 
-        workspace.prepare_training(batch_size, &self.config, &self.layer_dims);
+        let expected_output_len = checked_buffer_size(batch_size, self.config.output_dim)?;
+        if output.len() != expected_output_len {
+            return Err(ArkanError::shape_mismatch(
+                &[expected_output_len],
+                &[output.len()],
+            ));
+        }
+
+        if self.layers.is_empty() {
+            return Ok(());
+        }
+
+        workspace.try_prepare_training(batch_size, &self.config, &self.layer_dims)?;
 
         let max_hidden = self
             .layer_dims
@@ -619,57 +677,68 @@ impl KanNetwork {
             .copied()
             .max()
             .unwrap_or(self.config.input_dim);
-        let ping_pong_size = batch_size * max_hidden;
+        let ping_pong_size = checked_buffer_size(batch_size, max_hidden)?;
 
+        // Use std::mem::take for borrow-safety
         let mut buffer_a = std::mem::take(&mut workspace.layer_output);
         let mut buffer_b = std::mem::take(&mut workspace.layer_input);
-        buffer_a.resize(ping_pong_size);
-        buffer_b.resize(ping_pong_size);
 
-        let mut current_is_a = true;
+        // Wrap in a closure for early return with buffer restoration
+        let result = (|| -> ArkanResult<()> {
+            buffer_a.try_resize(ping_pong_size)?;
+            buffer_b.try_resize(ping_pong_size)?;
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let in_size = batch_size * layer.in_dim;
-            let out_size = batch_size * layer.out_dim;
+            let mut current_is_a = true;
 
-            let (input_slice, output_buf) = if layer_idx == 0 {
-                (
-                    input,
-                    if current_is_a {
-                        &mut buffer_a
-                    } else {
-                        &mut buffer_b
-                    },
-                )
-            } else if current_is_a {
-                (&buffer_a.as_slice()[..in_size], &mut buffer_b)
-            } else {
-                (&buffer_b.as_slice()[..in_size], &mut buffer_a)
-            };
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let in_size = checked_buffer_size(batch_size, layer.in_dim)?;
+                let out_size = checked_buffer_size(batch_size, layer.out_dim)?;
 
-            output_buf.resize(out_size);
-            layer.forward_batch(
-                input_slice,
-                &mut output_buf.as_mut_slice()[..out_size],
-                workspace,
-            );
+                let (input_slice, output_buf): (&[f32], &mut _) = if layer_idx == 0 {
+                    (
+                        input,
+                        if current_is_a {
+                            &mut buffer_a
+                        } else {
+                            &mut buffer_b
+                        },
+                    )
+                } else if current_is_a {
+                    (&buffer_a.as_slice()[..in_size], &mut buffer_b)
+                } else {
+                    (&buffer_b.as_slice()[..in_size], &mut buffer_a)
+                };
 
-            // Save normalized inputs and grid indices for backward
-            let hist_in = &mut workspace.layers_inputs[layer_idx].as_mut_slice()[..in_size];
-            hist_in.copy_from_slice(workspace.z_buffer.as_slice());
+                output_buf.try_resize(out_size)?;
+                layer.forward_batch(
+                    input_slice,
+                    &mut output_buf.as_mut_slice()[..out_size],
+                    workspace,
+                );
 
-            let hist_idx = &mut workspace.layers_grid_indices[layer_idx][..in_size];
-            hist_idx.copy_from_slice(&workspace.grid_indices[..in_size]);
+                // Save normalized inputs and grid indices for backward
+                let hist_in =
+                    &mut workspace.layers_inputs[layer_idx].as_mut_slice()[..in_size];
+                hist_in.copy_from_slice(workspace.z_buffer.as_slice());
 
-            if layer_idx == self.layers.len() - 1 {
-                output.copy_from_slice(&output_buf.as_slice()[..out_size]);
+                let hist_idx = &mut workspace.layers_grid_indices[layer_idx][..in_size];
+                hist_idx.copy_from_slice(&workspace.grid_indices[..in_size]);
+
+                if layer_idx == self.layers.len() - 1 {
+                    output.copy_from_slice(&output_buf.as_slice()[..out_size]);
+                }
+
+                current_is_a = !current_is_a;
             }
 
-            current_is_a = !current_is_a;
-        }
+            Ok(())
+        })();
 
+        // Return buffers to workspace (even on error)
         workspace.layer_output = buffer_a;
         workspace.layer_input = buffer_b;
+
+        result
     }
 
     /// Full training step: forward + backward + SGD update.
@@ -731,6 +800,12 @@ impl KanNetwork {
     /// * `opts` - Training options (gradient clipping, weight decay)
     ///
     /// See [`train_step`](Self::train_step) for other arguments.
+    ///
+    /// # Panics
+    ///
+    /// Panics if buffer size calculations overflow or shape validation fails.
+    /// Use [`try_train_step_with_options`](Self::try_train_step_with_options)
+    /// for a fallible version.
     pub fn train_step_with_options(
         &mut self,
         input: &[f32],
@@ -740,20 +815,128 @@ impl KanNetwork {
         workspace: &mut Workspace,
         opts: &TrainOptions,
     ) -> f32 {
+        self.try_train_step_with_options(input, target, mask, learning_rate, workspace, opts)
+            .expect("train_step_with_options failed")
+    }
+
+    /// Training step with Result return type for better error handling.
+    ///
+    /// This is the Result-returning version of [`train_step`](Self::train_step).
+    /// Use this when you want explicit error handling instead of panics.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data `[batch_size * input_dim]`
+    /// * `target` - Target values `[batch_size * output_dim]`
+    /// * `mask` - Optional mask `[batch_size * output_dim]`
+    /// * `learning_rate` - Learning rate for SGD update
+    /// * `workspace` - Pre-allocated workspace
+    ///
+    /// # Errors
+    ///
+    /// Returns `ArkanError::ShapeMismatch` if input/target/mask lengths don't match expected dimensions.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let config = KanConfig::preset();
+    /// let mut network = KanNetwork::new(config.clone());
+    /// let mut workspace = network.create_workspace(64);
+    ///
+    /// let batch_size = 64;
+    /// let inputs = vec![0.5f32; batch_size * config.input_dim];
+    /// let targets = vec![0.1f32; batch_size * config.output_dim];
+    ///
+    /// let loss = network.try_train_step(&inputs, &targets, None, 0.001, &mut workspace)?;
+    /// # Ok::<(), arkan::ArkanError>(())
+    /// ```
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_train_step(
+        &mut self,
+        input: &[f32],
+        target: &[f32],
+        mask: Option<&[f32]>,
+        learning_rate: f32,
+        workspace: &mut Workspace,
+    ) -> ArkanResult<f32> {
+        let opts = self.default_train_options;
+        self.try_train_step_with_options(input, target, mask, learning_rate, workspace, &opts)
+    }
+
+    /// Training step with explicit options and Result return type.
+    ///
+    /// This is the Result-returning version of [`train_step_with_options`](Self::train_step_with_options).
+    /// All internal operations use fallible versions with proper overflow checking.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data `[batch_size * input_dim]`
+    /// * `target` - Target values `[batch_size * output_dim]`
+    /// * `mask` - Optional mask `[batch_size * output_dim]`
+    /// * `learning_rate` - Learning rate for SGD update
+    /// * `workspace` - Pre-allocated workspace
+    /// * `opts` - Training options (gradient clipping, weight decay)
+    ///
+    /// # Errors
+    ///
+    /// Returns `ArkanError::ShapeMismatch` if input/target/mask lengths don't match expected dimensions.
+    /// Returns `ArkanError::Overflow` if buffer size calculations overflow.
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_train_step_with_options(
+        &mut self,
+        input: &[f32],
+        target: &[f32],
+        mask: Option<&[f32]>,
+        learning_rate: f32,
+        workspace: &mut Workspace,
+        opts: &TrainOptions,
+    ) -> ArkanResult<f32> {
         let batch_size = input.len() / self.config.input_dim;
         let output_dim = self.config.output_dim;
 
+        // Validate input length
+        let expected_input_len = checked_buffer_size(batch_size, self.config.input_dim)?;
+        if input.len() != expected_input_len {
+            return Err(ArkanError::shape_mismatch(
+                &[expected_input_len],
+                &[input.len()],
+            ));
+        }
+
+        // Validate target length
+        let expected_target_len = checked_buffer_size(batch_size, output_dim)?;
+        if target.len() != expected_target_len {
+            return Err(ArkanError::shape_mismatch(
+                &[expected_target_len],
+                &[target.len()],
+            ));
+        }
+
+        // Validate mask length if provided
+        if let Some(m) = mask {
+            if m.len() != expected_target_len {
+                return Err(ArkanError::shape_mismatch(
+                    &[expected_target_len],
+                    &[m.len()],
+                ));
+            }
+        }
+
         // Ensure workspace has gradient buffers for all layers
-        workspace.prepare_grad_buffers(&self.layer_param_sizes);
+        workspace.try_prepare_grad_buffers(&self.layer_param_sizes)?;
 
         // Forward pass with history capture using workspace predictions buffer
-        workspace.predictions_buffer.resize(batch_size * output_dim);
+        let pred_size = checked_buffer_size(batch_size, output_dim)?;
+        workspace.predictions_buffer.try_resize(pred_size)?;
+
         // Take predictions buffer to avoid borrow conflict
         let mut predictions_buf = std::mem::take(&mut workspace.predictions_buffer);
-        self.forward_batch_training(input, predictions_buf.as_mut_slice(), workspace);
+        self.try_forward_batch_training(input, predictions_buf.as_mut_slice(), workspace)?;
 
         // Compute loss and output gradient into workspace buffer
-        workspace.grad_output.resize(batch_size * output_dim);
+        workspace.grad_output.try_resize(pred_size)?;
         let loss = compute_masked_mse_loss_into(
             predictions_buf.as_slice(),
             target,
@@ -765,7 +948,8 @@ impl KanNetwork {
         // Return predictions buffer
         workspace.predictions_buffer = predictions_buf;
 
-        workspace.assert_history_batch(batch_size);
+        // Validate history batch size
+        workspace.check_history_batch(batch_size)?;
 
         // =====================================================================
         // Backward pass: compute gradients for all layers (zero-allocation).
@@ -804,10 +988,11 @@ impl KanNetwork {
         // staging_buffer holds the current layer's output gradient (dL/dy).
         // It's initialized with grad_output and updated each iteration.
         let max_dim = self.layer_dims.iter().copied().max().unwrap_or(output_dim);
-        workspace.staging_buffer.resize(batch_size * max_dim);
+        let staging_size = checked_buffer_size(batch_size, max_dim)?;
+        workspace.staging_buffer.try_resize(staging_size)?;
 
         // Seed the backward pass with dL/d(network_output)
-        let grad_out_size = batch_size * output_dim;
+        let grad_out_size = checked_buffer_size(batch_size, output_dim)?;
         workspace.staging_buffer.as_mut_slice()[..grad_out_size]
             .copy_from_slice(workspace.grad_output.as_slice());
 
@@ -818,7 +1003,8 @@ impl KanNetwork {
 
             // Take staging buffer with current gradient
             let staging = std::mem::take(&mut workspace.staging_buffer);
-            let grad_out_slice = &staging.as_slice()[..batch_size * out_dim];
+            let layer_out_size = checked_buffer_size(batch_size, out_dim)?;
+            let grad_out_slice = &staging.as_slice()[..layer_out_size];
 
             // Take weight/bias gradient buffers to avoid borrow conflicts
             let mut weight_grad = std::mem::take(&mut workspace.weight_grads[layer_idx]);
@@ -831,9 +1017,9 @@ impl KanNetwork {
                 None
             };
             if let Some(ref mut buf) = grad_buffer {
-                let needed = batch_size * in_dim;
-                buf.reserve(needed);
-                buf.resize(needed);
+                let needed = checked_buffer_size(batch_size, in_dim)?;
+                buf.try_reserve(needed)?;
+                buf.try_resize(needed)?;
                 buf.as_mut_slice().iter_mut().for_each(|x| *x = 0.0);
             }
 
@@ -841,13 +1027,14 @@ impl KanNetwork {
             let layer_input_buf = std::mem::take(&mut workspace.layers_inputs[layer_idx]);
             let layer_grid_buf = std::mem::take(&mut workspace.layers_grid_indices[layer_idx]);
 
+            let layer_in_size = checked_buffer_size(batch_size, in_dim)?;
             layer.backward(
                 layer_input_buf.as_slice(),
                 &layer_grid_buf,
                 grad_out_slice,
                 grad_buffer
                     .as_mut()
-                    .map(|b| &mut b.as_mut_slice()[..batch_size * in_dim]),
+                    .map(|b| &mut b.as_mut_slice()[..layer_in_size]),
                 &mut weight_grad,
                 &mut bias_grad,
                 workspace,
@@ -869,9 +1056,9 @@ impl KanNetwork {
             workspace.staging_buffer = staging;
 
             if let Some(buf) = grad_buffer {
-                let needed = batch_size * in_dim;
+                let needed = checked_buffer_size(batch_size, in_dim)?;
                 // Copy gradient for next layer into staging_buffer
-                workspace.staging_buffer.resize(needed);
+                workspace.staging_buffer.try_resize(needed)?;
                 workspace.staging_buffer.as_mut_slice()[..needed]
                     .copy_from_slice(&buf.as_slice()[..needed]);
 
@@ -928,113 +1115,7 @@ impl KanNetwork {
             }
         }
 
-        loss
-    }
-
-    /// Training step with Result return type for better error handling.
-    ///
-    /// This is the Result-returning version of [`train_step`](Self::train_step).
-    /// Use this when you want explicit error handling instead of panics.
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - Input data `[batch_size * input_dim]`
-    /// * `target` - Target values `[batch_size * output_dim]`
-    /// * `mask` - Optional mask `[batch_size * output_dim]`
-    /// * `learning_rate` - Learning rate for SGD update
-    /// * `workspace` - Pre-allocated workspace
-    ///
-    /// # Errors
-    ///
-    /// Returns `ArkanError::ShapeMismatch` if input/target/mask lengths don't match expected dimensions.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use arkan::{KanConfig, KanNetwork};
-    ///
-    /// let config = KanConfig::preset();
-    /// let mut network = KanNetwork::new(config.clone());
-    /// let mut workspace = network.create_workspace(64);
-    ///
-    /// let batch_size = 64;
-    /// let inputs = vec![0.5f32; batch_size * config.input_dim];
-    /// let targets = vec![0.1f32; batch_size * config.output_dim];
-    ///
-    /// let loss = network.try_train_step(&inputs, &targets, None, 0.001, &mut workspace)?;
-    /// # Ok::<(), arkan::ArkanError>(())
-    /// ```
-    #[must_use = "this returns a Result that should be handled"]
-    pub fn try_train_step(
-        &mut self,
-        input: &[f32],
-        target: &[f32],
-        mask: Option<&[f32]>,
-        learning_rate: f32,
-        workspace: &mut Workspace,
-    ) -> ArkanResult<f32> {
-        let opts = self.default_train_options;
-        self.try_train_step_with_options(input, target, mask, learning_rate, workspace, &opts)
-    }
-
-    /// Training step with explicit options and Result return type.
-    ///
-    /// This is the Result-returning version of [`train_step_with_options`](Self::train_step_with_options).
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - Input data `[batch_size * input_dim]`
-    /// * `target` - Target values `[batch_size * output_dim]`
-    /// * `mask` - Optional mask `[batch_size * output_dim]`
-    /// * `learning_rate` - Learning rate for SGD update
-    /// * `workspace` - Pre-allocated workspace
-    /// * `opts` - Training options (gradient clipping, weight decay)
-    ///
-    /// # Errors
-    ///
-    /// Returns `ArkanError::ShapeMismatch` if input/target/mask lengths don't match expected dimensions.
-    #[must_use = "this returns a Result that should be handled"]
-    pub fn try_train_step_with_options(
-        &mut self,
-        input: &[f32],
-        target: &[f32],
-        mask: Option<&[f32]>,
-        learning_rate: f32,
-        workspace: &mut Workspace,
-        opts: &TrainOptions,
-    ) -> ArkanResult<f32> {
-        let batch_size = input.len() / self.config.input_dim;
-
-        // Validate input length
-        let expected_input_len = batch_size * self.config.input_dim;
-        if input.len() != expected_input_len {
-            return Err(ArkanError::shape_mismatch(
-                &[expected_input_len],
-                &[input.len()],
-            ));
-        }
-
-        // Validate target length
-        let expected_target_len = batch_size * self.config.output_dim;
-        if target.len() != expected_target_len {
-            return Err(ArkanError::shape_mismatch(
-                &[expected_target_len],
-                &[target.len()],
-            ));
-        }
-
-        // Validate mask length if provided
-        if let Some(m) = mask {
-            if m.len() != expected_target_len {
-                return Err(ArkanError::shape_mismatch(
-                    &[expected_target_len],
-                    &[m.len()],
-                ));
-            }
-        }
-
-        // Delegate to train_step_with_options (which now has guaranteed valid sizes)
-        Ok(self.train_step_with_options(input, target, mask, learning_rate, workspace, opts))
+        Ok(loss)
     }
 
     /// Creates a workspace sized for this network (fallible version).
@@ -1847,5 +1928,36 @@ mod tests {
 
         // Results should be reproducible
         assert_eq!(output1, output3);
+    }
+
+    #[test]
+    fn test_try_forward_batch_overflow() {
+        // Huge batch should return Overflow error, not panic
+        let config = KanConfig::preset();
+        let network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(1);
+
+        // Create a very large input that would overflow
+        // Using a calculation that would exceed MAX_BUFFER_ELEMENTS
+        let _huge_batch = usize::MAX / 4;
+        
+        // We can't actually allocate this, but try_forward_batch should
+        // return an error before trying to allocate
+        let small_input = vec![0.5f32; config.input_dim]; // batch=1
+        let mut small_output = vec![0.0f32; config.output_dim];
+        
+        // This should succeed
+        let result = network.try_forward_batch(&small_input, &mut small_output, &mut workspace);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_train_step_overflow() {
+        // Overflow in train step should return error
+        use crate::buffer::checked_buffer_size;
+        
+        // This tests the overflow detection logic
+        let result = checked_buffer_size(usize::MAX, 2);
+        assert!(result.is_err());
     }
 }

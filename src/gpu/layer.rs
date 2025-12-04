@@ -310,6 +310,16 @@ impl GpuLayer {
         self.weight_count() + self.bias_count()
     }
 
+    /// Returns the GPU memory used by weights in bytes.
+    pub fn weights_bytes(&self) -> usize {
+        self.weight_count() * std::mem::size_of::<f32>()
+    }
+
+    /// Returns the GPU memory used by bias in bytes.
+    pub fn bias_bytes(&self) -> usize {
+        self.bias_count() * std::mem::size_of::<f32>()
+    }
+
     // ==================== Backward Pass Support ====================
 
     /// Creates the bind group layout for backward pass.

@@ -59,7 +59,7 @@ mod workspace;
 
 pub use backend::{PowerPreference, WgpuBackend, WgpuOptions};
 pub use layer::GpuLayer;
-pub use network::GpuNetwork;
+pub use network::{GpuMemoryStats, GpuNetwork};
 pub use optimizer::{
     AdamUniforms, GpuAdam, GpuAdamConfig, GpuAdamLayerState, GpuSgd, GpuSgdConfig,
     GpuSgdLayerState, SgdUniforms,

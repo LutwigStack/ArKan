@@ -3,6 +3,7 @@
 //! This module provides [`GpuNetwork`] which wraps a CPU KAN network
 //! with GPU-accelerated forward pass.
 
+use crate::config::{MAX_GPU_SPLINE_ORDER, MIN_GPU_SPLINE_ORDER};
 use crate::error::{ArkanError, ArkanResult};
 use crate::gpu::backend::WgpuBackend;
 use crate::gpu::layer::GpuLayer;
@@ -13,6 +14,39 @@ use crate::network::{KanNetwork, TrainOptions};
 use crate::optimizer::{Adam, SGD};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
+
+/// GPU memory usage statistics.
+///
+/// Returned by [`GpuNetwork::memory_stats`].
+#[derive(Debug, Clone, Copy)]
+pub struct GpuMemoryStats {
+    /// Total bytes used for weight buffers.
+    pub weights_bytes: usize,
+    /// Total bytes used for bias buffers.
+    pub bias_bytes: usize,
+    /// Total bytes used (weights + bias).
+    pub total_bytes: usize,
+    /// Number of layers in the network.
+    pub num_layers: usize,
+    /// Input dimension.
+    pub input_dim: usize,
+    /// Output dimension.
+    pub output_dim: usize,
+}
+
+impl GpuMemoryStats {
+    /// Returns memory usage in kilobytes.
+    #[must_use]
+    pub fn total_kb(&self) -> f64 {
+        self.total_bytes as f64 / 1024.0
+    }
+
+    /// Returns memory usage in megabytes.
+    #[must_use]
+    pub fn total_mb(&self) -> f64 {
+        self.total_bytes as f64 / (1024.0 * 1024.0)
+    }
+}
 
 /// GPU-accelerated KAN Network.
 ///
@@ -78,6 +112,15 @@ impl GpuNetwork {
         let device = backend.device_arc();
         let queue = backend.queue_arc();
 
+        // Validate spline order for GPU support
+        if cpu_network.config.spline_order < MIN_GPU_SPLINE_ORDER
+            || cpu_network.config.spline_order > MAX_GPU_SPLINE_ORDER
+        {
+            return Err(ArkanError::unsupported_order(
+                cpu_network.config.spline_order,
+            ));
+        }
+
         // Upload all layers
         let mut layers = Vec::with_capacity(cpu_network.layers.len());
         for cpu_layer in &cpu_network.layers {
@@ -124,6 +167,64 @@ impl GpuNetwork {
     /// Creates a GPU workspace for this network.
     pub fn create_workspace(&self, max_batch: usize) -> ArkanResult<GpuWorkspace> {
         GpuWorkspace::new(&self.device, max_batch, self.input_dim, self.output_dim)
+    }
+
+    /// Warms up the GPU by compiling all necessary pipelines.
+    ///
+    /// Call this method during application startup to ensure all shader
+    /// pipelines are compiled before the first inference. This prevents
+    /// latency spikes during the first forward pass.
+    ///
+    /// # Returns
+    ///
+    /// Number of pipelines that were compiled.
+    pub fn warmup(&mut self) -> ArkanResult<usize> {
+        let mut compiled = 0;
+
+        // Need at least one layer to get the bind group layout
+        let Some(first_layer) = self.layers.first() else {
+            return Ok(0);
+        };
+
+        // Compile forward pipeline for current spline order
+        if self.pipeline_cache.get_forward_pipeline_for_order(
+            &first_layer.bind_group_layout,
+            self.spline_order,
+        ).is_ok() {
+            compiled += 1;
+        }
+
+        // Compile softmax pipeline
+        if self.pipeline_cache.get_softmax_pipeline().is_ok() {
+            compiled += 1;
+        }
+
+        Ok(compiled)
+    }
+
+    /// Returns GPU memory statistics for this network.
+    ///
+    /// # Returns
+    ///
+    /// A [`GpuMemoryStats`] struct containing memory usage information.
+    #[must_use]
+    pub fn memory_stats(&self) -> GpuMemoryStats {
+        let mut weights_bytes = 0usize;
+        let mut bias_bytes = 0usize;
+
+        for layer in &self.layers {
+            weights_bytes += layer.weights_bytes();
+            bias_bytes += layer.bias_bytes();
+        }
+
+        GpuMemoryStats {
+            weights_bytes,
+            bias_bytes,
+            total_bytes: weights_bytes + bias_bytes,
+            num_layers: self.layers.len(),
+            input_dim: self.input_dim,
+            output_dim: self.output_dim,
+        }
     }
 
     /// Performs forward pass for a single input on GPU.
@@ -601,7 +702,7 @@ impl GpuNetwork {
         // Get or create pipeline
         let pipeline = self
             .pipeline_cache
-            .get_forward_training_pipeline(&layer.bind_group_layout)?;
+            .get_forward_training_pipeline_for_order(&layer.bind_group_layout, self.spline_order)?;
 
         // Create training bind group (input, output, z_values, span_indices)
         let training_bg = workspace.get_or_create_training_bind_group(
@@ -660,9 +761,10 @@ impl GpuNetwork {
 
         // Get or create pipeline
         let bind_group_layout = &layer.bind_group_layout;
-        let pipeline = self
-            .pipeline_cache
-            .get_forward_training_pipeline(bind_group_layout)?;
+        let pipeline = self.pipeline_cache.get_forward_training_pipeline_for_order(
+            bind_group_layout,
+            self.spline_order,
+        )?;
 
         // Create training bind group for this layer's I/O
         let training_bg = workspace.get_or_create_training_layer_bind_group(

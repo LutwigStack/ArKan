@@ -1061,9 +1061,44 @@ impl Workspace {
     ///
     /// Buffers grow monotonically. After first call, subsequent calls with
     /// same or smaller layer sizes perform zero allocations.
+    ///
+    /// # Panics
+    ///
+    /// May panic on allocation failure. Use [`try_prepare_grad_buffers`](Self::try_prepare_grad_buffers)
+    /// for a fallible version.
     #[inline]
     pub fn prepare_grad_buffers(&mut self, layer_sizes: &[(usize, usize)]) {
+        self.try_prepare_grad_buffers(layer_sizes)
+            .expect("Workspace::prepare_grad_buffers: allocation failed")
+    }
+
+    /// Fallible version of [`prepare_grad_buffers`](Self::prepare_grad_buffers).
+    ///
+    /// Returns `Ok(())` on success, or `ArkanError::Overflow` if buffer size
+    /// calculations overflow or exceed `MAX_BUFFER_ELEMENTS`.
+    ///
+    /// # Arguments
+    ///
+    /// * `layer_sizes` - Tuples of `(weight_count, bias_count)` per layer.
+    #[inline]
+    pub fn try_prepare_grad_buffers(&mut self, layer_sizes: &[(usize, usize)]) -> ArkanResult<()> {
         let num_layers = layer_sizes.len();
+
+        // Validate sizes won't overflow
+        for (w_size, b_size) in layer_sizes {
+            if *w_size > MAX_BUFFER_ELEMENTS {
+                return Err(ArkanError::overflow(&format!(
+                    "Weight gradient size {} exceeds MAX_BUFFER_ELEMENTS ({})",
+                    w_size, MAX_BUFFER_ELEMENTS
+                )));
+            }
+            if *b_size > MAX_BUFFER_ELEMENTS {
+                return Err(ArkanError::overflow(&format!(
+                    "Bias gradient size {} exceeds MAX_BUFFER_ELEMENTS ({})",
+                    b_size, MAX_BUFFER_ELEMENTS
+                )));
+            }
+        }
 
         // Resize gradient vectors if needed
         if self.weight_grads.len() < num_layers {
@@ -1084,12 +1119,20 @@ impl Workspace {
                 buf.resize(*b_size, 0.0);
             }
         }
+
+        Ok(())
     }
 
     /// Current batch capacity.
     #[inline]
     pub fn batch_capacity(&self) -> usize {
         self.batch_capacity
+    }
+
+    /// Returns the history batch size.
+    #[inline]
+    pub fn history_batch_size(&self) -> usize {
+        self.history_batch_size
     }
 
     /// Asserts that workspace is properly sized for the batch.
@@ -1101,6 +1144,21 @@ impl Workspace {
             self.history_batch_size,
             batch_size
         );
+    }
+
+    /// Checks that workspace history matches the expected batch size.
+    ///
+    /// Returns `Ok(())` if `history_batch_size == batch_size`, otherwise
+    /// returns `ArkanError::ShapeMismatch`.
+    #[inline]
+    pub fn check_history_batch(&self, batch_size: usize) -> ArkanResult<()> {
+        if self.history_batch_size != batch_size {
+            return Err(ArkanError::shape_mismatch(
+                &[batch_size],
+                &[self.history_batch_size],
+            ));
+        }
+        Ok(())
     }
 
     /// Asserts that workspace is properly sized for the batch.
