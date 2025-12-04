@@ -814,7 +814,7 @@ impl std::fmt::Debug for PipelineCache {
 /// Computes the workgroup count for a given number of elements.
 #[inline]
 pub fn workgroup_count(total: usize, workgroup_size: usize) -> u32 {
-    ((total + workgroup_size - 1) / workgroup_size) as u32
+    total.div_ceil(workgroup_size) as u32
 }
 
 /// Default workgroup size for compute shaders.

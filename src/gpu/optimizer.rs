@@ -339,7 +339,7 @@ impl GpuAdam {
             ],
         });
 
-        let workgroups = (state.num_params as u32 + 255) / 256;
+        let workgroups = (state.num_params as u32).div_ceil(256);
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -723,7 +723,7 @@ impl GpuSgd {
                 ],
             });
 
-            let workgroups = (self.weight_states[i].num_params as u32 + 255) / 256;
+            let workgroups = (self.weight_states[i].num_params as u32).div_ceil(256);
 
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -774,7 +774,7 @@ impl GpuSgd {
                 ],
             });
 
-            let workgroups = (self.bias_states[i].num_params as u32 + 255) / 256;
+            let workgroups = (self.bias_states[i].num_params as u32).div_ceil(256);
 
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

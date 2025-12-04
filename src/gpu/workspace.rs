@@ -300,8 +300,7 @@ impl GpuWorkspace {
             self.z_values.clear();
             self.span_indices.clear();
 
-            for i in 0..num_layers {
-                let in_dim = layer_dims[i];
+            for (i, &in_dim) in layer_dims.iter().take(num_layers).enumerate() {
                 let size = batch_size * in_dim;
 
                 // z_values: normalized inputs
@@ -331,7 +330,7 @@ impl GpuWorkspace {
         let needs_grad_output_realloc = self
             .grad_output
             .as_ref()
-            .map_or(true, |g| g.shape[0] < batch_size || g.shape[1] < max_dim);
+            .is_none_or(|g| g.shape[0] < batch_size || g.shape[1] < max_dim);
         if needs_grad_output_realloc {
             self.grad_output = Some(GpuTensor::storage_read_write(
                 device,
@@ -344,7 +343,7 @@ impl GpuWorkspace {
         let needs_grad_input_realloc = self
             .grad_input
             .as_ref()
-            .map_or(true, |g| g.shape[0] < batch_size);
+            .is_none_or(|g| g.shape[0] < batch_size);
         if needs_grad_input_realloc {
             self.grad_input = Some(GpuTensor::storage_read_write(
                 device,
@@ -435,7 +434,7 @@ impl GpuWorkspace {
         layer_idx: usize,
     ) -> ArkanResult<Vec<f32>> {
         let gw = self.grad_weights.get(layer_idx).ok_or_else(|| {
-            ArkanError::buffer(&format!("grad_weights[{}] not allocated", layer_idx))
+            ArkanError::buffer(format!("grad_weights[{}] not allocated", layer_idx))
         })?;
         gw.download(device, queue)
     }
@@ -448,7 +447,7 @@ impl GpuWorkspace {
         layer_idx: usize,
     ) -> ArkanResult<Vec<f32>> {
         let gb = self.grad_bias.get(layer_idx).ok_or_else(|| {
-            ArkanError::buffer(&format!("grad_bias[{}] not allocated", layer_idx))
+            ArkanError::buffer(format!("grad_bias[{}] not allocated", layer_idx))
         })?;
         gb.download(device, queue)
     }
@@ -582,8 +581,7 @@ impl GpuWorkspace {
                     .ok_or_else(|| ArkanError::buffer("No input buffer"))?
                     .buffer
                     .as_entire_binding(),
-                self.intermediates
-                    .get(0)
+                self.intermediates.first()
                     .ok_or_else(|| ArkanError::buffer("No intermediate buffer 0"))?
                     .buffer
                     .as_entire_binding(),
@@ -594,7 +592,7 @@ impl GpuWorkspace {
                 self.intermediates
                     .get(layer_idx - 1)
                     .ok_or_else(|| {
-                        ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1))
+                        ArkanError::buffer(format!("No intermediate buffer {}", layer_idx - 1))
                     })?
                     .buffer
                     .as_entire_binding(),
@@ -610,14 +608,14 @@ impl GpuWorkspace {
                 self.intermediates
                     .get(layer_idx - 1)
                     .ok_or_else(|| {
-                        ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1))
+                        ArkanError::buffer(format!("No intermediate buffer {}", layer_idx - 1))
                     })?
                     .buffer
                     .as_entire_binding(),
                 self.intermediates
                     .get(layer_idx)
                     .ok_or_else(|| {
-                        ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx))
+                        ArkanError::buffer(format!("No intermediate buffer {}", layer_idx))
                     })?
                     .buffer
                     .as_entire_binding(),
@@ -670,7 +668,7 @@ impl GpuWorkspace {
         if self
             .cached_training_bind_groups
             .get(layer_idx)
-            .map_or(false, |bg| bg.is_some())
+            .is_some_and(|bg| bg.is_some())
         {
             return self.cached_training_bind_groups[layer_idx]
                 .as_ref()
@@ -689,10 +687,10 @@ impl GpuWorkspace {
             .as_ref()
             .ok_or_else(|| ArkanError::buffer("Output buffer not allocated"))?;
         let z_values = self.z_values.get(layer_idx).ok_or_else(|| {
-            ArkanError::buffer(&format!("z_values buffer {} not allocated", layer_idx))
+            ArkanError::buffer(format!("z_values buffer {} not allocated", layer_idx))
         })?;
         let span_indices = self.span_indices.get(layer_idx).ok_or_else(|| {
-            ArkanError::buffer(&format!("span_indices buffer {} not allocated", layer_idx))
+            ArkanError::buffer(format!("span_indices buffer {} not allocated", layer_idx))
         })?;
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -763,8 +761,7 @@ impl GpuWorkspace {
                     .ok_or_else(|| ArkanError::buffer("No input buffer"))?
                     .buffer
                     .as_entire_binding(),
-                self.intermediates
-                    .get(0)
+                self.intermediates.first()
                     .ok_or_else(|| ArkanError::buffer("No intermediate buffer 0"))?
                     .buffer
                     .as_entire_binding(),
@@ -774,7 +771,7 @@ impl GpuWorkspace {
                 self.intermediates
                     .get(layer_idx - 1)
                     .ok_or_else(|| {
-                        ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1))
+                        ArkanError::buffer(format!("No intermediate buffer {}", layer_idx - 1))
                     })?
                     .buffer
                     .as_entire_binding(),
@@ -789,14 +786,14 @@ impl GpuWorkspace {
                 self.intermediates
                     .get(layer_idx - 1)
                     .ok_or_else(|| {
-                        ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx - 1))
+                        ArkanError::buffer(format!("No intermediate buffer {}", layer_idx - 1))
                     })?
                     .buffer
                     .as_entire_binding(),
                 self.intermediates
                     .get(layer_idx)
                     .ok_or_else(|| {
-                        ArkanError::buffer(&format!("No intermediate buffer {}", layer_idx))
+                        ArkanError::buffer(format!("No intermediate buffer {}", layer_idx))
                     })?
                     .buffer
                     .as_entire_binding(),
@@ -805,10 +802,10 @@ impl GpuWorkspace {
 
         // Get training buffers
         let z_values = self.z_values.get(layer_idx).ok_or_else(|| {
-            ArkanError::buffer(&format!("z_values buffer {} not allocated", layer_idx))
+            ArkanError::buffer(format!("z_values buffer {} not allocated", layer_idx))
         })?;
         let span_indices = self.span_indices.get(layer_idx).ok_or_else(|| {
-            ArkanError::buffer(&format!("span_indices buffer {} not allocated", layer_idx))
+            ArkanError::buffer(format!("span_indices buffer {} not allocated", layer_idx))
         })?;
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

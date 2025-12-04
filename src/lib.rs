@@ -28,6 +28,11 @@
 //! // Preallocate workspace (reuse across calls for zero-alloc)
 //! let mut workspace = network.create_workspace(64);
 //!
+
+// Allow manual divisibility checks (x % y == 0) - is_multiple_of is nightly-only
+// This lint may not exist in older clippy versions, so we allow unknown lints
+#![allow(unknown_lints)]
+#![allow(clippy::manual_is_multiple_of)]
 //! // Single inference (~30 µs)
 //! let input = vec![0.5f32; config.input_dim];
 //! let mut output = vec![0.0f32; config.output_dim];

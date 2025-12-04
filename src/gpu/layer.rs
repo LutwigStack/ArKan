@@ -104,7 +104,7 @@ impl GpuLayer {
         let order = cpu_layer.order;
         let global_basis_size = cpu_layer.global_basis_size;
         let basis_padded = pad_to_vec4(global_basis_size);
-        let basis_vec4s = (basis_padded + 3) / 4; // ceil division
+        let basis_vec4s = basis_padded.div_ceil(4); // ceil division
 
         // Pack weights into vec4 format
         // Each vec4 contains 4 consecutive basis weights

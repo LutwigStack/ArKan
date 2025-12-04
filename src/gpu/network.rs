@@ -256,7 +256,7 @@ impl GpuNetwork {
     pub fn is_training_initialized(&self) -> bool {
         self.layers
             .first()
-            .map_or(true, |l| l.is_training_initialized())
+            .is_none_or(|l| l.is_training_initialized())
     }
 
     /// Zeros all gradient buffers.
@@ -1020,7 +1020,7 @@ impl GpuNetwork {
             });
 
         // Update batch_size in uniforms
-        let mut uniforms = layer.uniforms.clone();
+        let mut uniforms = layer.uniforms;
         uniforms.batch_size = batch_size as u32;
         self.queue
             .write_buffer(&layer.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -1352,6 +1352,7 @@ impl GpuNetwork {
     /// # Returns
     ///
     /// The loss value for this batch.
+    #[allow(clippy::too_many_arguments)]
     pub fn train_step_with_options(
         &mut self,
         input: &[f32],
@@ -1484,6 +1485,7 @@ impl GpuNetwork {
     /// # Returns
     ///
     /// The loss value for this batch.
+    #[allow(clippy::too_many_arguments)]
     pub fn train_step_sgd_with_options(
         &mut self,
         input: &[f32],

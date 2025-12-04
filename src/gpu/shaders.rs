@@ -1385,7 +1385,7 @@ fn get_deriv_value(deriv: array<f32, 6>, idx: u32) -> f32 {
 /// assert!(shader.contains("order=4"));
 /// ```
 pub fn generate_forward_shader(order: usize) -> ArkanResult<String> {
-    if order < MIN_GPU_SPLINE_ORDER || order > MAX_GPU_SPLINE_ORDER {
+    if !(MIN_GPU_SPLINE_ORDER..=MAX_GPU_SPLINE_ORDER).contains(&order) {
         return Err(ArkanError::unsupported_order(order));
     }
 
@@ -1500,7 +1500,7 @@ fn forward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 ///
 /// Complete WGSL shader source code for weight gradient computation.
 pub fn generate_backward_weights_shader(order: usize) -> ArkanResult<String> {
-    if order < MIN_GPU_SPLINE_ORDER || order > MAX_GPU_SPLINE_ORDER {
+    if !(MIN_GPU_SPLINE_ORDER..=MAX_GPU_SPLINE_ORDER).contains(&order) {
         return Err(ArkanError::unsupported_order(order));
     }
 
@@ -1615,7 +1615,7 @@ fn backward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 
 /// Generates a backward pass shader for input gradients for a specific spline order.
 pub fn generate_backward_input_shader(order: usize) -> ArkanResult<String> {
-    if order < MIN_GPU_SPLINE_ORDER || order > MAX_GPU_SPLINE_ORDER {
+    if !(MIN_GPU_SPLINE_ORDER..=MAX_GPU_SPLINE_ORDER).contains(&order) {
         return Err(ArkanError::unsupported_order(order));
     }
 
@@ -1749,7 +1749,7 @@ fn backward_input_main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 
 /// Generates a forward training shader that saves intermediate values.
 pub fn generate_forward_training_shader(order: usize) -> ArkanResult<String> {
-    if order < MIN_GPU_SPLINE_ORDER || order > MAX_GPU_SPLINE_ORDER {
+    if !(MIN_GPU_SPLINE_ORDER..=MAX_GPU_SPLINE_ORDER).contains(&order) {
         return Err(ArkanError::unsupported_order(order));
     }
 

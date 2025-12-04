@@ -86,7 +86,7 @@ pub fn checked_buffer_size(a: usize, b: usize) -> ArkanResult<usize> {
         .ok_or_else(|| ArkanError::overflow("Buffer size overflow"))?;
 
     if result > MAX_BUFFER_ELEMENTS {
-        return Err(ArkanError::overflow(&format!(
+        return Err(ArkanError::overflow(format!(
             "Buffer size {} exceeds MAX_BUFFER_ELEMENTS ({})",
             result, MAX_BUFFER_ELEMENTS
         )));
@@ -202,7 +202,7 @@ impl AlignedBuffer {
         }
 
         if capacity > MAX_BUFFER_ELEMENTS {
-            return Err(ArkanError::overflow(&format!(
+            return Err(ArkanError::overflow(format!(
                 "Buffer capacity {} exceeds MAX_BUFFER_ELEMENTS ({})",
                 capacity, MAX_BUFFER_ELEMENTS
             )));
@@ -1091,13 +1091,13 @@ impl Workspace {
         // Validate sizes won't overflow
         for (w_size, b_size) in layer_sizes {
             if *w_size > MAX_BUFFER_ELEMENTS {
-                return Err(ArkanError::overflow(&format!(
+                return Err(ArkanError::overflow(format!(
                     "Weight gradient size {} exceeds MAX_BUFFER_ELEMENTS ({})",
                     w_size, MAX_BUFFER_ELEMENTS
                 )));
             }
             if *b_size > MAX_BUFFER_ELEMENTS {
-                return Err(ArkanError::overflow(&format!(
+                return Err(ArkanError::overflow(format!(
                     "Bias gradient size {} exceeds MAX_BUFFER_ELEMENTS ({})",
                     b_size, MAX_BUFFER_ELEMENTS
                 )));

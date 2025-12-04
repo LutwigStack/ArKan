@@ -97,7 +97,7 @@ impl GpuTensor {
             });
         }
 
-        let size_bytes = (data.len() * std::mem::size_of::<f32>()) as u64;
+        let size_bytes = std::mem::size_of_val(data) as u64;
 
         if exceeds_vram_limit(size_bytes) {
             return Err(ArkanError::batch_too_large(
@@ -184,7 +184,7 @@ impl GpuTensor {
             });
         }
 
-        let size_bytes = (data.len() * std::mem::size_of::<f32>()) as u64;
+        let size_bytes = std::mem::size_of_val(data) as u64;
 
         if exceeds_vram_limit(size_bytes) {
             return Err(ArkanError::batch_too_large(
@@ -231,7 +231,7 @@ impl GpuTensor {
             });
         }
 
-        let size_bytes = (data.len() * std::mem::size_of::<f32>()) as u64;
+        let size_bytes = std::mem::size_of_val(data) as u64;
 
         if exceeds_vram_limit(size_bytes) {
             return Err(ArkanError::batch_too_large(

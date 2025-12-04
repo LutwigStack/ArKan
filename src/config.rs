@@ -331,7 +331,6 @@ impl KanConfig {
     /// };
     /// assert!(bad_config.validate().is_err());
     /// ```
-    #[must_use]
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.input_dim == 0 {
             return Err(ConfigError::InvalidDimension(Cow::Borrowed(

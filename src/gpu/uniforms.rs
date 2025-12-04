@@ -61,6 +61,7 @@ pub struct LayerUniforms {
 
 impl LayerUniforms {
     /// Creates a new LayerUniforms.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         grid_min: f32,
         grid_max: f32,
