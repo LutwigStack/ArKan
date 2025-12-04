@@ -350,9 +350,15 @@ impl GpuLayer {
     /// - `grad_bias`: same size as bias buffer
     ///
     /// These buffers are used by [`GpuAdam`] and [`GpuSgd`] optimizers.
-    pub fn init_training(&mut self, device: &wgpu::Device) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArkanError::BufferError`] if buffer creation fails.
+    pub fn init_training(&mut self, device: &wgpu::Device) -> crate::ArkanResult<()> {
+        use crate::ArkanError;
+
         if self.grad_weights.is_some() {
-            return; // Already initialized
+            return Ok(()); // Already initialized
         }
 
         // Gradient for weights (same layout as weights: vec4 packed)
@@ -363,15 +369,17 @@ impl GpuLayer {
                 &grad_weights_zeros,
                 vec![self.out_dim * self.in_dim * self.basis_vec4s * 4],
             )
-            .expect("Failed to create grad_weights buffer"),
+            .map_err(|e| ArkanError::buffer(format!("Failed to create grad_weights buffer: {}", e)))?,
         );
 
         // Gradient for bias
         let grad_bias_zeros = vec![0.0f32; self.out_dim];
         self.grad_bias = Some(
             GpuTensor::storage_rw(device, &grad_bias_zeros, vec![self.out_dim])
-                .expect("Failed to create grad_bias buffer"),
+                .map_err(|e| ArkanError::buffer(format!("Failed to create grad_bias buffer: {}", e)))?,
         );
+
+        Ok(())
     }
 
     /// Returns true if training buffers are initialized.
@@ -408,30 +416,32 @@ impl GpuLayer {
 
     /// Returns the grad_weights buffer reference (for optimizer).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if training is not initialized. Call `init_training()` first.
+    /// Returns [`ArkanError::InvalidWorkspace`] if training is not initialized.
     #[inline]
-    pub fn grad_weights_buffer(&self) -> &wgpu::Buffer {
-        &self
+    pub fn grad_weights_buffer(&self) -> crate::ArkanResult<&wgpu::Buffer> {
+        use crate::ArkanError;
+        Ok(&self
             .grad_weights
             .as_ref()
-            .expect("Training not initialized. Call init_training() first.")
-            .buffer
+            .ok_or_else(|| ArkanError::invalid_workspace("Training not initialized. Call init_training() first."))?
+            .buffer)
     }
 
     /// Returns the grad_bias buffer reference (for optimizer).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if training is not initialized. Call `init_training()` first.
+    /// Returns [`ArkanError::InvalidWorkspace`] if training is not initialized.
     #[inline]
-    pub fn grad_bias_buffer(&self) -> &wgpu::Buffer {
-        &self
+    pub fn grad_bias_buffer(&self) -> crate::ArkanResult<&wgpu::Buffer> {
+        use crate::ArkanError;
+        Ok(&self
             .grad_bias
             .as_ref()
-            .expect("Training not initialized. Call init_training() first.")
-            .buffer
+            .ok_or_else(|| ArkanError::invalid_workspace("Training not initialized. Call init_training() first."))?
+            .buffer)
     }
 
     // ==================== Backward Pass Support ====================

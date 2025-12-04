@@ -20,6 +20,8 @@
 //! }
 //! ```
 
+use std::borrow::Cow;
+
 use thiserror::Error;
 
 use crate::config::ConfigError;
@@ -179,8 +181,7 @@ impl ArkanError {
     /// Creates a configuration error with a message.
     pub fn config_msg<S: AsRef<str>>(msg: S) -> Self {
         ArkanError::Config(ConfigError::InvalidDimension(
-            // This is a workaround - ideally ConfigError would have a Generic variant
-            Box::leak(msg.as_ref().to_string().into_boxed_str())
+            Cow::Owned(msg.as_ref().to_string())
         ))
     }
 
@@ -266,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_config_error() {
-        let err = ArkanError::config(ConfigError::InvalidDimension("test dimension"));
+        let err = ArkanError::config(ConfigError::InvalidDimension(Cow::Borrowed("test dimension")));
         assert!(err.to_string().contains("Configuration error"));
     }
 }

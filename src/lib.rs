@@ -138,6 +138,7 @@ pub mod spline;
 pub mod gpu;
 
 // Re-exports for convenience
+#[allow(deprecated)]
 pub use baked::BakedModel;
 pub use buffer::{
     checked_buffer_size, checked_buffer_size3, AlignedBuffer, Tensor, TensorView, Workspace,

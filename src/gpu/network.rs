@@ -239,10 +239,15 @@ impl GpuNetwork {
     ///
     /// This is separate from the hybrid training path (`train_step_mse`, etc.)
     /// which uses workspace buffers and CPU optimizers.
-    pub fn init_training(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns error if buffer creation fails.
+    pub fn init_training(&mut self) -> crate::ArkanResult<()> {
         for layer in &mut self.layers {
-            layer.init_training(&self.device);
+            layer.init_training(&self.device)?;
         }
+        Ok(())
     }
 
     /// Returns true if training buffers are initialized.
@@ -282,13 +287,13 @@ impl GpuNetwork {
 
     /// Returns references to layer gradient buffers for optimizer.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if training is not initialized. Call `init_training()` first.
-    pub fn layer_grads(&self) -> Vec<(&wgpu::Buffer, &wgpu::Buffer)> {
+    /// Returns error if training is not initialized. Call `init_training()` first.
+    pub fn layer_grads(&self) -> crate::ArkanResult<Vec<(&wgpu::Buffer, &wgpu::Buffer)>> {
         self.layers
             .iter()
-            .map(|l| (l.grad_weights_buffer(), l.grad_bias_buffer()))
+            .map(|l| Ok((l.grad_weights_buffer()?, l.grad_bias_buffer()?)))
             .collect()
     }
 
@@ -718,7 +723,11 @@ impl GpuNetwork {
 
         // Get training workspace layout
         let training_layout = self.pipeline_cache.get_training_workspace_layout();
-        // Need to clone reference before mutable borrow
+        // SAFETY: We need to extend the lifetime of training_layout to use it after
+        // mutable borrows of self. This is safe because:
+        // 1. training_layout is stored in pipeline_cache and never deallocated
+        // 2. The underlying wgpu::BindGroupLayout is immutable once created
+        // 3. We only use training_layout_ref for creating bind groups, not modifying pipeline_cache
         let training_layout_ref = unsafe { &*(training_layout as *const _) };
 
         // For single layer network
@@ -1023,7 +1032,11 @@ impl GpuNetwork {
         );
 
         // Create backward workspace bind group (Group 1)
-        // Need to use unsafe to break the borrow chain
+        // SAFETY: We need to extend the lifetime of backward_workspace_layout to use it 
+        // after mutable borrows of self. This is safe because:
+        // 1. backward_workspace_layout is stored in pipeline_cache and never deallocated
+        // 2. The underlying wgpu::BindGroupLayout is immutable once created
+        // 3. We only use it for creating bind groups, not modifying pipeline_cache
         let backward_workspace_layout = self.pipeline_cache.get_backward_workspace_layout();
         let backward_workspace_layout_ptr = backward_workspace_layout as *const _;
         let backward_workspace_bind_group =
@@ -1831,5 +1844,39 @@ impl std::fmt::Debug for GpuNetwork {
 
 #[cfg(test)]
 mod tests {
-    // GPU tests require actual GPU, run with: cargo test --features gpu -- --ignored
+    use super::*;
+
+    #[test]
+    fn test_gpu_memory_stats() {
+        let stats = GpuMemoryStats {
+            weights_bytes: 1024,
+            bias_bytes: 256,
+            total_bytes: 1280,
+            num_layers: 2,
+            input_dim: 21,
+            output_dim: 24,
+        };
+
+        assert_eq!(stats.total_bytes, 1280);
+        assert!((stats.total_kb() - 1.25).abs() < 0.01);
+        assert!((stats.total_mb() - 0.00122).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_gpu_memory_stats_zero() {
+        let stats = GpuMemoryStats {
+            weights_bytes: 0,
+            bias_bytes: 0,
+            total_bytes: 0,
+            num_layers: 0,
+            input_dim: 0,
+            output_dim: 0,
+        };
+
+        assert_eq!(stats.total_kb(), 0.0);
+        assert_eq!(stats.total_mb(), 0.0);
+    }
+
+    // GPU integration tests require actual GPU hardware.
+    // Run with: cargo test --features gpu -- --ignored
 }

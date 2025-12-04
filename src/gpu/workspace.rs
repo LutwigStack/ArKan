@@ -327,10 +327,11 @@ impl GpuWorkspace {
         let max_dim = layer_dims.iter().max().copied().unwrap_or(self.in_dim);
 
         // Allocate grad_output if needed (uses max_dim for intermediate gradient propagation)
-        if self.grad_output.is_none()
-            || self.grad_output.as_ref().unwrap().shape[0] < batch_size
-            || self.grad_output.as_ref().unwrap().shape[1] < max_dim
-        {
+        // Use map_or to avoid unwrap on Option
+        let needs_grad_output_realloc = self.grad_output.as_ref().map_or(true, |g| {
+            g.shape[0] < batch_size || g.shape[1] < max_dim
+        });
+        if needs_grad_output_realloc {
             self.grad_output = Some(GpuTensor::storage_read_write(
                 device,
                 vec![batch_size, max_dim],
@@ -339,7 +340,10 @@ impl GpuWorkspace {
         }
 
         // Allocate grad_input (max dim across layers for reuse)
-        if self.grad_input.is_none() || self.grad_input.as_ref().unwrap().shape[0] < batch_size {
+        let needs_grad_input_realloc = self.grad_input.as_ref().map_or(true, |g| {
+            g.shape[0] < batch_size
+        });
+        if needs_grad_input_realloc {
             self.grad_input = Some(GpuTensor::storage_read_write(
                 device,
                 vec![batch_size, max_dim],
@@ -528,7 +532,9 @@ impl GpuWorkspace {
             self.cached_bind_group = Some(bind_group);
         }
 
-        Ok(self.cached_bind_group.as_ref().unwrap())
+        self.cached_bind_group
+            .as_ref()
+            .ok_or_else(|| ArkanError::buffer("Failed to create cached bind group"))
     }
 
     /// Gets or creates the bind group for a specific layer in multi-layer forward.
@@ -560,7 +566,9 @@ impl GpuWorkspace {
 
         // Check if already cached
         if self.cached_layer_bind_groups[layer_idx].is_some() {
-            return Ok(self.cached_layer_bind_groups[layer_idx].as_ref().unwrap());
+            return self.cached_layer_bind_groups[layer_idx]
+                .as_ref()
+                .ok_or_else(|| ArkanError::buffer("Cache inconsistency: expected bind group"));
         }
 
         // Determine input and output buffers
@@ -631,7 +639,9 @@ impl GpuWorkspace {
         });
 
         self.cached_layer_bind_groups[layer_idx] = Some(bind_group);
-        Ok(self.cached_layer_bind_groups[layer_idx].as_ref().unwrap())
+        self.cached_layer_bind_groups[layer_idx]
+            .as_ref()
+            .ok_or_else(|| ArkanError::buffer("Failed to cache layer bind group"))
     }
 
     // ==================== Training Bind Groups ====================
@@ -660,9 +670,9 @@ impl GpuWorkspace {
             .get(layer_idx)
             .map_or(false, |bg| bg.is_some())
         {
-            return Ok(self.cached_training_bind_groups[layer_idx]
+            return self.cached_training_bind_groups[layer_idx]
                 .as_ref()
-                .unwrap());
+                .ok_or_else(|| ArkanError::buffer("Cache inconsistency: expected training bind group"));
         }
 
         // Get buffers
@@ -709,9 +719,9 @@ impl GpuWorkspace {
                 .resize_with(layer_idx + 1, || None);
         }
         self.cached_training_bind_groups[layer_idx] = Some(bind_group);
-        Ok(self.cached_training_bind_groups[layer_idx]
+        self.cached_training_bind_groups[layer_idx]
             .as_ref()
-            .unwrap())
+            .ok_or_else(|| ArkanError::buffer("Failed to cache training bind group"))
     }
 
     /// Gets or creates the training bind group for a layer in multi-layer network.
@@ -734,9 +744,9 @@ impl GpuWorkspace {
 
         // Check if already cached for this layer
         if self.cached_training_bind_groups[layer_idx].is_some() {
-            return Ok(self.cached_training_bind_groups[layer_idx]
+            return self.cached_training_bind_groups[layer_idx]
                 .as_ref()
-                .unwrap());
+                .ok_or_else(|| ArkanError::buffer("Cache inconsistency: expected training layer bind group"));
         }
 
         // Determine input and output buffers (same routing as forward)
@@ -819,9 +829,9 @@ impl GpuWorkspace {
         });
 
         self.cached_training_bind_groups[layer_idx] = Some(bind_group);
-        Ok(self.cached_training_bind_groups[layer_idx]
+        self.cached_training_bind_groups[layer_idx]
             .as_ref()
-            .unwrap())
+            .ok_or_else(|| ArkanError::buffer("Failed to cache training layer bind group"))
     }
 
     /// Uploads input data to the GPU.

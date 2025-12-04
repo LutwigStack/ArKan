@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// This is a stub for future implementation.
 #[doc(hidden)]
+#[deprecated(
+    since = "0.2.0",
+    note = "BakedModel is incomplete and not recommended for use. Use KanNetwork directly for inference."
+)]
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct BakedModel {
@@ -36,6 +40,7 @@ pub struct BakedModel {
     biases: Vec<f32>,
 }
 
+#[allow(deprecated)]
 impl BakedModel {
     /// Bakes a trained KAN network into quantized form.
     ///
@@ -85,18 +90,17 @@ impl BakedModel {
     /// # Arguments
     /// * `input` - Input features [input_dim]
     /// * `output` - Output buffer [output_dim]
+    ///
+    /// # Panics
+    ///
+    /// Always panics - BakedModel inference is not yet implemented.
+    /// Use `KanNetwork::forward_single` or `KanNetwork::forward_batch` instead.
+    #[allow(unused_variables)]
     pub fn forward(&self, input: &[f32], output: &mut [f32]) {
-        debug_assert_eq!(input.len(), self.config.input_dim);
-        debug_assert_eq!(output.len(), self.config.output_dim);
-
-        // TODO: Implement quantized inference
-        // For now, this is a placeholder
-        output.fill(0.0);
-
-        // Placeholder: just pass through scaled input
-        for (i, &x) in input.iter().enumerate().take(output.len()) {
-            output[i] = x * 0.1;
-        }
+        unimplemented!(
+            "BakedModel::forward() is not implemented. \
+             Use KanNetwork::forward_single() or KanNetwork::forward_batch() instead."
+        );
     }
 
     /// Returns the size of the baked model in bytes.
@@ -118,6 +122,7 @@ impl BakedModel {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -135,6 +140,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "BakedModel::forward() is not implemented")]
     fn test_baked_forward() {
         let config = KanConfig::default();
         let network = KanNetwork::new(config.clone());
@@ -143,9 +149,7 @@ mod tests {
         let input = vec![0.5f32; config.input_dim];
         let mut output = vec![0.0f32; config.output_dim];
 
+        // This should panic with unimplemented!
         baked.forward(&input, &mut output);
-
-        // Output should be finite
-        assert!(output.iter().all(|&x| x.is_finite()));
     }
 }

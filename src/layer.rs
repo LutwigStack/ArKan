@@ -152,15 +152,16 @@ impl KanLayer {
     ) -> Result<Self, crate::ArkanError> {
         use crate::config::ConfigError;
         use crate::ArkanError;
+        use std::borrow::Cow;
 
         if in_dim == 0 {
             return Err(ArkanError::Config(ConfigError::InvalidDimension(
-                "input dimension must be positive",
+                Cow::Borrowed("input dimension must be positive"),
             )));
         }
         if out_dim == 0 {
             return Err(ArkanError::Config(ConfigError::InvalidDimension(
-                "output dimension must be positive",
+                Cow::Borrowed("output dimension must be positive"),
             )));
         }
 
@@ -394,22 +395,39 @@ impl KanLayer {
     ///
     /// - `inputs`: Row-major `[Batch, Input]`
     /// - `outputs`: Row-major `[Batch, Output]`
+    ///
+    /// # Panics
+    ///
+    /// Panics if buffer size calculations overflow. Use [`try_forward_batch`](Self::try_forward_batch)
+    /// for a fallible version.
     pub fn forward_batch(&self, inputs: &[f32], outputs: &mut [f32], workspace: &mut Workspace) {
+        self.forward_batch_impl(inputs, outputs, workspace)
+            .expect("forward_batch: buffer size overflow")
+    }
+
+    /// Internal implementation of forward_batch with overflow checking.
+    fn forward_batch_impl(
+        &self,
+        inputs: &[f32],
+        outputs: &mut [f32],
+        workspace: &mut Workspace,
+    ) -> crate::ArkanResult<()> {
+        use crate::buffer::{checked_buffer_size, checked_buffer_size3};
+
         let batch_size = inputs.len() / self.in_dim;
         debug_assert_eq!(inputs.len(), batch_size * self.in_dim);
         debug_assert_eq!(outputs.len(), batch_size * self.out_dim);
 
-        // Ensure z_buffer is ready to store normalized inputs
-        let z_needed = batch_size * self.in_dim;
-        workspace.z_buffer.resize(z_needed);
+        // Use checked arithmetic to prevent overflow
+        let z_needed = checked_buffer_size(batch_size, self.in_dim)?;
+        workspace.z_buffer.try_resize(z_needed)?;
 
-        // Ensure workspace has enough capacity
-        let basis_needed = batch_size * self.in_dim * self.basis_aligned;
+        let basis_needed = checked_buffer_size3(batch_size, self.in_dim, self.basis_aligned)?;
         if workspace.basis_values.len() < basis_needed {
-            workspace.basis_values.resize(basis_needed);
+            workspace.basis_values.try_resize(basis_needed)?;
         }
 
-        let spans_needed = batch_size * self.in_dim;
+        let spans_needed = checked_buffer_size(batch_size, self.in_dim)?;
         if workspace.grid_indices.len() < spans_needed {
             workspace.grid_indices.resize(spans_needed, 0);
         }
@@ -447,6 +465,8 @@ impl KanLayer {
 
         // Accumulate outputs
         self.accumulate_batch(workspace, outputs, batch_size);
+
+        Ok(())
     }
 
     /// Forward pass for a single input sample (fallible version).
@@ -505,6 +525,7 @@ impl KanLayer {
         workspace: &mut Workspace,
     ) -> crate::ArkanResult<()> {
         use crate::ArkanError;
+        use crate::buffer::checked_buffer_size;
 
         if inputs.is_empty() {
             return Ok(());
@@ -518,7 +539,8 @@ impl KanLayer {
         }
 
         let batch_size = inputs.len() / self.in_dim;
-        let expected_output_len = batch_size * self.out_dim;
+        // Use checked arithmetic for expected_output_len
+        let expected_output_len = checked_buffer_size(batch_size, self.out_dim)?;
 
         if outputs.len() != expected_output_len {
             return Err(ArkanError::shape_mismatch(
@@ -527,8 +549,8 @@ impl KanLayer {
             ));
         }
 
-        self.forward_batch(inputs, outputs, workspace);
-        Ok(())
+        // Use internal impl that returns Result
+        self.forward_batch_impl(inputs, outputs, workspace)
     }
 
     /// Accumulates outputs for a batch (internal helper).

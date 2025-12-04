@@ -39,6 +39,8 @@
 //! - [`MAX_SPLINE_ORDER`]: Maximum supported spline order (7 for CPU, 5 for GPU)
 //! - [`MAX_GPU_SPLINE_ORDER`]: Maximum spline order supported by GPU shaders
 
+use std::borrow::Cow;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -332,10 +334,10 @@ impl KanConfig {
     #[must_use]
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.input_dim == 0 {
-            return Err(ConfigError::InvalidDimension("input_dim must be > 0"));
+            return Err(ConfigError::InvalidDimension(Cow::Borrowed("input_dim must be > 0")));
         }
         if self.output_dim == 0 {
-            return Err(ConfigError::InvalidDimension("output_dim must be > 0"));
+            return Err(ConfigError::InvalidDimension(Cow::Borrowed("output_dim must be > 0")));
         }
         if self.grid_size == 0 || self.grid_size > 16 {
             return Err(ConfigError::InvalidGridSize(self.grid_size));
@@ -352,6 +354,19 @@ impl KanConfig {
         if self.input_std.len() != self.input_dim {
             return Err(ConfigError::MismatchedNormalization("input_std"));
         }
+        // Warn about zero/negative values in input_std (will be clamped to EPSILON)
+        if self.input_std.iter().any(|&s| s <= 0.0) {
+            #[cfg(feature = "gpu")]
+            log::warn!(
+                "input_std contains zero or negative values; will be clamped to EPSILON ({})",
+                EPSILON
+            );
+            #[cfg(not(feature = "gpu"))]
+            eprintln!(
+                "Warning: input_std contains zero or negative values; will be clamped to EPSILON ({})",
+                EPSILON
+            );
+        }
         // init_seed: any value is acceptable, None => random
         // SIMD width must be a power of 2 (4, 8, 16)
         if !matches!(self.simd_width, 4 | 8 | 16) {
@@ -360,9 +375,9 @@ impl KanConfig {
         // Ensure order+1 <= global_basis_size (always true, but verify)
         let global_basis = self.basis_size();
         if self.spline_order + 1 > global_basis {
-            return Err(ConfigError::InvalidDimension(
+            return Err(ConfigError::InvalidDimension(Cow::Borrowed(
                 "spline_order + 1 must be <= grid_size + spline_order",
-            ));
+            )));
         }
         Ok(())
     }
@@ -421,14 +436,14 @@ impl Default for LayerConfig {
 pub enum ConfigError {
     /// A dimension parameter is invalid (zero or mismatched).
     #[error("Invalid dimension: {0}")]
-    InvalidDimension(&'static str),
+    InvalidDimension(Cow<'static, str>),
 
     /// Grid size is out of valid range (1-16).
     #[error("Grid size must be 1-16, got {0}")]
     InvalidGridSize(usize),
 
-    /// Spline order is out of valid range (1-5).
-    #[error("Spline order must be 1-5, got {0}")]
+    /// Spline order is out of valid range (1-7 for CPU, 2-5 for GPU).
+    #[error("Spline order must be 1-7 for CPU, 2-5 for GPU, got {0}")]
     InvalidSplineOrder(usize),
 
     /// Grid range is invalid (min >= max).
@@ -599,10 +614,10 @@ impl KanConfigBuilder {
     pub fn build(self) -> Result<KanConfig, ConfigError> {
         let input_dim = self
             .input_dim
-            .ok_or(ConfigError::InvalidDimension("input_dim not set"))?;
+            .ok_or(ConfigError::InvalidDimension(Cow::Borrowed("input_dim not set")))?;
         let output_dim = self
             .output_dim
-            .ok_or(ConfigError::InvalidDimension("output_dim not set"))?;
+            .ok_or(ConfigError::InvalidDimension(Cow::Borrowed("output_dim not set")))?;
 
         let input_mean = self.input_mean.unwrap_or_else(|| vec![0.0; input_dim]);
         let input_std = self

@@ -851,15 +851,14 @@ impl Workspace {
         let dims = config.layer_dims();
         let max_dim = *dims.iter().max().unwrap_or(&1);
         let basis = config.basis_size_aligned();
-        let input_dim = config.input_dim;
         let output_dim = config.output_dim;
 
         // Check all size calculations for overflow using checked_buffer_size
-        // z_buffer: [batch, input]
-        let z_size = checked_buffer_size(batch_size, input_dim)?;
+        // z_buffer: [batch, max_dim] - needs max_dim for hidden layers wider than input
+        let z_size = checked_buffer_size(batch_size, max_dim)?;
 
-        // basis_values: [batch, input, basis]
-        let basis_size = checked_buffer_size3(batch_size, input_dim, basis)?;
+        // basis_values: [batch, max_dim, basis] - needs max_dim for hidden layers
+        let basis_size = checked_buffer_size3(batch_size, max_dim, basis)?;
 
         // layer buffers: [batch, max_dim]
         let layer_size = checked_buffer_size(batch_size, max_dim)?;
@@ -916,14 +915,19 @@ impl Workspace {
         batch_size: usize,
         config: &KanConfig,
     ) -> ArkanResult<()> {
+        if batch_size == 0 {
+            return Err(crate::ArkanError::shape_mismatch(&[1], &[0]));
+        }
         self.try_reserve(batch_size, config)?;
 
-        let input_dim = config.input_dim;
+        // Use max_dim for hidden layers wider than input
+        let dims = config.layer_dims();
+        let max_dim = *dims.iter().max().unwrap_or(&1);
         let basis = config.basis_size_aligned();
 
-        // Use checked arithmetic
-        let z_size = checked_buffer_size(batch_size, input_dim)?;
-        let basis_size = checked_buffer_size3(batch_size, input_dim, basis)?;
+        // Use checked arithmetic with max_dim
+        let z_size = checked_buffer_size(batch_size, max_dim)?;
+        let basis_size = checked_buffer_size3(batch_size, max_dim, basis)?;
 
         self.z_buffer.resize(z_size);
         self.basis_values.resize(basis_size);
@@ -1379,8 +1383,10 @@ mod tests {
 
         ws.prepare_forward(64, &config);
 
-        assert_eq!(ws.z_buffer.len(), 64 * 21);
-        assert_eq!(ws.grid_indices.len(), 64 * 21);
+        // After fix: workspace uses max_dim (64) for z_buffer and grid_indices
+        let max_dim = *config.layer_dims().iter().max().unwrap();
+        assert_eq!(ws.z_buffer.len(), 64 * max_dim);
+        assert_eq!(ws.grid_indices.len(), 64 * max_dim);
     }
 
     #[test]
