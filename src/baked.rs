@@ -3,11 +3,17 @@
 //! This module provides a quantized, inference-only representation
 //! of a trained KAN model for production deployment.
 //!
-//! # Features (TODO)
+//! # Status: Planned for v0.4.0
+//!
+//! This module is currently a stub. Full implementation is planned for v0.4.0.
+//!
+//! # Planned Features
 //! - 8-bit quantized weights
 //! - Fixed-point arithmetic
 //! - No allocation inference
 //! - Platform-specific SIMD paths
+//!
+//! For now, use [`KanNetwork`](crate::KanNetwork) directly for inference.
 
 use crate::config::KanConfig;
 use crate::network::KanNetwork;
@@ -17,11 +23,12 @@ use serde::{Deserialize, Serialize};
 
 /// Quantized KAN model for inference.
 ///
-/// This is a stub for future implementation.
+/// This is a stub - full implementation planned for v0.4.0.
+/// Use [`KanNetwork`](crate::KanNetwork) for inference until then.
 #[doc(hidden)]
 #[deprecated(
     since = "0.2.0",
-    note = "BakedModel is incomplete and not recommended for use. Use KanNetwork directly for inference."
+    note = "BakedModel is a stub, planned for v0.4.0. Use KanNetwork directly for inference."
 )]
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
