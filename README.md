@@ -54,7 +54,7 @@ ArKan включает опциональный GPU бэкенд на основ
 
 ```toml
 [dependencies]
-arkan = { version = "0.2.0", features = ["gpu"] }
+arkan = { version = "0.3.0", features = ["gpu"] }
 ```
 
 ### **Использование**
@@ -170,7 +170,7 @@ ArKan занимает нишу **специализированного выс�
 
 ```toml
 [dependencies]
-arkan = "0.2.0"
+arkan = "0.3.0"
 ```
 
 Пример использования (смотрите также `examples/basic.rs` и `examples/training.rs`):
@@ -262,7 +262,7 @@ ArKan includes an optional GPU backend using `wgpu` for WebGPU/Vulkan/Metal/DX12
 
 ```toml
 [dependencies]
-arkan = { version = "0.2.0", features = ["gpu"] }
+arkan = { version = "0.3.0", features = ["gpu"] }
 ```
 
 ### **Usage**
@@ -426,7 +426,7 @@ Install from crates.io:
 
 ```toml
 [dependencies]
-arkan = "0.2.0"
+arkan = "0.3.0"
 ```
 
 Usage Example (see also `examples/basic.rs` and `examples/training.rs`):
