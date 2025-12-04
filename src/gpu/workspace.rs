@@ -330,7 +330,7 @@ impl GpuWorkspace {
         let needs_grad_output_realloc = self
             .grad_output
             .as_ref()
-            .is_none_or(|g| g.shape[0] < batch_size || g.shape[1] < max_dim);
+            .map_or(true, |g| g.shape[0] < batch_size || g.shape[1] < max_dim);
         if needs_grad_output_realloc {
             self.grad_output = Some(GpuTensor::storage_read_write(
                 device,
@@ -343,7 +343,7 @@ impl GpuWorkspace {
         let needs_grad_input_realloc = self
             .grad_input
             .as_ref()
-            .is_none_or(|g| g.shape[0] < batch_size);
+            .map_or(true, |g| g.shape[0] < batch_size);
         if needs_grad_input_realloc {
             self.grad_input = Some(GpuTensor::storage_read_write(
                 device,
@@ -668,7 +668,7 @@ impl GpuWorkspace {
         if self
             .cached_training_bind_groups
             .get(layer_idx)
-            .is_some_and(|bg| bg.is_some())
+            .map_or(false, |bg| bg.is_some())
         {
             return self.cached_training_bind_groups[layer_idx]
                 .as_ref()

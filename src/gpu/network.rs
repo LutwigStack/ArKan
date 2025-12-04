@@ -256,7 +256,7 @@ impl GpuNetwork {
     pub fn is_training_initialized(&self) -> bool {
         self.layers
             .first()
-            .is_none_or(|l| l.is_training_initialized())
+            .map_or(true, |l| l.is_training_initialized())
     }
 
     /// Zeros all gradient buffers.
