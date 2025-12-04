@@ -1,10 +1,11 @@
 # ArKan Benchmark Results
 
 **Test Date:** December 4, 2025  
-**Platform:** Windows, CPU + GPU  
+**Platform:** Windows 11, CPU + GPU  
 **CPU Config:** Poker preset `[21, 64, 64, 24]`, Grid 5, Spline Order 3 (cubic)  
-**GPU:** NVIDIA GeForce RTX 4070 SUPER (Vulkan via wgpu)  
-**Rust:** `cargo bench` with AVX2/Rayon enabled
+**GPU:** NVIDIA GeForce RTX 4070 SUPER (Vulkan via wgpu 0.23)  
+**Rust:** `cargo bench` with AVX2/Rayon enabled  
+**Python:** PyTorch 2.x (CPU comparison via `scripts/bench_pytorch_train.py`)
 
 ---
 
@@ -14,7 +15,8 @@
 |--------|-------|
 | **Single inference latency (P50)** | **15.0 µs** |
 | **Single inference throughput** | **~66,000 inferences/sec** |
-| **vs PyTorch (batch=1)** | **32x faster** |
+| **vs PyTorch CPU (batch=1)** | **54x faster (forward), 25x faster (train)** |
+| **vs PyTorch CPU (batch=64)** | **2.5x faster (forward), 1.6x faster (train)** |
 | **Memory footprint** | 218.6 KB (weights only) |
 | **Zero-allocation training** | ✅ Full train step without allocs |
 | **Native GPU training (batch=64)** | **3.96 ms** (2.5x faster than hybrid) |
@@ -296,9 +298,9 @@ Critical for MCTS/CFR solvers where thousands of single inferences per second ar
 | Batch | Est. Memory | Time | Bandwidth |
 |-------|-------------|------|-----------|
 | 1 | 222 KB | 15.0 µs | 14.1 GB/s |
-| 16 | 269 KB | 381 µs | 690 MB/s |
+| 16 | 269 KB | 427 µs | 616 MB/s |
 | 64 | 418 KB | 1.70 ms | 240 MB/s |
-| 256 | 1012 KB | 6.38 ms | 155 MB/s |
+| 256 | 1012 KB | 6.82 ms | 145 MB/s |
 | 1024 | 3391 KB | 25.4 ms | 130 MB/s |
 
 **Analysis:** Small batches achieve higher bandwidth due to cache locality. Large batches are compute-bound rather than memory-bound.
@@ -307,30 +309,45 @@ Critical for MCTS/CFR solvers where thousands of single inferences per second ar
 
 ## ⚡ ArKan CPU vs PyTorch CPU Comparison
 
+> **PyTorch benchmark:** `scripts/bench_pytorch_train.py`
+> Config: `[21, 64, 64, 24]`, grid=5, order=3 (same as ArKan poker config)
+
 ### Forward Pass (Inference)
 
 | Batch | ArKan | PyTorch | **Speedup** |
 |-------|-------|---------|-------------|
-| **1** | **15.0 µs** | 990 µs | **66x** |
-| 16 | 381 µs | 1.67 ms | **4.4x** |
-| 64 | 1.70 ms | 3.27 ms | **1.9x** |
-| 256 | 6.38 ms | 9.65 ms | **1.5x** |
+| **1** | **26.7 µs** | 1.45 ms | **54x** |
+| 16 | 427 µs | 2.58 ms | **6.0x** |
+| 64 | 1.70 ms | 4.30 ms | **2.5x** |
+| 256 | 6.82 ms | 11.7 ms | **1.7x** |
 
 ### Training Step (Forward + Backward + SGD)
 
 | Batch | ArKan | PyTorch | Speedup |
 |-------|-------|---------|--------|
-| 1 | 75 µs | 3.17 ms | **42x** |
-| 16 | 1.05 ms | 3.48 ms | **3.3x** |
-| 64 | 4.48 ms | 5.99 ms | **1.3x** |
-| 256 | 18.0 ms | 19.9 ms | **1.1x** |
+| 1 | 101 µs | 2.51 ms | **25x** |
+| 16 | 1.16 ms | 4.21 ms | **3.6x** |
+| 64 | 4.48 ms | 7.14 ms | **1.6x** |
+| 256 | 18.0 ms | 19.7 ms | **1.1x** |
+
+### Backward Pass Only (Gradient Computation)
+
+| Batch | ArKan (estimated) | PyTorch | Speedup |
+|-------|-------------------|---------|---------|
+| 1 | ~75 µs | 0.91 ms | **12x** |
+| 16 | ~730 µs | 1.23 ms | **1.7x** |
+| 64 | ~2.78 ms | 1.87 ms | 0.67x |
+| 256 | ~11.2 ms | 7.47 ms | 0.67x |
+
+**Note:** ArKan backward pass estimate = train_step - forward. PyTorch backward is faster for large batches due to optimized BLAS, but ArKan wins on full train_step due to lower forward overhead.
 
 ### Key Takeaways
 
-1. **Low-latency dominance:** ArKan is 42-66x faster for single-sample inference/training
-2. **Training competitive:** ArKan maintains advantage across all batch sizes (1.1x-42x)
+1. **Low-latency dominance:** ArKan is 25-54x faster for single-sample inference/training
+2. **Training competitive:** ArKan maintains advantage across all batch sizes (1.1x-25x)
 3. **Zero-allocation benefit:** Consistent performance without GC pauses or jitter
-4. **Large batch improvement:** After optimization, ArKan now beats PyTorch even at batch=256
+4. **Large batch parity:** ArKan matches PyTorch even at batch=256 (1.1x)
+5. **Forward pass wins:** ArKan forward is 1.7-54x faster across all batch sizes
 
 ---
 
