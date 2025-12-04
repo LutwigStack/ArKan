@@ -1,0 +1,23 @@
+[package]
+name = "game2048"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# ArKan from parent
+arkan = { path = "../..", features = ["gpu"] }
+
+# CLI and progress
+clap = { version = "4.5", features = ["derive"] }
+indicatif = "0.17"
+
+# Random
+rand = "0.8"
+
+# Parallelism
+rayon = "1.10"
+
+# Serialization for saving models
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
