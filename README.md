@@ -134,6 +134,19 @@ $env:ARKAN_GPU_BENCH="1"; cargo bench --bench gpu_forward --features gpu
 ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
 ```
 
+### **GPU производительность vs PyTorch CUDA**
+
+Сравнение ArKan GPU (wgpu/Vulkan) с PyTorch KAN реализациями на CUDA:
+
+| Implementation | Forward (batch=64) | Train (Adam) | Notes |
+|----------------|-------------------|--------------|-------|
+| **fast-kan (CUDA)** | **0.58 ms** | **1.78 ms** | RBF аппроксимация (самый быстрый) |
+| **ArKan (wgpu)** | **1.18 ms** | **3.04 ms** | WebGPU/Vulkan, native training |
+| efficient-kan (CUDA) | 1.62 ms | 3.70 ms | Native B-spline |
+| ArKan-style (CUDA) | 3.63 ms | N/A | Reference implementation |
+
+**Вывод:** ArKan wgpu быстрее efficient-kan на 27% и конкурентен с оптимизированными CUDA реализациями.
+
 ## **Бенчмарки (CPU)**
 
 Сравнение ArKan (Rust) против оптимизированной векторизованной реализации на PyTorch (CPU).
@@ -393,6 +406,19 @@ $env:ARKAN_GPU_BENCH="1"; cargo bench --bench gpu_forward --features gpu
 ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
 ARKAN_GPU_BENCH=1 cargo bench --bench gpu_backward --features gpu
 ```
+
+### **GPU Performance vs PyTorch CUDA**
+
+Comparison of ArKan GPU (wgpu/Vulkan) with PyTorch KAN implementations on CUDA:
+
+| Implementation | Forward (batch=64) | Train (Adam) | Notes |
+|----------------|-------------------|--------------|-------|
+| **fast-kan (CUDA)** | **0.58 ms** | **1.78 ms** | RBF approximation (fastest) |
+| **ArKan (wgpu)** | **1.18 ms** | **3.04 ms** | WebGPU/Vulkan, native training |
+| efficient-kan (CUDA) | 1.62 ms | 3.70 ms | Native B-spline |
+| ArKan-style (CUDA) | 3.63 ms | N/A | Reference implementation |
+
+**Conclusion:** ArKan wgpu is 27% faster than efficient-kan and competitive with optimized CUDA implementations.
 
 ## **Benchmarks (CPU)**
 
