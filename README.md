@@ -17,24 +17,28 @@
 
 ### **Математическая модель**
 
-В основе лежит теорема представления Колмогорова-Арнольда. Для слоя с $N\_{in}$ входами и $N\_{out}$ выходами преобразование выглядит так:
+В основе лежит теорема представления Колмогорова-Арнольда. Для слоя с `N_in` входами и `N_out` выходами преобразование выглядит так:
 
-$$x\_{l+1, j} \= \\sum\_{i=1}^{N\_{in}} \\phi\_{l, j, i}(x\_{l, i})$$
+```
+x[l+1, j] = Σᵢ φ[l,j,i](x[l, i])      где i = 1..N_in
+```
 
-Где $\\phi\_{l, j, i}$ — это обучаемая 1D-функция, которая связывает $i$-й нейрон входного слоя с $j$-м нейроном выходного.
+Где `φ[l,j,i]` — это обучаемая 1D-функция, которая связывает `i`-й нейрон входного слоя с `j`-м нейроном выходного.
 
 ### **Реализация в ArKan (B-Splines)**
 
-В данной библиотеке функции $\\phi$ параметризуются с помощью **B-сплайнов** (Basis splines). Это позволяет менять форму функции активации локально, сохраняя гладкость.
+В данной библиотеке функции `φ` параметризуются с помощью **B-сплайнов** (Basis splines). Это позволяет менять форму функции активации локально, сохраняя гладкость.
 
 Уравнение для конкретного веса в ArKan:
 
-$$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
+```
+φ(x) = Σᵢ cᵢ · Bᵢ(x)      где i = 1..(G+p)
+```
 
-* $B\_i(x)$ — базисные функции сплайна.  
-* $c\_i$ — обучаемые коэффициенты.  
-* $G$ — размер сетки (grid size).  
-* $p$ — порядок сплайна (spline order).
+* `Bᵢ(x)` — базисные функции сплайна.
+* `cᵢ` — обучаемые коэффициенты.
+* `G` — размер сетки (grid size).
+* `p` — порядок сплайна (spline order).
 
 ## **Ключевые возможности**
 
@@ -130,6 +134,19 @@ $env:ARKAN_GPU_BENCH="1"; cargo bench --bench gpu_forward --features gpu
 ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
 ```
 
+### **GPU производительность vs PyTorch CUDA**
+
+Сравнение ArKan GPU (wgpu/Vulkan) с PyTorch KAN реализациями на CUDA:
+
+| Implementation | Forward (batch=64) | Train (Adam) | Notes |
+|----------------|-------------------|--------------|-------|
+| **fast-kan (CUDA)** | **0.58 ms** | **1.78 ms** | RBF аппроксимация (самый быстрый) |
+| **ArKan (wgpu)** | **1.18 ms** | **3.04 ms** | WebGPU/Vulkan, native training |
+| efficient-kan (CUDA) | 1.62 ms | 3.70 ms | Native B-spline |
+| ArKan-style (CUDA) | 3.63 ms | N/A | Reference implementation |
+
+**Вывод:** ArKan wgpu быстрее efficient-kan на 27% и конкурентен с оптимизированными CUDA реализациями.
+
 ## **Бенчмарки (CPU)**
 
 Сравнение ArKan (Rust) против оптимизированной векторизованной реализации на PyTorch (CPU).
@@ -142,16 +159,16 @@ ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
 
 | Batch Size | ArKan (Time) | ArKan (Throughput) | PyTorch (Time) | PyTorch (Throughput) | Вывод |
 | :---- | :---- | :---- | :---- | :---- | :---- |
-| **1** | **30.5 µs** | **0.69 M elems/s** | 990.0 µs | 0.02 M elems/s | **Rust быстрее в 32x** (Low Latency) |
-| 16 | 454.8 µs | 0.74 M elems/s | 1.67 ms | 0.20 M elems/s | Rust быстрее в 3.7x |
-| 64 | 1.95 ms | 0.69 M elems/s | 3.27 ms | 0.41 M elems/s | Rust быстрее в 1.7x |
-| 256 | 7.29 ms | 0.74 M elems/s | 9.65 ms | 0.56 M elems/s | Rust быстрее в 1.3x
+| **1** | **26.7 µs** | **0.79 M elems/s** | 1.45 ms | 0.01 M elems/s | **Rust быстрее в 54x** (Low Latency) |
+| 16 | 427 µs | 0.79 M elems/s | 2.58 ms | 0.13 M elems/s | Rust быстрее в 6.0x |
+| 64 | 1.70 ms | 0.79 M elems/s | 4.30 ms | 0.31 M elems/s | Rust быстрее в 2.5x |
+| 256 | 6.82 ms | 0.79 M elems/s | 11.7 ms | 0.46 M elems/s | Rust быстрее в 1.7x
 
 ### **Анализ производительности**
 
-1. **Small Batch Dominance:** На единичных запросах (`batch=1`) ArKan **опережает** PyTorch за счет отсутствия оверхеда интерпретатора и абстракций. Это позволяет совершать \~33,000 инференсов в секунду против \~1,000 у PyTorch.  
-2. **Mid-Batch Performance:** На средних батчах (16-64) ArKan сохраняет преимущество в 1.7x-3.7x, демонстрируя хорошую масштабируемость.  
-3. **Throughput Scaling:** На больших батчах (256+) ArKan сохраняет преимущество 1.3x благодаря zero-allocation архитектуре и эффективному использованию кэша.
+1. **Small Batch Dominance:** На единичных запросах (`batch=1`) ArKan **опережает** PyTorch за счет отсутствия оверхеда интерпретатора и абстракций. Это позволяет совершать \~37,000 инференсов в секунду против \~700 у PyTorch.  
+2. **Mid-Batch Performance:** На средних батчах (16-64) ArKan сохраняет преимущество в 2.5x-6.0x, демонстрируя хорошую масштабируемость.  
+3. **Throughput Scaling:** На больших батчах (256+) ArKan сохраняет преимущество 1.7x благодаря zero-allocation архитектуре и эффективному использованию кэша.
 4. **Zero-Allocation Training:** Весь training loop (forward + backward + update) работает без аллокаций при прогретом Workspace.
 
 ## **Сравнение с аналогами (Prior Art)**
@@ -225,24 +242,28 @@ Unlike classical Multi-Layer Perceptrons (MLP), where activation functions are f
 
 ### **Mathematical Model**
 
-Based on the Kolmogorov-Arnold representation theorem. For a layer with $N\_{in}$ inputs and $N\_{out}$ outputs, the transformation looks like this:
+Based on the Kolmogorov-Arnold representation theorem. For a layer with `N_in` inputs and `N_out` outputs, the transformation looks like this:
 
-$$x\_{l+1, j} \= \\sum\_{i=1}^{N\_{in}} \\phi\_{l, j, i}(x\_{l, i})$$
+```
+x[l+1, j] = Σᵢ φ[l,j,i](x[l, i])      where i = 1..N_in
+```
 
-Where $\\phi\_{l, j, i}$ is a learnable 1D function connecting the $i$-th input neuron to the $j$-th output neuron.
+Where `φ[l,j,i]` is a learnable 1D function connecting the `i`-th input neuron to the `j`-th output neuron.
 
 ### **Implementation in ArKan (B-Splines)**
 
-In this library, $\\phi$ functions are parameterized using **B-Splines**. This allows modifying the shape of the activation function locally while maintaining smoothness.
+In this library, `φ` functions are parameterized using **B-Splines**. This allows modifying the shape of the activation function locally while maintaining smoothness.
 
 Equation for a specific weight in ArKan:
 
-$$\\phi(x) \= \\sum\_{i=1}^{G+p} c\_i \\cdot B\_i(x)$$
+```
+φ(x) = Σᵢ cᵢ · Bᵢ(x)      where i = 1..(G+p)
+```
 
-* $B\_i(x)$ — B-spline basis functions.  
-* $c\_i$ — learnable coefficients.  
-* $G$ — grid size.  
-* $p$ — spline order.
+* `Bᵢ(x)` — B-spline basis functions.
+* `cᵢ` — learnable coefficients.
+* `G` — grid size.
+* `p` — spline order.
 
 ## **Key Features**
 
@@ -386,6 +407,19 @@ ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
 ARKAN_GPU_BENCH=1 cargo bench --bench gpu_backward --features gpu
 ```
 
+### **GPU Performance vs PyTorch CUDA**
+
+Comparison of ArKan GPU (wgpu/Vulkan) with PyTorch KAN implementations on CUDA:
+
+| Implementation | Forward (batch=64) | Train (Adam) | Notes |
+|----------------|-------------------|--------------|-------|
+| **fast-kan (CUDA)** | **0.58 ms** | **1.78 ms** | RBF approximation (fastest) |
+| **ArKan (wgpu)** | **1.18 ms** | **3.04 ms** | WebGPU/Vulkan, native training |
+| efficient-kan (CUDA) | 1.62 ms | 3.70 ms | Native B-spline |
+| ArKan-style (CUDA) | 3.63 ms | N/A | Reference implementation |
+
+**Conclusion:** ArKan wgpu is 27% faster than efficient-kan and competitive with optimized CUDA implementations.
+
 ## **Benchmarks (CPU)**
 
 Comparison of ArKan (Rust) vs. optimized vectorized PyTorch implementation (CPU).
@@ -398,16 +432,16 @@ Comparison of ArKan (Rust) vs. optimized vectorized PyTorch implementation (CPU)
 
 | Batch Size | ArKan (Time) | ArKan (Throughput) | PyTorch (Time) | PyTorch (Throughput) | Conclusion |
 | :---- | :---- | :---- | :---- | :---- | :---- |
-| **1** | **30.5 µs** | **0.69 M elems/s** | 990.0 µs | 0.02 M elems/s | **Rust is 32x faster** (Low Latency) |
-| 16 | 454.8 µs | 0.74 M elems/s | 1.67 ms | 0.20 M elems/s | Rust is 3.7x faster |
-| 64 | 1.95 ms | 0.69 M elems/s | 3.27 ms | 0.41 M elems/s | Rust is 1.7x faster |
-| 256 | 7.29 ms | 0.74 M elems/s | 9.65 ms | 0.56 M elems/s | Rust is 1.3x faster
+| **1** | **26.7 µs** | **0.79 M elems/s** | 1.45 ms | 0.01 M elems/s | **Rust is 54x faster** (Low Latency) |
+| 16 | 427 µs | 0.79 M elems/s | 2.58 ms | 0.13 M elems/s | Rust is 6.0x faster |
+| 64 | 1.70 ms | 0.79 M elems/s | 4.30 ms | 0.31 M elems/s | Rust is 2.5x faster |
+| 256 | 6.82 ms | 0.79 M elems/s | 11.7 ms | 0.46 M elems/s | Rust is 1.7x faster
 
 ### **Performance Analysis**
 
-1. **Small Batch Dominance:** On single requests (`batch=1`), ArKan **outperforms** PyTorch due to the lack of interpreter overhead and abstractions. This allows for \~33,000 inferences per second vs \~1,000 for PyTorch.  
-2. **Mid-Batch Performance:** On medium batches (16-64), ArKan maintains a 1.7x-3.7x advantage, showing good scalability.  
-3. **Throughput Scaling:** On large batches (256+), ArKan maintains 1.3x advantage due to zero-allocation architecture and efficient cache utilization.
+1. **Small Batch Dominance:** On single requests (`batch=1`), ArKan **outperforms** PyTorch due to the lack of interpreter overhead and abstractions. This allows for \~37,000 inferences per second vs \~700 for PyTorch.  
+2. **Mid-Batch Performance:** On medium batches (16-64), ArKan maintains a 2.5x-6.0x advantage, showing good scalability.  
+3. **Throughput Scaling:** On large batches (256+), ArKan maintains 1.7x advantage due to zero-allocation architecture and efficient cache utilization.
 4. **Zero-Allocation Training:** The entire training loop (forward + backward + update) runs without allocations on a warmed-up Workspace.
 
 ## **Comparison with Analogues (Prior Art)**
