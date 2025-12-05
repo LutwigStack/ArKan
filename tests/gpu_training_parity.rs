@@ -12,7 +12,9 @@
 #![cfg(feature = "gpu")]
 #![allow(unused_imports)]
 
-use arkan::gpu::{GpuAdam, GpuAdamConfig, GpuNetwork, GpuSgd, GpuSgdConfig, WgpuBackend, WgpuOptions};
+use arkan::gpu::{
+    GpuAdam, GpuAdamConfig, GpuNetwork, GpuSgd, GpuSgdConfig, WgpuBackend, WgpuOptions,
+};
 use arkan::optimizer::{Adam, AdamConfig, SGD};
 use arkan::{KanConfig, KanNetwork, TrainOptions, Workspace};
 use rand::rngs::SmallRng;
@@ -37,7 +39,13 @@ const TEST_LR: f32 = 0.001;
 
 /// Compares two f32 slices with tolerance, returns (passed, max_diff, max_idx).
 fn compare_slices(a: &[f32], b: &[f32], tol: f32) -> (bool, f32, usize) {
-    assert_eq!(a.len(), b.len(), "Length mismatch: {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "Length mismatch: {} vs {}",
+        a.len(),
+        b.len()
+    );
 
     let mut max_diff = 0.0f32;
     let mut max_idx = 0;
@@ -123,24 +131,24 @@ fn make_target(dim: usize, batch_size: usize, seed: u64) -> Vec<f32> {
 #[ignore = "Requires GPU"]
 fn test_native_gradient_clipping_effect() {
     let backend = WgpuBackend::init(WgpuOptions::default()).expect("Failed to create backend");
-    
+
     let config = small_config(42);
     let cpu_network = KanNetwork::new(config.clone());
-    
+
     let batch_size = 4;
     let input = make_input(config.input_dim, batch_size, 100);
     // Large targets to produce large gradients
     let target: Vec<f32> = vec![100.0; batch_size * config.output_dim];
-    
+
     // Create two GPU networks with same weights
-    let mut gpu_clipped = GpuNetwork::from_cpu(&backend, &cpu_network)
-        .expect("Failed to create GPU network");
-    let mut gpu_unclipped = GpuNetwork::from_cpu(&backend, &cpu_network)
-        .expect("Failed to create GPU network");
-    
+    let mut gpu_clipped =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut gpu_unclipped =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
     let mut workspace_clipped = gpu_clipped.create_workspace(batch_size).expect("Failed");
     let mut workspace_unclipped = gpu_unclipped.create_workspace(batch_size).expect("Failed");
-    
+
     // Create two GPU Adam optimizers with same initial state
     let layer_sizes = gpu_clipped.layer_param_sizes();
     let mut optimizer_clipped = GpuAdam::new(
@@ -149,20 +157,20 @@ fn test_native_gradient_clipping_effect() {
         &layer_sizes,
         GpuAdamConfig::with_lr(TEST_LR),
     );
-    
+
     let mut optimizer_unclipped = GpuAdam::new(
         backend.device_arc(),
         backend.queue_arc(),
         &layer_sizes,
         GpuAdamConfig::with_lr(TEST_LR),
     );
-    
+
     // Training with clipping (max_grad_norm = 1.0)
     let opts_clipped = TrainOptions {
         max_grad_norm: Some(1.0),
         weight_decay: 0.0,
     };
-    
+
     let loss_clipped = gpu_clipped
         .train_step_gpu_native_with_options(
             &input,
@@ -174,13 +182,13 @@ fn test_native_gradient_clipping_effect() {
             &opts_clipped,
         )
         .expect("Clipped training failed");
-    
+
     // Training without clipping
     let opts_unclipped = TrainOptions {
         max_grad_norm: None,
         weight_decay: 0.0,
     };
-    
+
     let loss_unclipped = gpu_unclipped
         .train_step_gpu_native_with_options(
             &input,
@@ -192,7 +200,7 @@ fn test_native_gradient_clipping_effect() {
             &opts_unclipped,
         )
         .expect("Unclipped training failed");
-    
+
     // Both should have same initial loss (before weight update)
     assert!(
         (loss_clipped - loss_unclipped).abs() < LOSS_TOL,
@@ -200,14 +208,18 @@ fn test_native_gradient_clipping_effect() {
         loss_clipped,
         loss_unclipped
     );
-    
+
     // Sync weights back to CPU
     let mut cpu_clipped = KanNetwork::new(config.clone());
     let mut cpu_unclipped = KanNetwork::new(config.clone());
-    
-    gpu_clipped.sync_weights_to_cpu(&mut cpu_clipped).expect("Sync failed");
-    gpu_unclipped.sync_weights_to_cpu(&mut cpu_unclipped).expect("Sync failed");
-    
+
+    gpu_clipped
+        .sync_weights_to_cpu(&mut cpu_clipped)
+        .expect("Sync failed");
+    gpu_unclipped
+        .sync_weights_to_cpu(&mut cpu_unclipped)
+        .expect("Sync failed");
+
     // Compare weights - they should be DIFFERENT because of clipping
     let mut any_different = false;
     for (layer_c, layer_u) in cpu_clipped.layers.iter().zip(cpu_unclipped.layers.iter()) {
@@ -217,12 +229,12 @@ fn test_native_gradient_clipping_effect() {
             println!("Weight difference due to clipping: max_diff = {}", max_diff);
         }
     }
-    
+
     assert!(
         any_different,
         "Weights should be different when gradient clipping is applied vs not applied"
     );
-    
+
     println!("✅ Gradient clipping produces different weights (as expected)");
 }
 
@@ -237,28 +249,28 @@ fn test_native_gradient_clipping_effect() {
 #[ignore = "Requires GPU"]
 fn test_hybrid_vs_native_parity_sgd() {
     let backend = WgpuBackend::init(WgpuOptions::default()).expect("Failed to create backend");
-    
+
     let config = small_config(42);
-    
+
     // Create two identical networks
     let mut cpu_hybrid = KanNetwork::new(config.clone());
     let mut cpu_native = KanNetwork::new(config.clone());
-    
-    let mut gpu_hybrid = GpuNetwork::from_cpu(&backend, &cpu_hybrid)
-        .expect("Failed to create GPU network");
-    let mut gpu_native = GpuNetwork::from_cpu(&backend, &cpu_native)
-        .expect("Failed to create GPU network");
-    
+
+    let mut gpu_hybrid =
+        GpuNetwork::from_cpu(&backend, &cpu_hybrid).expect("Failed to create GPU network");
+    let mut gpu_native =
+        GpuNetwork::from_cpu(&backend, &cpu_native).expect("Failed to create GPU network");
+
     let batch_size = 8;
     let input = make_input(config.input_dim, batch_size, 100);
     let target = make_target(config.output_dim, batch_size, 200);
-    
+
     let mut workspace_hybrid = gpu_hybrid.create_workspace(batch_size).expect("Failed");
     let mut workspace_native = gpu_native.create_workspace(batch_size).expect("Failed");
-    
+
     // CPU SGD for hybrid (network, lr, momentum, weight_decay)
     let mut sgd_cpu = SGD::new(&cpu_hybrid, TEST_LR, 0.0, 0.0);
-    
+
     // GPU SGD for native
     let layer_sizes = gpu_native.layer_param_sizes();
     let mut sgd_gpu = GpuSgd::new(
@@ -271,40 +283,66 @@ fn test_hybrid_vs_native_parity_sgd() {
             weight_decay: 0.0,
         },
     );
-    
+
     let num_steps = 10;
     let mut losses_hybrid = Vec::new();
     let mut losses_native = Vec::new();
-    
+
     for step in 0..num_steps {
         // Hybrid training
         let loss_hybrid = gpu_hybrid
-            .train_step_sgd(&input, &target, batch_size, &mut workspace_hybrid, &mut sgd_cpu, &mut cpu_hybrid)
+            .train_step_sgd(
+                &input,
+                &target,
+                batch_size,
+                &mut workspace_hybrid,
+                &mut sgd_cpu,
+                &mut cpu_hybrid,
+            )
             .expect("Hybrid training failed");
         losses_hybrid.push(loss_hybrid);
-        
+
         // Native training
         let loss_native = gpu_native
-            .train_step_gpu_native_sgd(&input, &target, batch_size, &mut workspace_native, &mut sgd_gpu)
+            .train_step_gpu_native_sgd(
+                &input,
+                &target,
+                batch_size,
+                &mut workspace_native,
+                &mut sgd_gpu,
+            )
             .expect("Native training failed");
         losses_native.push(loss_native);
-        
-        println!("Step {}: hybrid_loss={:.6}, native_loss={:.6}, diff={:.2e}", 
-                 step, loss_hybrid, loss_native, (loss_hybrid - loss_native).abs());
+
+        println!(
+            "Step {}: hybrid_loss={:.6}, native_loss={:.6}, diff={:.2e}",
+            step,
+            loss_hybrid,
+            loss_native,
+            (loss_hybrid - loss_native).abs()
+        );
     }
-    
+
     // Sync native weights to CPU for comparison
-    gpu_native.sync_weights_to_cpu(&mut cpu_native).expect("Sync failed");
-    
+    gpu_native
+        .sync_weights_to_cpu(&mut cpu_native)
+        .expect("Sync failed");
+
     // Compare weights layer by layer
-    for (i, (layer_h, layer_n)) in cpu_hybrid.layers.iter().zip(cpu_native.layers.iter()).enumerate() {
-        let (passed, max_diff, max_idx) = compare_slices(&layer_h.weights, &layer_n.weights, WEIGHT_TOL);
+    for (i, (layer_h, layer_n)) in cpu_hybrid
+        .layers
+        .iter()
+        .zip(cpu_native.layers.iter())
+        .enumerate()
+    {
+        let (passed, max_diff, max_idx) =
+            compare_slices(&layer_h.weights, &layer_n.weights, WEIGHT_TOL);
         assert!(
             passed,
             "Layer {} weights differ: max_diff={} at idx={} (tol={})",
             i, max_diff, max_idx, WEIGHT_TOL
         );
-        
+
         let (passed, max_diff, max_idx) = compare_slices(&layer_h.bias, &layer_n.bias, WEIGHT_TOL);
         assert!(
             passed,
@@ -312,12 +350,15 @@ fn test_hybrid_vs_native_parity_sgd() {
             i, max_diff, max_idx, WEIGHT_TOL
         );
     }
-    
+
     // Compare final losses
     let final_loss_diff = (losses_hybrid.last().unwrap() - losses_native.last().unwrap()).abs();
     println!("Final loss difference: {:.2e}", final_loss_diff);
-    
-    println!("✅ Hybrid vs Native SGD parity confirmed after {} steps", num_steps);
+
+    println!(
+        "✅ Hybrid vs Native SGD parity confirmed after {} steps",
+        num_steps
+    );
 }
 
 /// Test that native GPU Adam training converges properly.
@@ -328,20 +369,20 @@ fn test_hybrid_vs_native_parity_sgd() {
 #[ignore = "Requires GPU"]
 fn test_native_adam_training_convergence() {
     let backend = WgpuBackend::init(WgpuOptions::default()).expect("Failed to create backend");
-    
+
     let config = small_config(42);
-    
+
     // For native training
     let cpu_network = KanNetwork::new(config.clone());
-    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
-        .expect("Failed to create GPU network");
-    
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
     let batch_size = 8;
     let input = make_input(config.input_dim, batch_size, 100);
     let target = make_target(config.output_dim, batch_size, 200);
-    
+
     let mut workspace = gpu_network.create_workspace(batch_size).expect("Failed");
-    
+
     let layer_sizes = gpu_network.layer_param_sizes();
     let mut adam_gpu = GpuAdam::new(
         backend.device_arc(),
@@ -355,43 +396,48 @@ fn test_native_adam_training_convergence() {
             weight_decay: 0.0,
         },
     );
-    
+
     let num_steps = 50;
     let mut losses = Vec::new();
-    
+
     for step in 0..num_steps {
         // Native GPU training only
         let loss = gpu_network
             .train_step_gpu_native(&input, &target, batch_size, &mut workspace, &mut adam_gpu)
             .expect("Native training failed");
         losses.push(loss);
-        
+
         if step % 10 == 0 {
             println!("Step {}: native_loss={:.6}", step, loss);
         }
     }
-    
+
     // Loss should decrease (convergence)
     let initial_loss = *losses.first().unwrap();
     let final_loss = *losses.last().unwrap();
-    
+
     assert!(
         final_loss < initial_loss,
         "Native Adam should decrease loss: {} -> {}",
-        initial_loss, final_loss
+        initial_loss,
+        final_loss
     );
-    
+
     // Loss should have decreased significantly (at least 10%)
     let decrease_ratio = final_loss / initial_loss;
-    println!("Loss decrease: {:.6} -> {:.6} ({}% of initial)", 
-             initial_loss, final_loss, decrease_ratio * 100.0);
-    
+    println!(
+        "Loss decrease: {:.6} -> {:.6} ({}% of initial)",
+        initial_loss,
+        final_loss,
+        decrease_ratio * 100.0
+    );
+
     assert!(
         decrease_ratio < 0.95,
         "Loss should decrease by at least 5%: decrease_ratio={}",
         decrease_ratio
     );
-    
+
     println!("✅ Native Adam training converges properly");
 }
 
@@ -404,23 +450,25 @@ fn test_native_adam_training_convergence() {
 #[ignore = "Requires GPU"]
 fn test_weight_sync_after_native_training() {
     let backend = WgpuBackend::init(WgpuOptions::default()).expect("Failed to create backend");
-    
+
     let config = small_config(42);
     let mut cpu_network = KanNetwork::new(config.clone());
-    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
-        .expect("Failed to create GPU network");
-    
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
     // Store initial weights
-    let initial_weights: Vec<Vec<f32>> = cpu_network.layers.iter()
+    let initial_weights: Vec<Vec<f32>> = cpu_network
+        .layers
+        .iter()
         .map(|l| l.weights.clone())
         .collect();
-    
+
     let batch_size = 8;
     let input = make_input(config.input_dim, batch_size, 100);
     let target = make_target(config.output_dim, batch_size, 200);
-    
+
     let mut workspace = gpu_network.create_workspace(batch_size).expect("Failed");
-    
+
     let layer_sizes = gpu_network.layer_param_sizes();
     let mut optimizer = GpuAdam::new(
         backend.device_arc(),
@@ -428,38 +476,61 @@ fn test_weight_sync_after_native_training() {
         &layer_sizes,
         GpuAdamConfig::with_lr(0.01), // Larger LR for visible change
     );
-    
+
     // Do several training steps
     for _ in 0..10 {
         gpu_network
             .train_step_gpu_native(&input, &target, batch_size, &mut workspace, &mut optimizer)
             .expect("Training failed");
     }
-    
+
     // Sync weights back
-    gpu_network.sync_weights_to_cpu(&mut cpu_network).expect("Sync failed");
-    
+    gpu_network
+        .sync_weights_to_cpu(&mut cpu_network)
+        .expect("Sync failed");
+
     // Weights should have changed
     let mut any_changed = false;
-    for (i, (initial, layer)) in initial_weights.iter().zip(cpu_network.layers.iter()).enumerate() {
+    for (i, (initial, layer)) in initial_weights
+        .iter()
+        .zip(cpu_network.layers.iter())
+        .enumerate()
+    {
         let (same, max_diff, _) = compare_slices(initial, &layer.weights, 1e-8);
         if !same {
             any_changed = true;
             println!("Layer {} weights changed: max_diff = {}", i, max_diff);
         }
     }
-    
+
     assert!(any_changed, "Weights should have changed after training");
-    
+
     // Sync again and verify it's consistent
     let mut cpu_network2 = KanNetwork::new(config.clone());
-    gpu_network.sync_weights_to_cpu(&mut cpu_network2).expect("Sync failed");
-    
-    for (i, (l1, l2)) in cpu_network.layers.iter().zip(cpu_network2.layers.iter()).enumerate() {
-        assert_approx_eq(&l1.weights, &l2.weights, 1e-8, &format!("Layer {} weights sync consistency", i));
-        assert_approx_eq(&l1.bias, &l2.bias, 1e-8, &format!("Layer {} bias sync consistency", i));
+    gpu_network
+        .sync_weights_to_cpu(&mut cpu_network2)
+        .expect("Sync failed");
+
+    for (i, (l1, l2)) in cpu_network
+        .layers
+        .iter()
+        .zip(cpu_network2.layers.iter())
+        .enumerate()
+    {
+        assert_approx_eq(
+            &l1.weights,
+            &l2.weights,
+            1e-8,
+            &format!("Layer {} weights sync consistency", i),
+        );
+        assert_approx_eq(
+            &l1.bias,
+            &l2.bias,
+            1e-8,
+            &format!("Layer {} bias sync consistency", i),
+        );
     }
-    
+
     // Verify forward pass produces same output on CPU and GPU
     let cpu_output = {
         let mut workspace = Workspace::new(&config);
@@ -467,12 +538,13 @@ fn test_weight_sync_after_native_training() {
         cpu_network.forward_batch(&input, &mut out, &mut workspace);
         out
     };
-    
-    let gpu_output = gpu_network.forward_batch(&input, batch_size, &mut workspace)
+
+    let gpu_output = gpu_network
+        .forward_batch(&input, batch_size, &mut workspace)
         .expect("GPU forward failed");
-    
+
     assert_approx_eq(&cpu_output, &gpu_output, 1e-5, "Forward output after sync");
-    
+
     println!("✅ Weight sync after native training is correct");
 }
 
@@ -485,18 +557,18 @@ fn test_weight_sync_after_native_training() {
 #[ignore = "Requires GPU"]
 fn test_native_training_stability_1000_steps() {
     let backend = WgpuBackend::init(WgpuOptions::default()).expect("Failed to create backend");
-    
+
     let config = small_config(42);
     let cpu_network = KanNetwork::new(config.clone());
-    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
-        .expect("Failed to create GPU network");
-    
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
     let batch_size = 16;
     let input = make_input(config.input_dim, batch_size, 100);
     let target = make_target(config.output_dim, batch_size, 200);
-    
+
     let mut workspace = gpu_network.create_workspace(batch_size).expect("Failed");
-    
+
     let layer_sizes = gpu_network.layer_param_sizes();
     let mut optimizer = GpuAdam::new(
         backend.device_arc(),
@@ -504,69 +576,85 @@ fn test_native_training_stability_1000_steps() {
         &layer_sizes,
         GpuAdamConfig::with_lr(0.001),
     );
-    
+
     let num_steps = 1000;
     let mut losses = Vec::with_capacity(num_steps);
     let mut min_loss = f32::MAX;
     let mut max_loss = f32::MIN;
-    
+
     for step in 0..num_steps {
         let loss = gpu_network
             .train_step_gpu_native(&input, &target, batch_size, &mut workspace, &mut optimizer)
             .expect("Training failed");
-        
+
         losses.push(loss);
         min_loss = min_loss.min(loss);
         max_loss = max_loss.max(loss);
-        
+
         // Check for NaN/Inf
-        assert!(loss.is_finite(), "Loss became non-finite at step {}: {}", step, loss);
-        
+        assert!(
+            loss.is_finite(),
+            "Loss became non-finite at step {}: {}",
+            step,
+            loss
+        );
+
         // Check for explosion (loss > 1000x initial)
         if step > 0 {
             let initial = losses[0];
             assert!(
                 loss < initial * 1000.0,
                 "Loss exploded at step {}: {} (initial: {})",
-                step, loss, initial
+                step,
+                loss,
+                initial
             );
         }
-        
+
         if step % 200 == 0 {
             println!("Step {}: loss = {:.6}", step, loss);
         }
     }
-    
+
     // Loss should have decreased overall
     let initial_loss = losses[0];
     let final_loss = *losses.last().unwrap();
-    
+
     println!("Training summary:");
     println!("  Initial loss: {:.6}", initial_loss);
     println!("  Final loss:   {:.6}", final_loss);
     println!("  Min loss:     {:.6}", min_loss);
     println!("  Max loss:     {:.6}", max_loss);
     println!("  Steps:        {}", num_steps);
-    
+
     assert!(
         final_loss < initial_loss,
         "Loss should decrease: initial={}, final={}",
-        initial_loss, final_loss
+        initial_loss,
+        final_loss
     );
-    
+
     // Verify weights are finite after training
     let mut cpu_final = KanNetwork::new(config.clone());
-    gpu_network.sync_weights_to_cpu(&mut cpu_final).expect("Sync failed");
-    
+    gpu_network
+        .sync_weights_to_cpu(&mut cpu_final)
+        .expect("Sync failed");
+
     for (i, layer) in cpu_final.layers.iter().enumerate() {
         for (j, w) in layer.weights.iter().enumerate() {
-            assert!(w.is_finite(), "Layer {} weight {} is not finite: {}", i, j, w);
+            assert!(
+                w.is_finite(),
+                "Layer {} weight {} is not finite: {}",
+                i,
+                j,
+                w
+            );
         }
         for (j, b) in layer.bias.iter().enumerate() {
             assert!(b.is_finite(), "Layer {} bias {} is not finite: {}", i, j, b);
         }
     }
-    
+
     println!("✅ Native training stable for {} steps", num_steps);
 }
 
@@ -575,26 +663,26 @@ fn test_native_training_stability_1000_steps() {
 #[ignore = "Requires GPU"]
 fn test_native_training_with_clipping_stability() {
     let backend = WgpuBackend::init(WgpuOptions::default()).expect("Failed to create backend");
-    
+
     // Larger network for more stress
     let config = test_config(42);
     let cpu_network = KanNetwork::new(config.clone());
-    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
-        .expect("Failed to create GPU network");
-    
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
     let batch_size = 32;
     // Create challenging data with larger values
     let input: Vec<f32> = make_input(config.input_dim, batch_size, 100)
         .iter()
-        .map(|x| x * 5.0)  // Larger inputs
+        .map(|x| x * 5.0) // Larger inputs
         .collect();
     let target: Vec<f32> = make_target(config.output_dim, batch_size, 200)
         .iter()
-        .map(|x| x * 5.0)  // Larger targets
+        .map(|x| x * 5.0) // Larger targets
         .collect();
-    
+
     let mut workspace = gpu_network.create_workspace(batch_size).expect("Failed");
-    
+
     let layer_sizes = gpu_network.layer_param_sizes();
     let mut optimizer = GpuAdam::new(
         backend.device_arc(),
@@ -602,15 +690,15 @@ fn test_native_training_with_clipping_stability() {
         &layer_sizes,
         GpuAdamConfig::with_lr(0.01), // Higher LR
     );
-    
+
     let opts = TrainOptions {
         max_grad_norm: Some(1.0),
         weight_decay: 0.0,
     };
-    
+
     let num_steps = 500;
     let mut losses = Vec::with_capacity(num_steps);
-    
+
     for step in 0..num_steps {
         let loss = gpu_network
             .train_step_gpu_native_with_options(
@@ -623,19 +711,22 @@ fn test_native_training_with_clipping_stability() {
                 &opts,
             )
             .expect("Training failed");
-        
+
         losses.push(loss);
         assert!(loss.is_finite(), "Loss became non-finite at step {}", step);
-        
+
         if step % 100 == 0 {
             println!("Step {}: loss = {:.6}", step, loss);
         }
     }
-    
-    println!("Training with clipping completed successfully for {} steps", num_steps);
+
+    println!(
+        "Training with clipping completed successfully for {} steps",
+        num_steps
+    );
     println!("  Initial loss: {:.6}", losses[0]);
     println!("  Final loss:   {:.6}", losses.last().unwrap());
-    
+
     println!("✅ Native training with gradient clipping is stable");
 }
 
@@ -648,18 +739,18 @@ fn test_native_training_with_clipping_stability() {
 #[ignore = "Requires GPU"]
 fn test_native_training_batch_size_1() {
     let backend = WgpuBackend::init(WgpuOptions::default()).expect("Failed to create backend");
-    
+
     let config = small_config(42);
     let cpu_network = KanNetwork::new(config.clone());
-    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
-        .expect("Failed to create GPU network");
-    
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
     let batch_size = 1;
     let input = make_input(config.input_dim, batch_size, 100);
     let target = make_target(config.output_dim, batch_size, 200);
-    
+
     let mut workspace = gpu_network.create_workspace(batch_size).expect("Failed");
-    
+
     let layer_sizes = gpu_network.layer_param_sizes();
     let mut optimizer = GpuAdam::new(
         backend.device_arc(),
@@ -667,19 +758,24 @@ fn test_native_training_batch_size_1() {
         &layer_sizes,
         GpuAdamConfig::with_lr(TEST_LR),
     );
-    
+
     let loss1 = gpu_network
         .train_step_gpu_native(&input, &target, batch_size, &mut workspace, &mut optimizer)
         .expect("Training failed");
-    
+
     let loss2 = gpu_network
         .train_step_gpu_native(&input, &target, batch_size, &mut workspace, &mut optimizer)
         .expect("Training failed");
-    
+
     assert!(loss1.is_finite());
     assert!(loss2.is_finite());
-    assert!(loss2 <= loss1, "Loss should decrease: {} -> {}", loss1, loss2);
-    
+    assert!(
+        loss2 <= loss1,
+        "Loss should decrease: {} -> {}",
+        loss1,
+        loss2
+    );
+
     println!("✅ Native training works with batch_size=1");
 }
 
@@ -688,18 +784,18 @@ fn test_native_training_batch_size_1() {
 #[ignore = "Requires GPU"]
 fn test_native_training_large_batch() {
     let backend = WgpuBackend::init(WgpuOptions::default()).expect("Failed to create backend");
-    
+
     let config = small_config(42);
     let cpu_network = KanNetwork::new(config.clone());
-    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
-        .expect("Failed to create GPU network");
-    
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
     let batch_size = 256;
     let input = make_input(config.input_dim, batch_size, 100);
     let target = make_target(config.output_dim, batch_size, 200);
-    
+
     let mut workspace = gpu_network.create_workspace(batch_size).expect("Failed");
-    
+
     let layer_sizes = gpu_network.layer_param_sizes();
     let mut optimizer = GpuAdam::new(
         backend.device_arc(),
@@ -707,7 +803,7 @@ fn test_native_training_large_batch() {
         &layer_sizes,
         GpuAdamConfig::with_lr(TEST_LR),
     );
-    
+
     let mut losses = Vec::new();
     for _ in 0..10 {
         let loss = gpu_network
@@ -716,12 +812,12 @@ fn test_native_training_large_batch() {
         assert!(loss.is_finite());
         losses.push(loss);
     }
-    
+
     assert!(
         losses.last().unwrap() < losses.first().unwrap(),
         "Loss should decrease with large batch"
     );
-    
+
     println!("✅ Native training works with batch_size={}", batch_size);
 }
 
@@ -735,86 +831,122 @@ fn test_native_training_large_batch() {
 #[ignore = "Requires GPU - DIAGNOSTIC"]
 fn test_diagnostic_adam_hybrid_sizes() {
     let backend = WgpuBackend::init(WgpuOptions::default()).expect("Failed to create backend");
-    
+
     let config = small_config(42);
-    println!("Config: input_dim={}, hidden_dims={:?}, output_dim={}", 
-             config.input_dim, config.hidden_dims, config.output_dim);
-    println!("spline_order={}, grid_size={}", config.spline_order, config.grid_size);
-    
+    println!(
+        "Config: input_dim={}, hidden_dims={:?}, output_dim={}",
+        config.input_dim, config.hidden_dims, config.output_dim
+    );
+    println!(
+        "spline_order={}, grid_size={}",
+        config.spline_order, config.grid_size
+    );
+
     let cpu_network = KanNetwork::new(config.clone());
-    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
-        .expect("Failed to create GPU network");
-    
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
     // Print CPU layer sizes
     println!("\nCPU Layer sizes:");
     for (i, layer) in cpu_network.layers.iter().enumerate() {
-        println!("  Layer {}: in_dim={}, out_dim={}, global_basis_size={}", 
-                 i, layer.in_dim, layer.out_dim, layer.global_basis_size);
+        println!(
+            "  Layer {}: in_dim={}, out_dim={}, global_basis_size={}",
+            i, layer.in_dim, layer.out_dim, layer.global_basis_size
+        );
         println!("    weights.len() = {}", layer.weights.len());
         println!("    bias.len() = {}", layer.bias.len());
     }
-    
+
     // Print GPU layer sizes
     println!("\nGPU Layer param sizes (from layer_param_sizes):");
     let layer_sizes = gpu_network.layer_param_sizes();
     for (i, (w, b)) in layer_sizes.iter().enumerate() {
         println!("  Layer {}: weights={}, bias={}", i, w, b);
     }
-    
+
     // Create Adam optimizer
     let adam_config = AdamConfig {
         lr: TEST_LR,
         ..Default::default()
     };
     let adam = Adam::new(&cpu_network, adam_config);
-    
+
     // Print Adam state sizes
     println!("\nAdam state sizes:");
     for (i, state) in adam.layer_states.iter().enumerate() {
-        println!("  Layer {}: weights.m.len()={}, bias.m.len()={}", 
-                 i, state.weights.m.len(), state.bias.m.len());
+        println!(
+            "  Layer {}: weights.m.len()={}, bias.m.len()={}",
+            i,
+            state.weights.m.len(),
+            state.bias.m.len()
+        );
     }
-    
+
     let batch_size = 4;
     let input = make_input(config.input_dim, batch_size, 100);
     let target = make_target(config.output_dim, batch_size, 200);
-    
+
     let mut workspace = gpu_network.create_workspace(batch_size).expect("Failed");
-    
+
     // Do forward pass with training mode (allocates gradient buffers)
     let output = gpu_network
         .forward_batch_training(&input, batch_size, &mut workspace)
         .expect("Forward failed");
-    
+
     // Compute loss gradient manually
     let (loss, grad_output) = arkan::loss::masked_mse(&output, &target, None);
     println!("\nLoss: {}", loss);
     println!("grad_output.len() = {}", grad_output.len());
-    
+
     // Do backward pass
     let mut grad_weights = Vec::new();
     let mut grad_biases = Vec::new();
     let _grad_input = gpu_network
-        .backward_batch(&grad_output, batch_size, &mut workspace, &mut grad_weights, &mut grad_biases)
+        .backward_batch(
+            &grad_output,
+            batch_size,
+            &mut workspace,
+            &mut grad_weights,
+            &mut grad_biases,
+        )
         .expect("Backward failed");
-    
+
     println!("\nGradient sizes from backward_batch:");
     for (i, (gw, gb)) in grad_weights.iter().zip(grad_biases.iter()).enumerate() {
-        println!("  Layer {}: grad_weights.len()={}, grad_bias.len()={}", i, gw.len(), gb.len());
+        println!(
+            "  Layer {}: grad_weights.len()={}, grad_bias.len()={}",
+            i,
+            gw.len(),
+            gb.len()
+        );
     }
-    
+
     // Compare with CPU weights
     println!("\nComparison:");
     for (i, layer) in cpu_network.layers.iter().enumerate() {
         let cpu_w = layer.weights.len();
         let gpu_gw = grad_weights[i].len();
-        let match_str = if cpu_w == gpu_gw { "✅ MATCH" } else { "❌ MISMATCH" };
-        println!("  Layer {} weights: CPU={}, GPU grad={} {}", i, cpu_w, gpu_gw, match_str);
-        
+        let match_str = if cpu_w == gpu_gw {
+            "✅ MATCH"
+        } else {
+            "❌ MISMATCH"
+        };
+        println!(
+            "  Layer {} weights: CPU={}, GPU grad={} {}",
+            i, cpu_w, gpu_gw, match_str
+        );
+
         let cpu_b = layer.bias.len();
         let gpu_gb = grad_biases[i].len();
-        let match_str = if cpu_b == gpu_gb { "✅ MATCH" } else { "❌ MISMATCH" };
-        println!("  Layer {} bias: CPU={}, GPU grad={} {}", i, cpu_b, gpu_gb, match_str);
+        let match_str = if cpu_b == gpu_gb {
+            "✅ MATCH"
+        } else {
+            "❌ MISMATCH"
+        };
+        println!(
+            "  Layer {} bias: CPU={}, GPU grad={} {}",
+            i, cpu_b, gpu_gb, match_str
+        );
     }
 }
 
@@ -823,60 +955,72 @@ fn test_diagnostic_adam_hybrid_sizes() {
 #[ignore = "Requires GPU"]
 fn test_hybrid_adam_training_convergence() {
     let backend = WgpuBackend::init(WgpuOptions::default()).expect("Failed to create backend");
-    
+
     let config = small_config(42);
-    
+
     let mut cpu_network = KanNetwork::new(config.clone());
-    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
-        .expect("Failed to create GPU network");
-    
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+
     let batch_size = 8;
     let input = make_input(config.input_dim, batch_size, 100);
     let target = make_target(config.output_dim, batch_size, 200);
-    
+
     let mut workspace = gpu_network.create_workspace(batch_size).expect("Failed");
-    
+
     // CPU Adam optimizer
     let adam_config = AdamConfig {
         lr: TEST_LR,
         ..Default::default()
     };
     let mut adam = Adam::new(&cpu_network, adam_config);
-    
+
     let num_steps = 50;
     let mut losses = Vec::new();
-    
+
     for step in 0..num_steps {
         let loss = gpu_network
-            .train_step_mse(&input, &target, batch_size, &mut workspace, &mut adam, &mut cpu_network)
+            .train_step_mse(
+                &input,
+                &target,
+                batch_size,
+                &mut workspace,
+                &mut adam,
+                &mut cpu_network,
+            )
             .expect("Hybrid Adam training failed");
         losses.push(loss);
-        
+
         if step % 10 == 0 {
             println!("Step {}: loss={:.6}", step, loss);
         }
     }
-    
+
     // Loss should decrease (convergence)
     let initial_loss = *losses.first().unwrap();
     let final_loss = *losses.last().unwrap();
-    
+
     assert!(
         final_loss < initial_loss,
         "Hybrid Adam should decrease loss: {} -> {}",
-        initial_loss, final_loss
+        initial_loss,
+        final_loss
     );
-    
+
     // Loss should have decreased significantly
     let decrease_ratio = final_loss / initial_loss;
-    println!("Loss decrease: {:.6} -> {:.6} ({}% of initial)", 
-             initial_loss, final_loss, decrease_ratio * 100.0);
-    
+    println!(
+        "Loss decrease: {:.6} -> {:.6} ({}% of initial)",
+        initial_loss,
+        final_loss,
+        decrease_ratio * 100.0
+    );
+
     assert!(
         decrease_ratio < 0.95,
         "Loss should decrease by at least 5%: decrease_ratio={}",
         decrease_ratio
     );
-    
+
     println!("✅ Hybrid Adam training converges properly");
 }

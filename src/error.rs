@@ -24,6 +24,9 @@ use std::borrow::Cow;
 
 use thiserror::Error;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::config::ConfigError;
 
 /// Unified error type for ArKan operations.
@@ -153,7 +156,6 @@ pub enum ArkanError {
     // =========================================================================
     // Optimizer-specific errors (v2.1)
     // =========================================================================
-
     /// Parameter group index out of bounds.
     ///
     /// Occurs when trying to access or modify a parameter group that doesn't exist.
@@ -274,7 +276,10 @@ impl ArkanError {
 
     /// Creates a group index out of bounds error.
     pub fn group_index_out_of_bounds(index: usize, total_groups: usize) -> Self {
-        ArkanError::GroupIndexOutOfBounds { index, total_groups }
+        ArkanError::GroupIndexOutOfBounds {
+            index,
+            total_groups,
+        }
     }
 
     /// Creates a tensor shape mismatch error.

@@ -1,7 +1,7 @@
 //! Comprehensive functionality test for ArKan library
 //! Tests CPU, GPU, forward, backward, optimizers, etc.
 
-use arkan::optimizer::{Adam, AdamConfig, CosineAnnealingLR, LrScheduler, StepLR, SGD, SGDConfig};
+use arkan::optimizer::{Adam, AdamConfig, CosineAnnealingLR, LrScheduler, SGDConfig, StepLR, SGD};
 use arkan::{KanConfig, KanNetwork, TrainOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

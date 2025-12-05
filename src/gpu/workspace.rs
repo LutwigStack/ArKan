@@ -961,13 +961,13 @@ impl GpuWorkspace {
         queue: &std::sync::Arc<wgpu::Queue>,
     ) -> ArkanResult<Vec<(Vec<f32>, Vec<f32>)>> {
         let mut result = Vec::with_capacity(self.grad_weights.len());
-        
+
         for (gw, gb) in self.grad_weights.iter().zip(self.grad_bias.iter()) {
             let weights = gw.download(device, queue)?;
             let biases = gb.download(device, queue)?;
             result.push((weights, biases));
         }
-        
+
         Ok(result)
     }
 

@@ -37,7 +37,13 @@ const NUMERICAL_TOL: f32 = 1e-2;
 
 /// Compares two f32 slices with tolerance, returns (passed, max_diff, max_idx).
 fn compare_slices(a: &[f32], b: &[f32], tol: f32) -> (bool, f32, usize) {
-    assert_eq!(a.len(), b.len(), "Length mismatch: {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "Length mismatch: {} vs {}",
+        a.len(),
+        b.len()
+    );
 
     let mut max_diff = 0.0f32;
     let mut max_idx = 0;
@@ -86,12 +92,7 @@ fn single_layer_config(in_dim: usize, out_dim: usize, seed: u64) -> KanConfig {
 }
 
 /// Helper config for multi-layer tests.
-fn multi_layer_config(
-    in_dim: usize,
-    hidden: &[usize],
-    out_dim: usize,
-    seed: u64,
-) -> KanConfig {
+fn multi_layer_config(in_dim: usize, hidden: &[usize], out_dim: usize, seed: u64) -> KanConfig {
     KanConfigBuilder::new()
         .input_dim(in_dim)
         .output_dim(out_dim)
@@ -395,7 +396,12 @@ fn test_gpu_bias_gradient_isolated() {
     println!("GPU bias grad:      {:?}", gpu_grad_biases[0]);
 
     // Strict tolerance for this mathematical identity
-    assert_approx_eq(&expected_bias_grad, &gpu_grad_biases[0], 1e-6, "Bias gradient identity");
+    assert_approx_eq(
+        &expected_bias_grad,
+        &gpu_grad_biases[0],
+        1e-6,
+        "Bias gradient identity",
+    );
 
     println!("✓ Isolated bias gradient test passed");
 }
@@ -635,17 +641,18 @@ fn test_gpu_numerical_gradient_check() {
     let analytical_grad = gpu_grad_weights[0].clone();
 
     // Helper: compute MSE loss on GPU
-    let compute_loss = |network: &mut GpuNetwork, workspace: &mut arkan::gpu::GpuWorkspace| -> f32 {
-        let output = network
-            .forward_batch(&input, batch_size, workspace)
-            .expect("Forward failed");
-        output
-            .iter()
-            .zip(target.iter())
-            .map(|(o, t)| (o - t).powi(2))
-            .sum::<f32>()
-            / (batch_size * config.output_dim) as f32
-    };
+    let compute_loss =
+        |network: &mut GpuNetwork, workspace: &mut arkan::gpu::GpuWorkspace| -> f32 {
+            let output = network
+                .forward_batch(&input, batch_size, workspace)
+                .expect("Forward failed");
+            output
+                .iter()
+                .zip(target.iter())
+                .map(|(o, t)| (o - t).powi(2))
+                .sum::<f32>()
+                / (batch_size * config.output_dim) as f32
+        };
 
     // Numerical gradient check for a subset of weights (checking all would be slow)
     let num_weights = analytical_grad.len();
@@ -661,16 +668,21 @@ fn test_gpu_numerical_gradient_check() {
     for &idx in &check_indices {
         // Perturb weight +h
         cpu_network_for_perturbation.layers[0].weights[idx] += h;
-        let mut gpu_plus =
-            GpuNetwork::from_cpu(&backend, &cpu_network_for_perturbation).expect("GPU create failed");
-        let mut ws_plus = gpu_plus.create_workspace(batch_size).expect("Workspace failed");
+        let mut gpu_plus = GpuNetwork::from_cpu(&backend, &cpu_network_for_perturbation)
+            .expect("GPU create failed");
+        let mut ws_plus = gpu_plus
+            .create_workspace(batch_size)
+            .expect("Workspace failed");
         let loss_plus = compute_loss(&mut gpu_plus, &mut ws_plus);
 
         // Perturb weight -h (from original)
-        cpu_network_for_perturbation.layers[0].weights[idx] = cpu_network.layers[0].weights[idx] - h;
-        let mut gpu_minus =
-            GpuNetwork::from_cpu(&backend, &cpu_network_for_perturbation).expect("GPU create failed");
-        let mut ws_minus = gpu_minus.create_workspace(batch_size).expect("Workspace failed");
+        cpu_network_for_perturbation.layers[0].weights[idx] =
+            cpu_network.layers[0].weights[idx] - h;
+        let mut gpu_minus = GpuNetwork::from_cpu(&backend, &cpu_network_for_perturbation)
+            .expect("GPU create failed");
+        let mut ws_minus = gpu_minus
+            .create_workspace(batch_size)
+            .expect("Workspace failed");
         let loss_minus = compute_loss(&mut gpu_minus, &mut ws_minus);
 
         // Restore original weight
@@ -1007,7 +1019,12 @@ fn test_gpu_backward_spline_order_2_regression() {
                 .sum()
         })
         .collect();
-    assert_approx_eq(&expected_bias_grad, &gpu_grad_biases[0], 1e-5, "Order=2 bias");
+    assert_approx_eq(
+        &expected_bias_grad,
+        &gpu_grad_biases[0],
+        1e-5,
+        "Order=2 bias",
+    );
 
     // Input gradients should be non-zero (this was the bug)
     let grad_input_norm: f32 = gpu_grad_input.iter().map(|g| g * g).sum::<f32>().sqrt();
@@ -1092,7 +1109,12 @@ fn test_gpu_backward_wide_layer() {
         })
         .collect();
 
-    assert_approx_eq(&expected_bias_grad, &gpu_grad_biases[0], 1e-4, "Wide layer bias");
+    assert_approx_eq(
+        &expected_bias_grad,
+        &gpu_grad_biases[0],
+        1e-4,
+        "Wide layer bias",
+    );
 
     println!(
         "Wide layer test: in={}, out={}, batch={}, weights={}",

@@ -513,7 +513,13 @@ pub fn masked_mae(predictions: &[f32], targets: &[f32], mask: Option<&[f32]>) ->
             let diff = predictions[i] - targets[i];
             loss += m * diff.abs();
             // Subgradient: sign(diff), use 0 for diff=0
-            grad[i] = m * if diff > 0.0 { 1.0 } else if diff < 0.0 { -1.0 } else { 0.0 };
+            grad[i] = m * if diff > 0.0 {
+                1.0
+            } else if diff < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
             count += m;
         }
     }
@@ -778,7 +784,14 @@ pub fn l1_sparsity_gradient(coefficients: &[f32]) -> Vec<f32> {
     coefficients
         .iter()
         .map(|&c| {
-            scale * if c > 0.0 { 1.0 } else if c < 0.0 { -1.0 } else { 0.0 }
+            scale
+                * if c > 0.0 {
+                    1.0
+                } else if c < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                }
         })
         .collect()
 }

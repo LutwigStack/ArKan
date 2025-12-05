@@ -1003,7 +1003,13 @@ impl KanLayer {
                     // Thread-local basis buffers
                     let basis_values = vec![0.0f32; self.in_dim * self.basis_aligned];
                     let basis_derivs = vec![0.0f32; self.in_dim * self.basis_aligned];
-                    (local_weights, local_bias, local_input, basis_values, basis_derivs)
+                    (
+                        local_weights,
+                        local_bias,
+                        local_input,
+                        basis_values,
+                        basis_derivs,
+                    )
                 },
                 |mut acc, b| {
                     let (
@@ -1083,7 +1089,13 @@ impl KanLayer {
                     };
                     let basis_values = Vec::new();
                     let basis_derivs = Vec::new();
-                    (local_weights, local_bias, local_input, basis_values, basis_derivs)
+                    (
+                        local_weights,
+                        local_bias,
+                        local_input,
+                        basis_values,
+                        basis_derivs,
+                    )
                 },
                 |mut a, b| {
                     // Sum thread-local gradients

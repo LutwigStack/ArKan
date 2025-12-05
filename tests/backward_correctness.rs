@@ -41,9 +41,9 @@ fn setup_layer_test(
 ) -> (
     KanLayer,
     Workspace,
-    Vec<f32>,  // normalized_input
-    Vec<u32>,  // grid_indices
-    Vec<f32>,  // grad_output
+    Vec<f32>, // normalized_input
+    Vec<u32>, // grid_indices
+    Vec<f32>, // grad_output
 ) {
     let config = test_config(in_dim, out_dim, &[]);
     let layer = KanLayer::new(in_dim, out_dim, &config);
@@ -68,7 +68,13 @@ fn setup_layer_test(
         .map(|_| rng.gen_range(-1.0..1.0))
         .collect();
 
-    (layer, workspace, normalized_input, grid_indices, grad_output)
+    (
+        layer,
+        workspace,
+        normalized_input,
+        grid_indices,
+        grad_output,
+    )
 }
 
 // =============================================================================
@@ -421,14 +427,21 @@ fn test_network_train_step_uses_parallel() {
     let batch_size = 64; // Above threshold
     let mut rng = SmallRng::seed_from_u64(11111);
 
-    let input: Vec<f32> = (0..batch_size * 8).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let target: Vec<f32> = (0..batch_size * 4).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let input: Vec<f32> = (0..batch_size * 8)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
+    let target: Vec<f32> = (0..batch_size * 4)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
 
     // This should use backward_parallel internally
     let loss = network.train_step(&input, &target, None, 0.001, &mut workspace);
     assert!(loss.is_finite(), "Loss should be finite");
 
-    println!("Network train_step (batch=64, threshold=32): loss = {:.6}", loss);
+    println!(
+        "Network train_step (batch=64, threshold=32): loss = {:.6}",
+        loss
+    );
 }
 
 /// Test network with batch below threshold (uses sequential backward).
@@ -453,14 +466,21 @@ fn test_network_train_step_uses_sequential() {
     let batch_size = 16; // Below threshold
     let mut rng = SmallRng::seed_from_u64(22222);
 
-    let input: Vec<f32> = (0..batch_size * 8).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let target: Vec<f32> = (0..batch_size * 4).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let input: Vec<f32> = (0..batch_size * 8)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
+    let target: Vec<f32> = (0..batch_size * 4)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
 
     // This should use sequential backward
     let loss = network.train_step(&input, &target, None, 0.001, &mut workspace);
     assert!(loss.is_finite(), "Loss should be finite");
 
-    println!("Network train_step (batch=16, threshold=128): loss = {:.6}", loss);
+    println!(
+        "Network train_step (batch=16, threshold=128): loss = {:.6}",
+        loss
+    );
 }
 
 // =============================================================================
@@ -710,6 +730,9 @@ fn test_backward_parallel_deterministic() {
     );
 
     // Should be exactly identical
-    assert_eq!(grad_weights_1, grad_weights_2, "Weights should be deterministic");
+    assert_eq!(
+        grad_weights_1, grad_weights_2,
+        "Weights should be deterministic"
+    );
     assert_eq!(grad_bias_1, grad_bias_2, "Biases should be deterministic");
 }

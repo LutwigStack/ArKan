@@ -157,12 +157,16 @@ pub use error::{ArkanError, ArkanResult};
 pub use layer::KanLayer;
 pub use loss::{
     entropy_regularization, kan_combined_loss, kan_regularization_gradient, l1_sparsity_gradient,
-    l1_sparsity_loss, masked_bce_with_logits, masked_categorical_cross_entropy, masked_cross_entropy,
-    masked_huber, masked_mae, masked_mse, masked_rmse, masked_softmax, pde_residual_loss,
-    poker_combined_loss, r_squared, smoothness_gradient, smoothness_penalty, softmax, KanLossConfig,
+    l1_sparsity_loss, masked_bce_with_logits, masked_categorical_cross_entropy,
+    masked_cross_entropy, masked_huber, masked_mae, masked_mse, masked_rmse, masked_softmax,
+    pde_residual_loss, poker_combined_loss, r_squared, smoothness_gradient, smoothness_penalty,
+    softmax, KanLossConfig,
 };
 pub use network::{KanNetwork, TrainOptions};
-pub use optimizer::{Adam, AdamConfig, AdamState, CosineAnnealingLR, LrScheduler, StepLR, SGD};
+pub use optimizer::{
+    Adam, AdamConfig, AdamState, CosineAnnealingLR, LBFGSConfig, LineSearchMethod, LrScheduler,
+    Optimizer, ParamGroup, SGDConfig, SafetyConfig, StepLR, LBFGS, SGD,
+};
 pub use spline::{
     compute_basis, compute_basis_and_deriv, compute_knots, find_span, normalize_batch,
 };

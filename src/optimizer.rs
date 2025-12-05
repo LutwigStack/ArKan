@@ -124,7 +124,9 @@ pub trait Optimizer: Send + Sync {
     {
         // Default: not supported for first-order optimizers
         let _ = closure;
-        Err(ArkanError::optimizer("step_with_closure not supported for this optimizer"))
+        Err(ArkanError::optimizer(
+            "step_with_closure not supported for this optimizer",
+        ))
     }
 
     /// Zeros all gradients in the network.
@@ -180,6 +182,75 @@ pub trait Optimizer: Send + Sync {
 // =============================================================================
 // COMMON CONFIGURATION
 // =============================================================================
+
+/// Parameter group for per-layer or per-parameter-set optimization.
+///
+/// Allows different learning rates, weight decay, and other hyperparameters
+/// for different parts of the network.
+///
+/// # Example
+///
+/// ```rust
+/// use arkan::optimizer::ParamGroup;
+///
+/// // Custom group with overrides
+/// let group = ParamGroup {
+///     lr_override: Some(0.0001),
+///     weight_decay_override: Some(0.01),
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ParamGroup {
+    /// Override learning rate for this group. If None, uses optimizer default.
+    pub lr_override: Option<f64>,
+
+    /// Override weight decay for this group. If None, uses optimizer default.
+    pub weight_decay_override: Option<f64>,
+
+    /// Override betas (for Adam) for this group. If None, uses optimizer default.
+    pub betas_override: Option<(f64, f64)>,
+
+    /// If false, parameters in this group are frozen (no gradient updates).
+    pub requires_grad: bool,
+
+    /// Per-group gradient scaling factor for AMP.
+    pub grad_scaling: Option<f64>,
+
+    /// Layer indices that belong to this group.
+    pub layer_indices: Vec<usize>,
+}
+
+impl ParamGroup {
+    /// Creates a new parameter group for all layers with default settings.
+    pub fn all_layers(num_layers: usize) -> Self {
+        Self {
+            requires_grad: true,
+            layer_indices: (0..num_layers).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Creates a frozen group (no gradient updates).
+    pub fn frozen(layer_indices: Vec<usize>) -> Self {
+        Self {
+            requires_grad: false,
+            layer_indices,
+            ..Default::default()
+        }
+    }
+
+    /// Creates a group with custom learning rate.
+    pub fn with_lr(layer_indices: Vec<usize>, lr: f64) -> Self {
+        Self {
+            requires_grad: true,
+            lr_override: Some(lr),
+            layer_indices,
+            ..Default::default()
+        }
+    }
+}
 
 /// Safety configuration for optimizers.
 ///
@@ -484,7 +555,7 @@ impl Clone for LayerAdamState {
 /// let config = KanConfig::preset();
 /// let mut network = KanNetwork::new(config);
 /// let mut optimizer = Adam::new(&network, AdamConfig::with_lr(0.001));
-/// 
+///
 /// // Check optimizer version
 /// assert_eq!(optimizer.get_state_version(), 0);
 /// ```
@@ -898,6 +969,9 @@ pub struct SGDConfig {
     /// Weight decay coefficient.
     pub weight_decay: f32,
 
+    /// Use Nesterov momentum (look-ahead gradients).
+    pub nesterov: bool,
+
     /// Safety configuration for NaN handling and AMP.
     #[cfg_attr(feature = "serde", serde(default))]
     pub safety: SafetyConfig,
@@ -909,6 +983,7 @@ impl Default for SGDConfig {
             lr: 0.01,
             momentum: 0.0,
             weight_decay: 0.0,
+            nesterov: false,
             safety: SafetyConfig::default(),
         }
     }
@@ -932,12 +1007,36 @@ impl SGDConfig {
         }
     }
 
+    /// Creates config with Nesterov momentum.
+    ///
+    /// Nesterov momentum computes gradients at the "look-ahead" position,
+    /// often leading to faster convergence than standard momentum.
+    pub fn with_nesterov(lr: f32, momentum: f32) -> Self {
+        Self {
+            lr,
+            momentum,
+            nesterov: true,
+            ..Default::default()
+        }
+    }
+
     /// Creates full config.
     pub fn full(lr: f32, momentum: f32, weight_decay: f32) -> Self {
         Self {
             lr,
             momentum,
             weight_decay,
+            ..Default::default()
+        }
+    }
+
+    /// Creates full config with Nesterov option.
+    pub fn full_nesterov(lr: f32, momentum: f32, weight_decay: f32, nesterov: bool) -> Self {
+        Self {
+            lr,
+            momentum,
+            weight_decay,
+            nesterov,
             ..Default::default()
         }
     }
@@ -1111,13 +1210,19 @@ impl Optimizer for SGD {
             if safety.fail_on_nan || safety.skip_step_on_nan {
                 if let Some(idx) = find_nan_in_grads(wg) {
                     if safety.fail_on_nan && !safety.skip_step_on_nan {
-                        return Err(ArkanError::nan_encountered(idx, format!("weight gradient at layer {}", i)));
+                        return Err(ArkanError::nan_encountered(
+                            idx,
+                            format!("weight gradient at layer {}", i),
+                        ));
                     }
                     return Ok(()); // Skip step
                 }
                 if let Some(idx) = find_nan_in_grads(bg) {
                     if safety.fail_on_nan && !safety.skip_step_on_nan {
-                        return Err(ArkanError::nan_encountered(idx, format!("bias gradient at layer {}", i)));
+                        return Err(ArkanError::nan_encountered(
+                            idx,
+                            format!("bias gradient at layer {}", i),
+                        ));
                     }
                     return Ok(()); // Skip step
                 }
@@ -1126,6 +1231,10 @@ impl Optimizer for SGD {
 
         // Apply AMP scaling
         let scaling_factor = self.config.safety.grad_scaling_factor;
+        let nesterov = self.config.nesterov;
+        let momentum = self.config.momentum;
+        let lr = self.config.lr;
+        let decay = self.config.weight_decay;
 
         for (i, layer) in network.layers.iter_mut().enumerate() {
             let (ref mut vw, ref mut vb) = self.velocities[i];
@@ -1139,19 +1248,36 @@ impl Optimizer for SGD {
             let vw_slice = vw.as_mut_slice();
 
             for j in 0..weights.len() {
-                vw_slice[j] = self.config.momentum * vw_slice[j] + wg_clipped[j];
-                if self.config.weight_decay > 0.0 {
-                    weights[j] *= 1.0 - self.config.lr * self.config.weight_decay;
+                // Update velocity: v = μ*v + g
+                vw_slice[j] = momentum * vw_slice[j] + wg_clipped[j];
+
+                // Apply decoupled weight decay BEFORE gradient step
+                if decay > 0.0 {
+                    weights[j] *= 1.0 - lr * decay;
                 }
-                weights[j] -= self.config.lr * vw_slice[j];
+
+                // Nesterov vs standard momentum
+                // Nesterov: θ -= lr * (μ*v + g)
+                // Standard: θ -= lr * v
+                let update = if nesterov {
+                    momentum * vw_slice[j] + wg_clipped[j]
+                } else {
+                    vw_slice[j]
+                };
+                weights[j] -= lr * update;
             }
 
             let bias = layer.bias.as_mut_slice();
             let vb_slice = vb.as_mut_slice();
 
             for j in 0..bias.len() {
-                vb_slice[j] = self.config.momentum * vb_slice[j] + bg_clipped[j];
-                bias[j] -= self.config.lr * vb_slice[j];
+                vb_slice[j] = momentum * vb_slice[j] + bg_clipped[j];
+                let update = if nesterov {
+                    momentum * vb_slice[j] + bg_clipped[j]
+                } else {
+                    vb_slice[j]
+                };
+                bias[j] -= lr * update;
             }
         }
 
@@ -1244,13 +1370,16 @@ impl Default for LBFGSConfig {
 }
 
 /// Line search methods for L-BFGS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum LineSearchMethod {
     /// Strong Wolfe conditions (default, most robust).
+    #[default]
     StrongWolfe,
     /// Backtracking with Armijo condition.
     Backtracking,
+    /// No line search (fixed step size). Use with caution.
+    NoLineSearch,
 }
 
 /// L-BFGS optimizer for KAN networks.
@@ -1339,9 +1468,19 @@ impl LBFGS {
         self.n_eval = 0;
     }
 
+    /// Returns the number of function evaluations.
+    pub fn num_evals(&self) -> usize {
+        self.n_eval
+    }
+
     /// Flattens network parameters into a single vector.
-    fn flatten_params(network: &KanNetwork) -> Vec<f32> {
-        let mut params = Vec::new();
+    pub fn flatten_params(network: &KanNetwork) -> Vec<f32> {
+        let total: usize = network
+            .layers
+            .iter()
+            .map(|l| l.weights.len() + l.bias.len())
+            .sum();
+        let mut params = Vec::with_capacity(total);
         for layer in &network.layers {
             params.extend_from_slice(&layer.weights);
             params.extend_from_slice(&layer.bias);
@@ -1350,22 +1489,30 @@ impl LBFGS {
     }
 
     /// Restores parameters from a flat vector.
-    fn restore_params(network: &mut KanNetwork, params: &[f32]) {
+    pub fn restore_params(network: &mut KanNetwork, params: &[f32]) {
         let mut offset = 0;
         for layer in &mut network.layers {
             let w_len = layer.weights.len();
-            layer.weights.as_mut_slice().copy_from_slice(&params[offset..offset + w_len]);
+            layer
+                .weights
+                .as_mut_slice()
+                .copy_from_slice(&params[offset..offset + w_len]);
             offset += w_len;
 
             let b_len = layer.bias.len();
-            layer.bias.as_mut_slice().copy_from_slice(&params[offset..offset + b_len]);
+            layer
+                .bias
+                .as_mut_slice()
+                .copy_from_slice(&params[offset..offset + b_len]);
             offset += b_len;
         }
     }
 
     /// Flattens gradients into a single vector.
-    fn flatten_grads(weight_grads: &[Vec<f32>], bias_grads: &[Vec<f32>]) -> Vec<f32> {
-        let mut grads = Vec::new();
+    pub fn flatten_grads(weight_grads: &[Vec<f32>], bias_grads: &[Vec<f32>]) -> Vec<f32> {
+        let total: usize = weight_grads.iter().map(|v| v.len()).sum::<usize>()
+            + bias_grads.iter().map(|v| v.len()).sum::<usize>();
+        let mut grads = Vec::with_capacity(total);
         for (wg, bg) in weight_grads.iter().zip(bias_grads.iter()) {
             grads.extend_from_slice(wg);
             grads.extend_from_slice(bg);
@@ -1373,9 +1520,37 @@ impl LBFGS {
         grads
     }
 
+    /// Updates history with new s and y vectors.
+    fn update_history(&mut self, s: Vec<f32>, y: Vec<f32>) {
+        let sy: f64 = s
+            .iter()
+            .zip(y.iter())
+            .map(|(&si, &yi)| si as f64 * yi as f64)
+            .sum();
+
+        // Skip if curvature condition not satisfied
+        if sy <= 1e-10 {
+            return;
+        }
+
+        let rho = 1.0 / sy;
+
+        // Maintain history_size limit
+        if self.s_history.len() >= self.config.history_size {
+            self.s_history.remove(0);
+            self.y_history.remove(0);
+            self.rho_history.remove(0);
+        }
+
+        self.s_history.push(s);
+        self.y_history.push(y);
+        self.rho_history.push(rho);
+    }
+
     /// Two-loop recursion for computing search direction.
-    fn two_loop_recursion(&self, grad: &[f32]) -> Vec<f32> {
-        let n = grad.len();
+    ///
+    /// Returns -H⁻¹g where H⁻¹ is approximated using L-BFGS history.
+    pub fn two_loop_recursion(&self, grad: &[f32]) -> Vec<f32> {
         let m = self.s_history.len();
 
         if m == 0 {
@@ -1388,6 +1563,8 @@ impl LBFGS {
         let mut alpha = vec![0.0f64; m];
 
         // First loop (backward)
+        // Note: We need to access alpha[i] and history[i] in tandem, clippy allow is correct here
+        #[allow(clippy::needless_range_loop)]
         for i in (0..m).rev() {
             alpha[i] = self.rho_history[i]
                 * self.s_history[i]
@@ -1395,15 +1572,15 @@ impl LBFGS {
                     .zip(q.iter())
                     .map(|(&s, &q)| s as f64 * q)
                     .sum::<f64>();
-            for j in 0..n {
-                q[j] -= alpha[i] * self.y_history[i][j] as f64;
+            for (q_j, &y_ij) in q.iter_mut().zip(self.y_history[i].iter()) {
+                *q_j -= alpha[i] * y_ij as f64;
             }
         }
 
-        // Scale initial Hessian approximation
+        // Scale initial Hessian approximation: H0 = γI where γ = sᵀy / yᵀy
         let s_last = &self.s_history[m - 1];
         let y_last = &self.y_history[m - 1];
-        let yy: f64 = y_last.iter().map(|&y| (y as f64) * (y as f64)).sum();
+        let yy: f64 = y_last.iter().map(|&y| (y as f64).powi(2)).sum();
         let sy: f64 = s_last
             .iter()
             .zip(y_last.iter())
@@ -1411,10 +1588,12 @@ impl LBFGS {
             .sum();
         let gamma = if yy > 1e-10 { sy / yy } else { 1.0 };
 
-        // r = gamma * q
+        // r = γ * q
         let mut r: Vec<f64> = q.iter().map(|&q| gamma * q).collect();
 
         // Second loop (forward)
+        // Note: We need to access alpha[i] and history[i] in tandem, clippy allow is correct here
+        #[allow(clippy::needless_range_loop)]
         for i in 0..m {
             let beta = self.rho_history[i]
                 * self.y_history[i]
@@ -1422,13 +1601,174 @@ impl LBFGS {
                     .zip(r.iter())
                     .map(|(&y, &r)| y as f64 * r)
                     .sum::<f64>();
-            for j in 0..n {
-                r[j] += self.s_history[i][j] as f64 * (alpha[i] - beta);
+            for (r_j, &s_ij) in r.iter_mut().zip(self.s_history[i].iter()) {
+                *r_j += s_ij as f64 * (alpha[i] - beta);
             }
         }
 
         // Return -r (descent direction)
         r.iter().map(|&r| -r as f32).collect()
+    }
+
+    /// Computes directional derivative: g ⋅ d
+    fn directional_derivative(grad: &[f32], direction: &[f32]) -> f64 {
+        grad.iter()
+            .zip(direction.iter())
+            .map(|(&g, &d)| g as f64 * d as f64)
+            .sum()
+    }
+
+    /// Computes gradient norm: ||g||
+    fn grad_norm(grad: &[f32]) -> f64 {
+        grad.iter().map(|&g| (g as f64).powi(2)).sum::<f64>().sqrt()
+    }
+
+    /// Strong Wolfe line search.
+    ///
+    /// Finds step size α satisfying Strong Wolfe conditions:
+    /// 1. Sufficient decrease: f(x + αd) ≤ f(x) + c₁·α·(∇f·d)
+    /// 2. Curvature: |∇f(x + αd)·d| ≤ c₂·|∇f(x)·d|
+    ///
+    /// Parameters from PyTorch LBFGS defaults:
+    /// - c1 = 1e-4 (Armijo constant)
+    /// - c2 = 0.9 (curvature constant for L-BFGS, 0.1 for CG)
+    /// - max_iter = 25
+    fn strong_wolfe_line_search<F>(
+        &mut self,
+        network: &mut KanNetwork,
+        closure: &mut F,
+        x0: &[f32],
+        f0: f64,
+        g0: &[f32],
+        direction: &[f32],
+    ) -> ArkanResult<(f64, Vec<f32>, f64)>
+    where
+        F: FnMut(&mut KanNetwork) -> ArkanResult<(f64, Vec<f32>)>,
+    {
+        const C1: f64 = 1e-4;
+        const C2: f64 = 0.9;
+        const MAX_LS_ITER: usize = 25;
+        const ALPHA_MAX: f64 = 50.0;
+
+        let dg0 = Self::directional_derivative(g0, direction);
+
+        // dg0 should be negative (descent direction)
+        if dg0 >= 0.0 {
+            return Err(ArkanError::line_search_failed(
+                "Search direction is not a descent direction",
+            ));
+        }
+
+        let mut alpha = self.config.lr as f64;
+        let mut alpha_lo: f64 = 0.0;
+        let mut alpha_hi: f64 = ALPHA_MAX;
+        let mut f_lo = f0;
+        let mut g_lo = g0.to_vec();
+
+        for iter in 0..MAX_LS_ITER {
+            // x = x0 + alpha * d
+            let x_new: Vec<f32> = x0
+                .iter()
+                .zip(direction.iter())
+                .map(|(&x, &d)| x + alpha as f32 * d)
+                .collect();
+
+            Self::restore_params(network, &x_new);
+            self.n_eval += 1;
+            let (f_new, g_new) = closure(network)?;
+
+            // Check for NaN
+            if f_new.is_nan() || !f_new.is_finite() {
+                // Reduce step size
+                alpha_hi = alpha;
+                alpha = (alpha_lo + alpha_hi) / 2.0;
+                continue;
+            }
+
+            let dg_new = Self::directional_derivative(&g_new, direction);
+
+            // Check Armijo condition (sufficient decrease)
+            if f_new > f0 + C1 * alpha * dg0 || (iter > 0 && f_new >= f_lo) {
+                // Zoom into [alpha_lo, alpha]
+                alpha_hi = alpha;
+            } else {
+                // Check Strong Wolfe curvature condition
+                if dg_new.abs() <= -C2 * dg0 {
+                    // Both conditions satisfied
+                    return Ok((alpha, g_new, f_new));
+                }
+
+                if dg_new >= 0.0 {
+                    // Zoom into [alpha, alpha_lo]
+                    alpha_hi = alpha_lo;
+                    alpha_lo = alpha;
+                    f_lo = f_new;
+                    g_lo = g_new;
+                } else {
+                    // Move to higher alpha
+                    alpha_lo = alpha;
+                    f_lo = f_new;
+                    g_lo = g_new.clone();
+                    alpha = (alpha + alpha_hi) / 2.0;
+                    continue;
+                }
+            }
+
+            // Zoom phase: binary search in [alpha_lo, alpha_hi]
+            if (alpha_hi - alpha_lo).abs() < 1e-10 {
+                // Interval too small
+                return Ok((alpha_lo, g_lo, f_lo));
+            }
+
+            alpha = (alpha_lo + alpha_hi) / 2.0;
+        }
+
+        // Max iterations reached - return best found
+        Ok((alpha_lo, g_lo, f_lo))
+    }
+
+    /// Backtracking line search with Armijo condition.
+    fn backtracking_line_search<F>(
+        &mut self,
+        network: &mut KanNetwork,
+        closure: &mut F,
+        x0: &[f32],
+        f0: f64,
+        g0: &[f32],
+        direction: &[f32],
+    ) -> ArkanResult<(f64, Vec<f32>, f64)>
+    where
+        F: FnMut(&mut KanNetwork) -> ArkanResult<(f64, Vec<f32>)>,
+    {
+        const C1: f64 = 1e-4;
+        const RHO: f64 = 0.5; // Backtrack factor
+        const MAX_LS_ITER: usize = 20;
+
+        let dg0 = Self::directional_derivative(g0, direction);
+        let mut alpha = self.config.lr as f64;
+
+        for _ in 0..MAX_LS_ITER {
+            let x_new: Vec<f32> = x0
+                .iter()
+                .zip(direction.iter())
+                .map(|(&x, &d)| x + alpha as f32 * d)
+                .collect();
+
+            Self::restore_params(network, &x_new);
+            self.n_eval += 1;
+            let (f_new, g_new) = closure(network)?;
+
+            // Check Armijo condition
+            if f_new <= f0 + C1 * alpha * dg0 {
+                return Ok((alpha, g_new, f_new));
+            }
+
+            alpha *= RHO;
+        }
+
+        Err(ArkanError::line_search_failed(
+            "Backtracking line search did not converge",
+        ))
     }
 }
 
@@ -1457,39 +1797,19 @@ impl Optimizer for LBFGS {
     ) -> ArkanResult<()> {
         // L-BFGS requires closure-based API
         Err(ArkanError::optimizer(
-            "LBFGS requires step_with_closure(). Use step() only for first-order optimizers.",
+            "LBFGS requires step_lbfgs() with closure. Use step() only for first-order optimizers.",
         ))
     }
 
-    fn step_with_closure<F>(&mut self, mut closure: F) -> ArkanResult<f64>
+    fn step_with_closure<F>(&mut self, _closure: F) -> ArkanResult<f64>
     where
         F: FnMut() -> ArkanResult<f64>,
     {
-        // Placeholder implementation - full line search would be complex
-        // This is a minimal scaffold demonstrating the API
-        
-        self.n_eval += 1;
-        let loss = closure()?;
-
-        // Check for NaN in loss
-        if loss.is_nan() {
-            if self.config.safety.fail_on_nan && !self.config.safety.skip_step_on_nan {
-                return Err(ArkanError::nan_encountered(0, "loss"));
-            }
-            if self.config.safety.skip_step_on_nan {
-                return Ok(loss);
-            }
-        }
-
-        // TODO: Implement full two-loop recursion and line search
-        // For now, return loss without parameter update
-        // Real implementation would:
-        // 1. Compute search direction via two_loop_recursion
-        // 2. Perform line search
-        // 3. Update parameters
-        // 4. Update history
-
-        Ok(loss)
+        // This default impl doesn't work for LBFGS because we need mutable network access
+        // Use step_lbfgs() instead
+        Err(ArkanError::optimizer(
+            "Use step_lbfgs() for L-BFGS optimization with network access.",
+        ))
     }
 
     fn zero_grad(&mut self, network: &mut KanNetwork) -> ArkanResult<()> {
@@ -1521,6 +1841,144 @@ impl Optimizer for LBFGS {
         } else {
             Err(ArkanError::group_index_out_of_bounds(group_index, 1))
         }
+    }
+}
+
+impl LBFGS {
+    /// Performs L-BFGS optimization step.
+    ///
+    /// The closure should compute loss and gradients given the current network state.
+    /// It will be called multiple times during line search.
+    ///
+    /// # Arguments
+    ///
+    /// * `network` - Network to optimize
+    /// * `closure` - Closure that computes `(loss, gradient_vector)` for current params
+    ///
+    /// # Returns
+    ///
+    /// Final loss value after the optimization step.
+    ///
+    /// # Rollback Guarantee
+    ///
+    /// If line search fails, parameters are restored to their initial values.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let loss = optimizer.step_lbfgs(&mut network, |net| {
+    ///     let mut ws = net.create_workspace(batch_size);
+    ///     let output = net.forward_batch(&input, &mut output_buf, &mut ws);
+    ///     let loss = compute_mse(&output_buf, &target);
+    ///     
+    ///     // Compute gradients
+    ///     net.train_step_with_options(&input, &target, None, 0.0, &mut ws, &opts);
+    ///     let grads = LBFGS::flatten_grads(&ws.weight_grads, &ws.bias_grads);
+    ///     
+    ///     Ok((loss as f64, grads))
+    /// })?;
+    /// ```
+    pub fn step_lbfgs<F>(&mut self, network: &mut KanNetwork, mut closure: F) -> ArkanResult<f64>
+    where
+        F: FnMut(&mut KanNetwork) -> ArkanResult<(f64, Vec<f32>)>,
+    {
+        // Save initial parameters for potential rollback
+        let x0 = Self::flatten_params(network);
+
+        // Evaluate closure to get initial loss and gradient
+        self.n_eval += 1;
+        let (f0, g0) = closure(network)?;
+
+        // Check for NaN in loss
+        if f0.is_nan() || !f0.is_finite() {
+            if self.config.safety.fail_on_nan && !self.config.safety.skip_step_on_nan {
+                return Err(ArkanError::nan_encountered(0, "loss"));
+            }
+            if self.config.safety.skip_step_on_nan {
+                return Ok(f0);
+            }
+        }
+
+        // Check convergence on gradient norm
+        let grad_norm = Self::grad_norm(&g0);
+        if grad_norm < self.config.tolerance_grad {
+            return Ok(f0);
+        }
+
+        // Compute search direction using two-loop recursion
+        let direction = self.two_loop_recursion(&g0);
+
+        // Perform line search based on configured method
+        let (alpha, g_new, f_new) = match self.config.line_search_fn {
+            LineSearchMethod::StrongWolfe => {
+                match self.strong_wolfe_line_search(network, &mut closure, &x0, f0, &g0, &direction)
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // Rollback on failure
+                        Self::restore_params(network, &x0);
+                        return Err(ArkanError::line_search_failed(
+                            "Strong Wolfe line search failed, parameters restored",
+                        ));
+                    }
+                }
+            }
+            LineSearchMethod::Backtracking => {
+                match self.backtracking_line_search(network, &mut closure, &x0, f0, &g0, &direction)
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // Rollback on failure
+                        Self::restore_params(network, &x0);
+                        return Err(ArkanError::line_search_failed(
+                            "Backtracking line search failed, parameters restored",
+                        ));
+                    }
+                }
+            }
+            LineSearchMethod::NoLineSearch => {
+                // Fixed step size (use lr directly)
+                let alpha = self.config.lr as f64;
+                let x_new: Vec<f32> = x0
+                    .iter()
+                    .zip(direction.iter())
+                    .map(|(&x, &d)| x + alpha as f32 * d)
+                    .collect();
+
+                Self::restore_params(network, &x_new);
+                self.n_eval += 1;
+                let (f_new, g_new) = closure(network)?;
+
+                (alpha, g_new, f_new)
+            }
+        };
+
+        // Compute s and y for history update
+        let x_new = Self::flatten_params(network);
+        let s: Vec<f32> = x_new
+            .iter()
+            .zip(x0.iter())
+            .map(|(&xn, &x0)| xn - x0)
+            .collect();
+        let y: Vec<f32> = g_new
+            .iter()
+            .zip(g0.iter())
+            .map(|(&gn, &g0)| gn - g0)
+            .collect();
+
+        // Update history
+        self.update_history(s, y);
+
+        // Store for next iteration
+        self.prev_params = Some(x_new);
+        self.prev_grads = Some(g_new);
+
+        // Check for step size convergence
+        if alpha.abs() < self.config.tolerance_change {
+            // Step too small, may have converged
+        }
+
+        Ok(f_new)
     }
 }
 
@@ -1695,7 +2153,9 @@ mod tests {
         let bias_grads = vec![vec![0.5f32; network.layers[0].bias.len()]];
 
         // Step using new API
-        optimizer.step(&mut network, &weight_grads, &bias_grads, None).unwrap();
+        optimizer
+            .step(&mut network, &weight_grads, &bias_grads, None)
+            .unwrap();
 
         // Weight should have decreased
         let new_weight = network.layers[0].weights[0];
@@ -1826,7 +2286,10 @@ mod tests {
         assert!(result.is_ok());
 
         // Weights should be unchanged
-        assert_eq!(network.layers[0].weights.as_slice(), initial_weights.as_slice());
+        assert_eq!(
+            network.layers[0].weights.as_slice(),
+            initial_weights.as_slice()
+        );
     }
 
     #[test]
@@ -1884,5 +2347,233 @@ mod tests {
         assert_send_sync::<Adam>();
         assert_send_sync::<SGD>();
         assert_send_sync::<LBFGS>();
+    }
+
+    // =========================================================================
+    // NEW TESTS FOR v2.0 FEATURES
+    // =========================================================================
+
+    #[test]
+    fn test_sgd_nesterov() {
+        let config = KanConfig {
+            input_dim: 2,
+            output_dim: 1,
+            hidden_dims: vec![],
+            grid_size: 3,
+            spline_order: 3,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 2],
+            input_std: vec![1.0; 2],
+            init_seed: Some(42),
+            ..Default::default()
+        };
+
+        let mut network = KanNetwork::new(config);
+        let initial_weights = network.layers[0].weights.clone();
+
+        // Create Nesterov SGD
+        let mut optimizer = SGD::new(&network, SGDConfig::with_nesterov(0.1, 0.9));
+
+        // Create constant gradients
+        let weight_grads = vec![vec![1.0f32; network.layers[0].weights.len()]];
+        let bias_grads = vec![vec![0.5f32; network.layers[0].bias.len()]];
+
+        // Step 1
+        optimizer
+            .step(&mut network, &weight_grads, &bias_grads, None)
+            .unwrap();
+
+        // Weights should have decreased more than standard momentum due to look-ahead
+        // For Nesterov: update = μ*(μ*v + g) + g = μ²v + μg + g
+        // First step v=0: update = 0 + μ*1 + 1 = μ + 1 = 1.9
+        // param -= lr * update = param - 0.1 * 1.9 = param - 0.19
+        let expected_change = 0.1 * (0.9 * 1.0 + 1.0); // 0.19
+        let actual_change = initial_weights[0] - network.layers[0].weights[0];
+
+        assert!(
+            (actual_change - expected_change).abs() < 0.01,
+            "Nesterov update: expected ~{:.4}, got {:.4}",
+            expected_change,
+            actual_change
+        );
+    }
+
+    #[test]
+    fn test_sgd_nesterov_vs_standard() {
+        let config = KanConfig {
+            input_dim: 2,
+            output_dim: 1,
+            hidden_dims: vec![],
+            grid_size: 3,
+            spline_order: 3,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 2],
+            input_std: vec![1.0; 2],
+            init_seed: Some(42),
+            ..Default::default()
+        };
+
+        // Two networks with same init
+        let mut net_standard = KanNetwork::new(config.clone());
+        let mut net_nesterov = KanNetwork::new(config);
+
+        let mut opt_standard = SGD::new(&net_standard, SGDConfig::with_momentum(0.1, 0.9));
+        let mut opt_nesterov = SGD::new(&net_nesterov, SGDConfig::with_nesterov(0.1, 0.9));
+
+        let weight_grads = vec![vec![1.0f32; net_standard.layers[0].weights.len()]];
+        let bias_grads = vec![vec![0.5f32; net_standard.layers[0].bias.len()]];
+
+        // After first step, Nesterov should move more aggressively
+        opt_standard
+            .step(&mut net_standard, &weight_grads, &bias_grads, None)
+            .unwrap();
+        opt_nesterov
+            .step(&mut net_nesterov, &weight_grads, &bias_grads, None)
+            .unwrap();
+
+        let w_standard = net_standard.layers[0].weights[0];
+        let w_nesterov = net_nesterov.layers[0].weights[0];
+
+        // Nesterov should have moved further (smaller weight = more decrease)
+        assert!(
+            w_nesterov < w_standard,
+            "Nesterov should be more aggressive: standard={:.6}, nesterov={:.6}",
+            w_standard,
+            w_nesterov
+        );
+    }
+
+    #[test]
+    fn test_param_group_creation() {
+        // Test all layers group
+        let group = ParamGroup::all_layers(4);
+        assert!(group.requires_grad);
+        assert_eq!(group.layer_indices, vec![0, 1, 2, 3]);
+        assert!(group.lr_override.is_none());
+
+        // Test frozen group
+        let frozen = ParamGroup::frozen(vec![0, 1]);
+        assert!(!frozen.requires_grad);
+        assert_eq!(frozen.layer_indices, vec![0, 1]);
+
+        // Test custom LR group
+        let custom = ParamGroup::with_lr(vec![2, 3], 0.0001);
+        assert!(custom.requires_grad);
+        assert_eq!(custom.lr_override, Some(0.0001));
+    }
+
+    #[test]
+    fn test_lbfgs_two_loop_recursion() {
+        let config = KanConfig::preset();
+        let network = KanNetwork::new(config);
+        let optimizer = LBFGS::new(&network, LBFGSConfig::default());
+
+        // With no history, should return negative gradient (steepest descent)
+        let grad = vec![1.0f32, 2.0, 3.0];
+        let direction = optimizer.two_loop_recursion(&grad);
+
+        assert_eq!(direction.len(), 3);
+        assert!((direction[0] - (-1.0)).abs() < 1e-5);
+        assert!((direction[1] - (-2.0)).abs() < 1e-5);
+        assert!((direction[2] - (-3.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_lbfgs_pack_unpack() {
+        let config = KanConfig {
+            input_dim: 2,
+            output_dim: 1,
+            hidden_dims: vec![4],
+            grid_size: 3,
+            spline_order: 3,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 2],
+            input_std: vec![1.0; 2],
+            init_seed: Some(42),
+            ..Default::default()
+        };
+
+        let network = KanNetwork::new(config);
+
+        // Flatten params
+        let params = LBFGS::flatten_params(&network);
+
+        // Check total size
+        let expected_size: usize = network
+            .layers
+            .iter()
+            .map(|l| l.weights.len() + l.bias.len())
+            .sum();
+        assert_eq!(params.len(), expected_size);
+
+        // Restore to new network and verify
+        let mut network2 = network.clone();
+        // Modify weights
+        for layer in &mut network2.layers {
+            for w in layer.weights.as_mut_slice() {
+                *w = 0.0;
+            }
+        }
+
+        // Restore original params
+        LBFGS::restore_params(&mut network2, &params);
+
+        // Verify restoration
+        for (l1, l2) in network.layers.iter().zip(network2.layers.iter()) {
+            assert_eq!(l1.weights.as_slice(), l2.weights.as_slice());
+            assert_eq!(l1.bias.as_slice(), l2.bias.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_line_search_method_default() {
+        let method = LineSearchMethod::default();
+        assert_eq!(method, LineSearchMethod::StrongWolfe);
+    }
+
+    #[test]
+    fn test_lbfgs_config_variants() {
+        let config = LBFGSConfig {
+            lr: 0.5,
+            line_search_fn: LineSearchMethod::Backtracking,
+            ..Default::default()
+        };
+        assert_eq!(config.line_search_fn, LineSearchMethod::Backtracking);
+        assert!((config.lr - 0.5).abs() < 1e-6);
+
+        let config2 = LBFGSConfig {
+            line_search_fn: LineSearchMethod::NoLineSearch,
+            ..Default::default()
+        };
+        assert_eq!(config2.line_search_fn, LineSearchMethod::NoLineSearch);
+    }
+
+    #[test]
+    fn test_workspace_zero_grads() {
+        use crate::buffer::Workspace;
+
+        let config = KanConfig::preset();
+        let mut workspace = Workspace::new(&config);
+
+        // Manually add some gradient data
+        workspace.weight_grads.push(vec![1.0, 2.0, 3.0]);
+        workspace.weight_grads.push(vec![4.0, 5.0]);
+        workspace.bias_grads.push(vec![0.5, 0.6]);
+        workspace.bias_grads.push(vec![0.7]);
+
+        // Zero them
+        workspace.zero_grads();
+
+        // Verify all zeros
+        for wg in &workspace.weight_grads {
+            for &v in wg {
+                assert_eq!(v, 0.0);
+            }
+        }
+        for bg in &workspace.bias_grads {
+            for &v in bg {
+                assert_eq!(v, 0.0);
+            }
+        }
     }
 }

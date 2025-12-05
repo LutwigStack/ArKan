@@ -7,9 +7,7 @@
 
 #![cfg(feature = "gpu")]
 
-use arkan::gpu::{
-    GpuNetwork, GpuTensor, GpuWorkspace, WgpuBackend, WgpuOptions, MAX_VRAM_ALLOC,
-};
+use arkan::gpu::{GpuNetwork, GpuTensor, GpuWorkspace, WgpuBackend, WgpuOptions, MAX_VRAM_ALLOC};
 use arkan::{ArkanError, KanConfig, KanNetwork};
 
 /// Helper to create a valid config with proper normalization
@@ -51,8 +49,16 @@ fn test_tensor_upload_exceeds_vram_limit() {
 
     match result {
         Err(ArkanError::BatchTooLarge(requested, max)) => {
-            assert!(requested > max, "requested={} should be > max={}", requested, max);
-            println!("✅ Correctly rejected tensor allocation: requested={}, max={}", requested, max);
+            assert!(
+                requested > max,
+                "requested={} should be > max={}",
+                requested,
+                max
+            );
+            println!(
+                "✅ Correctly rejected tensor allocation: requested={}, max={}",
+                requested, max
+            );
         }
         Ok(_) => panic!("Should have failed with BatchTooLarge"),
         Err(other) => panic!("Wrong error type: {:?}", other),
@@ -85,8 +91,8 @@ fn test_workspace_ensure_capacity_rejects_huge_batch() {
     let backend = WgpuBackend::init(WgpuOptions::default()).expect("GPU init");
 
     // Start with small workspace
-    let mut workspace = GpuWorkspace::new(&backend.device, 32, 64, 64)
-        .expect("Failed to create small workspace");
+    let mut workspace =
+        GpuWorkspace::new(&backend.device, 32, 64, 64).expect("Failed to create small workspace");
 
     // Try to resize to huge batch
     let huge_batch = (MAX_VRAM_ALLOC / 4 / 64) as usize + 1;
@@ -167,7 +173,10 @@ fn test_shader_bounds_with_non_power_of_two_batch() {
         max_diff
     );
 
-    println!("✅ Shader bounds OK with non-power-of-2 batch (max_diff={})", max_diff);
+    println!(
+        "✅ Shader bounds OK with non-power-of-2 batch (max_diff={})",
+        max_diff
+    );
 }
 
 #[test]
@@ -261,10 +270,8 @@ fn test_shader_bounds_extreme_input_values() {
     // Extreme input values: way outside grid range, infinities, etc.
     let input = vec![
         // Sample 1: normal
-        0.0, 0.5, -0.5, 1.0,
-        // Sample 2: outside grid range
-        -100.0, 100.0, -1000.0, 1000.0,
-        // Sample 3: boundary values
+        0.0, 0.5, -0.5, 1.0, // Sample 2: outside grid range
+        -100.0, 100.0, -1000.0, 1000.0, // Sample 3: boundary values
         -2.0, 2.0, -2.0, 2.0, // Exact grid boundaries
         // Sample 4: very small values
         1e-30, -1e-30, 1e-20, -1e-20,
@@ -416,8 +423,8 @@ fn test_multi_layer_intermediate_buffer_bounds() {
     // Network with varying layer sizes to stress intermediate buffer indexing
     // All primes, not divisible by workgroup
     let config = KanConfig {
-        input_dim: 13,   // Prime number
-        output_dim: 7,   // Prime number
+        input_dim: 13,                 // Prime number
+        output_dim: 7,                 // Prime number
         hidden_dims: vec![31, 17, 11], // All primes
         spline_order: 3,
         grid_size: 5,

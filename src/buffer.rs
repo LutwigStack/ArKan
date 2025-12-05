@@ -1127,6 +1127,44 @@ impl Workspace {
         Ok(())
     }
 
+    /// Zeros all gradient buffers in-place without reallocation.
+    ///
+    /// Call this at the start of each training step to clear gradients
+    /// from the previous iteration. This is more efficient than reallocating
+    /// the buffers.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork, Workspace};
+    ///
+    /// let config = KanConfig::preset();
+    /// let network = KanNetwork::new(config.clone());
+    /// let mut workspace = network.create_workspace(64);
+    ///
+    /// // After training step, zero grads for next iteration
+    /// workspace.zero_grads();
+    /// ```
+    #[inline]
+    pub fn zero_grads(&mut self) {
+        for wg in &mut self.weight_grads {
+            wg.fill(0.0);
+        }
+        for bg in &mut self.bias_grads {
+            bg.fill(0.0);
+        }
+    }
+
+    /// Zeros gradient buffers and grad_output buffer.
+    ///
+    /// Extended version that also clears the output gradient buffer
+    /// used for backpropagation.
+    #[inline]
+    pub fn zero_all_grads(&mut self) {
+        self.zero_grads();
+        self.grad_output.zero();
+    }
+
     /// Current batch capacity.
     #[inline]
     pub fn batch_capacity(&self) -> usize {

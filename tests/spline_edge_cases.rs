@@ -381,7 +381,12 @@ fn test_x_outside_range() {
         // Even outside range, should not panic
         let sum: f32 = basis.iter().sum();
         // Partition of unity may not hold exactly outside range, but should be finite
-        assert!(sum.is_finite(), "Non-finite basis sum for x={}: sum={}", x, sum);
+        assert!(
+            sum.is_finite(),
+            "Non-finite basis sum for x={}: sum={}",
+            x,
+            sum
+        );
     }
 
     println!("✓ Outside range handling: OK (no panics)");

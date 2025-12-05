@@ -210,8 +210,12 @@ fn test_gradient_clipping_no_effect_when_large_threshold() {
 
     let batch_size = 16;
     let mut rng = SmallRng::seed_from_u64(12345);
-    let input: Vec<f32> = (0..batch_size * 4).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let target: Vec<f32> = (0..batch_size * 2).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let input: Vec<f32> = (0..batch_size * 4)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
+    let target: Vec<f32> = (0..batch_size * 2)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
 
     let lr = 0.01;
 
@@ -240,7 +244,10 @@ fn test_gradient_clipping_no_effect_when_large_threshold() {
         }
     }
 
-    println!("Max weight diff with large vs no clipping: {:.2e}", max_diff);
+    println!(
+        "Max weight diff with large vs no clipping: {:.2e}",
+        max_diff
+    );
     assert!(
         max_diff < 1e-6,
         "Large max_grad_norm should have no effect, but diff = {:.2e}",
@@ -259,8 +266,12 @@ fn test_weight_decay_actually_decays() {
 
     let batch_size = 16;
     let mut rng = SmallRng::seed_from_u64(54321);
-    let input: Vec<f32> = (0..batch_size * 4).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let target: Vec<f32> = (0..batch_size * 2).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let input: Vec<f32> = (0..batch_size * 4)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
+    let target: Vec<f32> = (0..batch_size * 2)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
 
     let lr = 0.01;
     let decay = 0.1; // Strong decay for clear effect
@@ -317,8 +328,12 @@ fn test_weight_decay_zero_no_decay() {
 
     let batch_size = 16;
     let mut rng = SmallRng::seed_from_u64(11111);
-    let input: Vec<f32> = (0..batch_size * 4).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let target: Vec<f32> = (0..batch_size * 2).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let input: Vec<f32> = (0..batch_size * 4)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
+    let target: Vec<f32> = (0..batch_size * 2)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
 
     let lr = 0.01;
 
@@ -342,7 +357,7 @@ fn test_weight_decay_zero_no_decay() {
 }
 
 /// Test that only weights decay, not biases.
-/// 
+///
 /// Strategy: Compare two networks - one with decay, one without.
 /// The difference in weights should be due to decay term.
 /// The difference in biases should be zero (biases are not decayed).
@@ -367,8 +382,12 @@ fn test_weight_decay_only_weights_not_biases() {
 
     let batch_size = 16;
     let mut rng = SmallRng::seed_from_u64(33333);
-    let input: Vec<f32> = (0..batch_size * 4).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let target: Vec<f32> = (0..batch_size * 2).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let input: Vec<f32> = (0..batch_size * 4)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
+    let target: Vec<f32> = (0..batch_size * 2)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
 
     let lr = 0.1;
 
@@ -377,17 +396,36 @@ fn test_weight_decay_only_weights_not_biases() {
         max_grad_norm: None,
         weight_decay: 0.5, // Strong decay
     };
-    network_decay.train_step_with_options(&input, &target, None, lr, &mut workspace_decay, &opts_decay);
+    network_decay.train_step_with_options(
+        &input,
+        &target,
+        None,
+        lr,
+        &mut workspace_decay,
+        &opts_decay,
+    );
 
     // Train without decay
     let opts_nodecay = TrainOptions {
         max_grad_norm: None,
         weight_decay: 0.0,
     };
-    network_nodecay.train_step_with_options(&input, &target, None, lr, &mut workspace_nodecay, &opts_nodecay);
+    network_nodecay.train_step_with_options(
+        &input,
+        &target,
+        None,
+        lr,
+        &mut workspace_nodecay,
+        &opts_nodecay,
+    );
 
     // Compare biases - should be IDENTICAL (decay doesn't affect biases)
-    for (layer_idx, (ld, lnd)) in network_decay.layers.iter().zip(network_nodecay.layers.iter()).enumerate() {
+    for (layer_idx, (ld, lnd)) in network_decay
+        .layers
+        .iter()
+        .zip(network_nodecay.layers.iter())
+        .enumerate()
+    {
         for (i, (bd, bnd)) in ld.bias.iter().zip(lnd.bias.iter()).enumerate() {
             let diff = (bd - bnd).abs();
             assert!(
@@ -403,7 +441,11 @@ fn test_weight_decay_only_weights_not_biases() {
 
     // Compare weights - should be DIFFERENT (decay affects weights)
     let mut any_weight_diff = false;
-    for (ld, lnd) in network_decay.layers.iter().zip(network_nodecay.layers.iter()) {
+    for (ld, lnd) in network_decay
+        .layers
+        .iter()
+        .zip(network_nodecay.layers.iter())
+    {
         for (wd, wnd) in ld.weights.iter().zip(lnd.weights.iter()) {
             if (wd - wnd).abs() > 1e-6 {
                 any_weight_diff = true;
@@ -411,7 +453,10 @@ fn test_weight_decay_only_weights_not_biases() {
             }
         }
     }
-    assert!(any_weight_diff, "Weights should differ with decay vs without");
+    assert!(
+        any_weight_diff,
+        "Weights should differ with decay vs without"
+    );
 
     println!("✓ Weight decay affects weights only, not biases");
 }
@@ -427,8 +472,12 @@ fn test_learning_rate_zero_no_change() {
 
     let batch_size = 32;
     let mut rng = SmallRng::seed_from_u64(99999);
-    let input: Vec<f32> = (0..batch_size * 4).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let target: Vec<f32> = (0..batch_size * 2).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let input: Vec<f32> = (0..batch_size * 4)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
+    let target: Vec<f32> = (0..batch_size * 2)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
 
     let weights_before = copy_weights(&network);
 
@@ -452,8 +501,12 @@ fn test_learning_rate_zero_with_decay_no_change() {
 
     let batch_size = 16;
     let mut rng = SmallRng::seed_from_u64(88888);
-    let input: Vec<f32> = (0..batch_size * 4).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let target: Vec<f32> = (0..batch_size * 2).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let input: Vec<f32> = (0..batch_size * 4)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
+    let target: Vec<f32> = (0..batch_size * 2)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
 
     let weights_before = copy_weights(&network);
 
@@ -582,10 +635,7 @@ fn test_large_batch_with_wide_network() {
         loss.is_finite(),
         "Loss should be finite with batch=1024, wide network"
     );
-    println!(
-        "✓ Wide network (64→128→32) batch=1024: loss = {:.6}",
-        loss
-    );
+    println!("✓ Wide network (64→128→32) batch=1024: loss = {:.6}", loss);
 }
 
 // =============================================================================
@@ -599,8 +649,12 @@ fn test_all_options_combined() {
 
     let batch_size = 64;
     let mut rng = SmallRng::seed_from_u64(44444);
-    let input: Vec<f32> = (0..batch_size * 4).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let target: Vec<f32> = (0..batch_size * 2).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let input: Vec<f32> = (0..batch_size * 4)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
+    let target: Vec<f32> = (0..batch_size * 2)
+        .map(|_| rng.gen_range(-1.0..1.0))
+        .collect();
 
     let opts = TrainOptions {
         max_grad_norm: Some(1.0),
