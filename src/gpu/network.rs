@@ -1187,7 +1187,10 @@ impl GpuNetwork {
         let num_layers = self.layers.len();
 
         for layer_idx in (0..num_layers).rev() {
-            let compute_input_grad = layer_idx > 0;
+            // Always compute input gradients:
+            // - For intermediate layers: to propagate gradients backward
+            // - For first layer (layer_idx == 0): to return gradient w.r.t. network input
+            let compute_input_grad = true;
 
             // Execute GPU backward for this layer
             self.backward_layer_gpu(layer_idx, batch_size, workspace, compute_input_grad)?;
