@@ -151,11 +151,16 @@ pub use buffer::{
 };
 pub use config::{
     ConfigError, KanConfig, KanConfigBuilder, LayerConfig, DEFAULT_GRID_SIZE, EPSILON,
-    MAX_GPU_SPLINE_ORDER, MAX_SPLINE_ORDER, MIN_GPU_SPLINE_ORDER,
+    MAX_GPU_SPLINE_ORDER, MAX_GRID_SIZE, MAX_SPLINE_ORDER, MIN_GPU_SPLINE_ORDER,
 };
 pub use error::{ArkanError, ArkanResult};
 pub use layer::KanLayer;
-pub use loss::{masked_cross_entropy, masked_mse, masked_softmax, poker_combined_loss, softmax};
+pub use loss::{
+    entropy_regularization, kan_combined_loss, kan_regularization_gradient, l1_sparsity_gradient,
+    l1_sparsity_loss, masked_bce_with_logits, masked_categorical_cross_entropy, masked_cross_entropy,
+    masked_huber, masked_mae, masked_mse, masked_rmse, masked_softmax, pde_residual_loss,
+    poker_combined_loss, r_squared, smoothness_gradient, smoothness_penalty, softmax, KanLossConfig,
+};
 pub use network::{KanNetwork, TrainOptions};
 pub use optimizer::{Adam, AdamConfig, AdamState, CosineAnnealingLR, LrScheduler, StepLR, SGD};
 pub use spline::{

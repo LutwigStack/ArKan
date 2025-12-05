@@ -910,6 +910,211 @@ impl KanLayer {
             }
         }
     }
+
+    /// Parallel backward pass using thread-local gradient accumulation.
+    ///
+    /// # Algorithm (Thread-Local Gradients + Reduce)
+    ///
+    /// 1. **Parallel basis computation**: Each thread computes basis values and
+    ///    derivatives for a subset of samples independently.
+    ///
+    /// 2. **Thread-local accumulation**: Each thread accumulates gradients into
+    ///    its own local `(grad_weights, grad_bias, grad_input)` buffers.
+    ///    No synchronization needed during accumulation.
+    ///
+    /// 3. **Reduce**: After parallel section, thread-local buffers are summed
+    ///    into the final output buffers.
+    ///
+    /// # Memory Overhead
+    ///
+    /// O(num_threads × num_parameters) additional memory for thread-local buffers.
+    /// For a layer with 10K parameters and 8 threads: ~320 KB overhead.
+    ///
+    /// # When to Use
+    ///
+    /// Use this method when `batch_size >= multithreading_threshold` (typically 64+).
+    /// For smaller batches, the sequential [`backward`](Self::backward) is faster.
+    ///
+    /// # Arguments
+    ///
+    /// Same as [`backward`](Self::backward).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanLayer, Workspace};
+    ///
+    /// let config = KanConfig::preset();
+    /// let layer = KanLayer::new(4, 8, &config);
+    /// let mut workspace = Workspace::new(&config);
+    ///
+    /// let batch_size = 128;
+    /// let normalized_input = vec![0.5f32; batch_size * 4];
+    /// let grid_indices = vec![3u32; batch_size * 4];
+    /// let grad_output = vec![1.0f32; batch_size * 8];
+    /// let mut grad_input = vec![0.0f32; batch_size * 4];
+    /// let mut grad_weights = vec![0.0f32; layer.weights.len()];
+    /// let mut grad_bias = vec![0.0f32; layer.bias.len()];
+    ///
+    /// layer.backward_parallel(
+    ///     &normalized_input,
+    ///     &grid_indices,
+    ///     &grad_output,
+    ///     Some(&mut grad_input),
+    ///     &mut grad_weights,
+    ///     &mut grad_bias,
+    /// );
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_parallel(
+        &self,
+        normalized_input: &[f32],
+        grid_indices: &[u32],
+        grad_output: &[f32],
+        grad_input: Option<&mut [f32]>,
+        grad_weights: &mut [f32],
+        grad_bias: &mut [f32],
+    ) {
+        use rayon::prelude::*;
+
+        let batch_size = normalized_input.len() / self.in_dim;
+        debug_assert_eq!(normalized_input.len(), batch_size * self.in_dim);
+        debug_assert_eq!(grid_indices.len(), batch_size * self.in_dim);
+        debug_assert_eq!(grad_output.len(), batch_size * self.out_dim);
+        debug_assert_eq!(grad_weights.len(), self.weights.len());
+        debug_assert_eq!(grad_bias.len(), self.bias.len());
+
+        let compute_grad_input = grad_input.is_some();
+
+        // Parallel phase: each chunk computes its own gradients
+        // Returns (local_grad_weights, local_grad_bias, local_grad_input)
+        let (reduced_weights, reduced_bias, reduced_input, _, _) = (0..batch_size)
+            .into_par_iter()
+            .fold(
+                || {
+                    // Thread-local gradient buffers
+                    let local_weights = vec![0.0f32; self.weights.len()];
+                    let local_bias = vec![0.0f32; self.bias.len()];
+                    let local_input = if compute_grad_input {
+                        vec![0.0f32; batch_size * self.in_dim]
+                    } else {
+                        Vec::new()
+                    };
+                    // Thread-local basis buffers
+                    let basis_values = vec![0.0f32; self.in_dim * self.basis_aligned];
+                    let basis_derivs = vec![0.0f32; self.in_dim * self.basis_aligned];
+                    (local_weights, local_bias, local_input, basis_values, basis_derivs)
+                },
+                |mut acc, b| {
+                    let (
+                        ref mut local_weights,
+                        ref mut local_bias,
+                        ref mut local_input,
+                        ref mut basis_values,
+                        ref mut basis_derivs,
+                    ) = acc;
+
+                    let input_offset = b * self.in_dim;
+                    let grad_out_start = b * self.out_dim;
+
+                    // Compute basis values and derivatives for this sample
+                    for i in 0..self.in_dim {
+                        let z = normalized_input[input_offset + i];
+                        let span = grid_indices[input_offset + i] as usize;
+                        let basis_offset = i * self.basis_aligned;
+
+                        compute_basis_and_deriv(
+                            z,
+                            span,
+                            &self.knots,
+                            self.order,
+                            &mut basis_values[basis_offset..basis_offset + self.local_basis_size],
+                            &mut basis_derivs[basis_offset..basis_offset + self.local_basis_size],
+                        );
+
+                        // Zero padding
+                        for k in self.local_basis_size..self.basis_aligned {
+                            basis_values[basis_offset + k] = 0.0;
+                            basis_derivs[basis_offset + k] = 0.0;
+                        }
+                    }
+
+                    // Accumulate gradients for this sample
+                    for j in 0..self.out_dim {
+                        let g_out = grad_output[grad_out_start + j];
+                        if g_out == 0.0 {
+                            continue;
+                        }
+
+                        local_bias[j] += g_out;
+
+                        for i in 0..self.in_dim {
+                            let span = grid_indices[input_offset + i] as usize;
+                            let start_idx = span - self.order;
+                            let basis_start = i * self.basis_aligned;
+
+                            for k in 0..self.local_basis_size {
+                                let weight_idx = self.weight_index(j, i, start_idx + k);
+                                let basis_val = basis_values[basis_start + k];
+                                local_weights[weight_idx] += g_out * basis_val;
+
+                                if compute_grad_input {
+                                    let deriv = basis_derivs[basis_start + k];
+                                    let std_inv = 1.0 / self.std[i].max(EPSILON);
+                                    local_input[input_offset + i] +=
+                                        g_out * self.weights[weight_idx] * deriv * std_inv;
+                                }
+                            }
+                        }
+                    }
+
+                    acc
+                },
+            )
+            .reduce(
+                || {
+                    // Identity for reduce
+                    let local_weights = vec![0.0f32; self.weights.len()];
+                    let local_bias = vec![0.0f32; self.bias.len()];
+                    let local_input = if compute_grad_input {
+                        vec![0.0f32; batch_size * self.in_dim]
+                    } else {
+                        Vec::new()
+                    };
+                    let basis_values = Vec::new();
+                    let basis_derivs = Vec::new();
+                    (local_weights, local_bias, local_input, basis_values, basis_derivs)
+                },
+                |mut a, b| {
+                    // Sum thread-local gradients
+                    for (aw, bw) in a.0.iter_mut().zip(b.0.iter()) {
+                        *aw += bw;
+                    }
+                    for (ab, bb) in a.1.iter_mut().zip(b.1.iter()) {
+                        *ab += bb;
+                    }
+                    if compute_grad_input {
+                        for (ai, bi) in a.2.iter_mut().zip(b.2.iter()) {
+                            *ai += bi;
+                        }
+                    }
+                    a
+                },
+            );
+
+        // Copy reduced results to output buffers
+        for (gw, rw) in grad_weights.iter_mut().zip(reduced_weights.iter()) {
+            *gw += rw;
+        }
+        for (gb, rb) in grad_bias.iter_mut().zip(reduced_bias.iter()) {
+            *gb += rb;
+        }
+        if let Some(gi) = grad_input {
+            for (g, r) in gi.iter_mut().zip(reduced_input.iter()) {
+                *g += r;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

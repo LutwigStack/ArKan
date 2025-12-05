@@ -1098,17 +1098,34 @@ impl KanNetwork {
             let layer_grid_buf = std::mem::take(&mut workspace.layers_grid_indices[layer_idx]);
 
             let layer_in_size = checked_buffer_size(batch_size, in_dim)?;
-            layer.backward(
-                layer_input_buf.as_slice(),
-                &layer_grid_buf,
-                grad_out_slice,
-                grad_buffer
-                    .as_mut()
-                    .map(|b| &mut b.as_mut_slice()[..layer_in_size]),
-                &mut weight_grad,
-                &mut bias_grad,
-                workspace,
-            );
+
+            // Choose between sequential and parallel backward based on batch size
+            if batch_size >= self.config.multithreading_threshold {
+                // Parallel backward: uses thread-local gradient accumulation
+                layer.backward_parallel(
+                    layer_input_buf.as_slice(),
+                    &layer_grid_buf,
+                    grad_out_slice,
+                    grad_buffer
+                        .as_mut()
+                        .map(|b| &mut b.as_mut_slice()[..layer_in_size]),
+                    &mut weight_grad,
+                    &mut bias_grad,
+                );
+            } else {
+                // Sequential backward: uses workspace basis buffers
+                layer.backward(
+                    layer_input_buf.as_slice(),
+                    &layer_grid_buf,
+                    grad_out_slice,
+                    grad_buffer
+                        .as_mut()
+                        .map(|b| &mut b.as_mut_slice()[..layer_in_size]),
+                    &mut weight_grad,
+                    &mut bias_grad,
+                    workspace,
+                );
+            }
 
             // Return history buffers
             workspace.layers_inputs[layer_idx] = layer_input_buf;

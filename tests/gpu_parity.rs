@@ -2886,3 +2886,168 @@ fn test_training_trajectory_short() {
 
     println!("\n✅ Short trajectory test PASSED!");
 }
+
+// =============================================================================
+// forward_batch_async Tests
+// =============================================================================
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_forward_batch_async_parity_single_layer() {
+    let backend = WgpuBackend::init(WgpuOptions::default()).expect("GPU init");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut cpu_workspace = cpu_network.create_workspace(32);
+
+    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network).expect("GPU network");
+    let mut gpu_workspace = gpu_network.create_workspace(32).expect("GPU workspace");
+
+    // Random input
+    let input: Vec<f32> = (0..32 * config.input_dim)
+        .map(|i| (i as f32 * 0.123).sin())
+        .collect();
+
+    // CPU forward
+    let mut cpu_output = vec![0.0f32; 32 * config.output_dim];
+    cpu_network.forward_batch(&input, &mut cpu_output, &mut cpu_workspace);
+
+    // GPU sync forward
+    let gpu_output_sync = gpu_network
+        .forward_batch(&input, 32, &mut gpu_workspace)
+        .expect("GPU forward");
+
+    // GPU async forward
+    let handle = gpu_network
+        .forward_batch_async(&input, 32, &mut gpu_workspace)
+        .expect("GPU async submit");
+    let gpu_output_async = handle.wait().expect("GPU async wait");
+
+    // Compare
+    assert_approx_eq(&cpu_output, &gpu_output_sync, EPSILON);
+    assert_approx_eq(&cpu_output, &gpu_output_async, EPSILON);
+    assert_approx_eq(&gpu_output_sync, &gpu_output_async, EPSILON);
+
+    println!("✅ forward_batch_async single layer parity PASSED!");
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_forward_batch_async_parity_multi_layer() {
+    let backend = WgpuBackend::init(WgpuOptions::default()).expect("GPU init");
+
+    let config = multi_layer_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut cpu_workspace = cpu_network.create_workspace(64);
+
+    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network).expect("GPU network");
+    let mut gpu_workspace = gpu_network.create_workspace(64).expect("GPU workspace");
+
+    // Random input
+    let input: Vec<f32> = (0..64 * config.input_dim)
+        .map(|i| (i as f32 * 0.077).cos())
+        .collect();
+
+    // CPU forward
+    let mut cpu_output = vec![0.0f32; 64 * config.output_dim];
+    cpu_network.forward_batch(&input, &mut cpu_output, &mut cpu_workspace);
+
+    // GPU async forward
+    let handle = gpu_network
+        .forward_batch_async(&input, 64, &mut gpu_workspace)
+        .expect("GPU async submit");
+    let gpu_output = handle.wait().expect("GPU async wait");
+
+    assert_approx_eq(&cpu_output, &gpu_output, 1e-4);
+
+    println!("✅ forward_batch_async multi-layer parity PASSED!");
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_forward_batch_async_try_recv() {
+    let backend = WgpuBackend::init(WgpuOptions::default()).expect("GPU init");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network).expect("GPU network");
+    let mut gpu_workspace = gpu_network.create_workspace(16).expect("GPU workspace");
+
+    let input: Vec<f32> = (0..16 * config.input_dim)
+        .map(|i| i as f32 * 0.01)
+        .collect();
+
+    // Submit async
+    let handle = gpu_network
+        .forward_batch_async(&input, 16, &mut gpu_workspace)
+        .expect("GPU async submit");
+
+    // Try polling (may return None if not ready, or Ok if ready)
+    let mut handle = handle;
+    let mut iterations = 0;
+    let result = loop {
+        iterations += 1;
+        handle.poll();
+        match handle.try_recv() {
+            Ok(Some(result)) => break result,
+            Ok(None) => panic!("Unexpected None with disconnected channel"),
+            Err(h) => {
+                handle = h;
+                if iterations > 1000 {
+                    // Fallback to blocking wait
+                    break handle.wait();
+                }
+            }
+        }
+    };
+
+    let output = result.expect("Forward failed");
+    assert_eq!(output.len(), 16 * config.output_dim);
+
+    println!(
+        "✅ forward_batch_async try_recv PASSED (iterations: {})",
+        iterations
+    );
+}
+
+#[test]
+#[ignore = "Requires GPU"]
+fn test_forward_batch_async_multiple_submits() {
+    let backend = WgpuBackend::init(WgpuOptions::default()).expect("GPU init");
+
+    let config = simple_config();
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network).expect("GPU network");
+    let mut gpu_workspace = gpu_network.create_workspace(8).expect("GPU workspace");
+
+    // Submit multiple batches and collect handles
+    let mut handles = Vec::new();
+    for batch_idx in 0..5 {
+        let input: Vec<f32> = (0..8 * config.input_dim)
+            .map(|i| (i + batch_idx * 100) as f32 * 0.01)
+            .collect();
+
+        let handle = gpu_network
+            .forward_batch_async(&input, 8, &mut gpu_workspace)
+            .expect("GPU async submit");
+        handles.push(handle);
+    }
+
+    // Wait for all (in order - each uses same workspace, so sequential)
+    let outputs: Vec<Vec<f32>> = handles
+        .into_iter()
+        .map(|h| h.wait().expect("Wait failed"))
+        .collect();
+
+    // Verify all outputs have correct size
+    for (i, output) in outputs.iter().enumerate() {
+        assert_eq!(
+            output.len(),
+            8 * config.output_dim,
+            "Output {} has wrong size",
+            i
+        );
+    }
+
+    println!("✅ forward_batch_async multiple submits PASSED!");
+}

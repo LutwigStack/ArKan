@@ -29,7 +29,7 @@
 //!
 //! | Parameter | Typical Values | Effect |
 //! |-----------|---------------|--------|
-//! | `grid_size` | 3-16 | More intervals = finer control, more params |
+//! | `grid_size` | 3-64 | More intervals = finer control, more params |
 //! | `spline_order` | 2-5 | Higher = smoother functions, more compute |
 //!
 //! **Recommended**: `grid_size=5`, `spline_order=3` (cubic) for balanced performance.
@@ -54,6 +54,13 @@ pub const EPSILON: f32 = 1e-6;
 /// A grid size of 5 provides a good balance between expressiveness
 /// and computational cost for most applications.
 pub const DEFAULT_GRID_SIZE: usize = 5;
+
+/// Maximum supported grid size.
+///
+/// Higher grid sizes allow finer control of the spline functions,
+/// but increase memory usage and computation time quadratically.
+/// For most applications, grid_size <= 16 is sufficient.
+pub const MAX_GRID_SIZE: usize = 64;
 
 /// Default spline order (cubic).
 ///
@@ -311,7 +318,7 @@ impl KanConfig {
     ///
     /// Returns [`ConfigError`] if:
     /// - Dimensions are zero
-    /// - `grid_size` not in 1..=16
+    /// - `grid_size` not in 1..=[`MAX_GRID_SIZE`] (64)
     /// - `spline_order` not in 1..=[`MAX_SPLINE_ORDER`]
     /// - `grid_range.0 >= grid_range.1`
     /// - Normalization arrays don't match `input_dim`
@@ -342,7 +349,7 @@ impl KanConfig {
                 "output_dim must be > 0",
             )));
         }
-        if self.grid_size == 0 || self.grid_size > 16 {
+        if self.grid_size == 0 || self.grid_size > MAX_GRID_SIZE {
             return Err(ConfigError::InvalidGridSize(self.grid_size));
         }
         if self.spline_order == 0 || self.spline_order > MAX_SPLINE_ORDER {
@@ -687,11 +694,29 @@ mod tests {
 
     #[test]
     fn test_invalid_grid_size() {
+        // grid_size = 65 exceeds MAX_GRID_SIZE (64)
         let config = KanConfig {
-            grid_size: 20,
+            grid_size: 65,
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_valid_large_grid_size() {
+        // grid_size = 64 is now valid (MAX_GRID_SIZE)
+        let config = KanConfig {
+            grid_size: 64,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        // grid_size = 32 also valid
+        let config32 = KanConfig {
+            grid_size: 32,
+            ..Default::default()
+        };
+        assert!(config32.validate().is_ok());
     }
 
     #[test]

@@ -13,8 +13,132 @@ use crate::gpu::workspace::GpuWorkspace;
 use crate::loss::{masked_cross_entropy, masked_mse};
 use crate::network::{KanNetwork, TrainOptions};
 use crate::optimizer::{Adam, SGD};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
+
+/// Handle for asynchronous GPU forward pass result.
+///
+/// Created by [`GpuNetwork::forward_batch_async`]. This handle allows you to
+/// submit GPU work and continue CPU processing while the GPU computes the result.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use arkan::{KanConfig, KanNetwork};
+/// use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork, GpuWorkspace};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let backend = WgpuBackend::init(WgpuOptions::default())?;
+/// let config = KanConfig::preset();
+/// let cpu_network = KanNetwork::new(config.clone());
+/// let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)?;
+/// let mut workspace = GpuWorkspace::new(&backend.device, 64, config.input_dim, config.output_dim)?;
+///
+/// let input = vec![0.5f32; 64 * config.input_dim];
+///
+/// // Submit work and get handle
+/// let handle = gpu_network.forward_batch_async(&input, 64, &mut workspace)?;
+///
+/// // Do other CPU work while GPU computes...
+///
+/// // Get result (blocking)
+/// let output = handle.wait()?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct GpuForwardHandle {
+    /// Staging buffer for reading results.
+    staging_buffer: wgpu::Buffer,
+    /// Receiver for map_async completion signal.
+    receiver: Receiver<Result<(), wgpu::BufferAsyncError>>,
+    /// Batch size of this forward pass.
+    batch_size: usize,
+    /// Output dimension.
+    out_dim: usize,
+    /// Device reference for polling.
+    device: Arc<wgpu::Device>,
+}
+
+impl GpuForwardHandle {
+    /// Blocks until the GPU result is ready and returns the output.
+    ///
+    /// This is equivalent to calling `forward_batch` but allows you to do
+    /// CPU work between submission and result retrieval.
+    ///
+    /// # Returns
+    ///
+    /// Output data `[batch_size * out_dim]`.
+    pub fn wait(self) -> ArkanResult<Vec<f32>> {
+        // Poll device to ensure work is submitted
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Wait for map_async callback
+        self.receiver
+            .recv()
+            .map_err(|e| ArkanError::buffer(format!("Channel recv failed: {}", e)))?
+            .map_err(|e| ArkanError::buffer(format!("Buffer map failed: {:?}", e)))?;
+
+        // Read mapped data
+        let data = {
+            let mapped = self.staging_buffer.slice(..).get_mapped_range();
+            let full_data: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
+            let used = self.batch_size * self.out_dim;
+            full_data[..used].to_vec()
+        };
+
+        self.staging_buffer.unmap();
+        Ok(data)
+    }
+
+    /// Attempts to get the result without blocking.
+    ///
+    /// Returns `Some(Ok(data))` if the result is ready, `Some(Err(e))` if there
+    /// was an error, or `None` if the GPU is still computing.
+    ///
+    /// # Note
+    ///
+    /// You should call `poll()` before `try_recv()` to check for completion.
+    pub fn try_recv(self) -> Result<Option<ArkanResult<Vec<f32>>>, Self> {
+        // Do a non-blocking poll
+        self.device.poll(wgpu::Maintain::Poll);
+
+        match self.receiver.try_recv() {
+            Ok(Ok(())) => {
+                // Ready - read data
+                let data = {
+                    let mapped = self.staging_buffer.slice(..).get_mapped_range();
+                    let full_data: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
+                    let used = self.batch_size * self.out_dim;
+                    full_data[..used].to_vec()
+                };
+                self.staging_buffer.unmap();
+                Ok(Some(Ok(data)))
+            }
+            Ok(Err(e)) => {
+                // Map failed
+                Ok(Some(Err(ArkanError::buffer(format!(
+                    "Buffer map failed: {:?}",
+                    e
+                )))))
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // Not ready yet - return self for retry
+                Err(self)
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Ok(Some(Err(ArkanError::buffer("Channel disconnected"))))
+            }
+        }
+    }
+
+    /// Polls the GPU for work completion.
+    ///
+    /// Call this periodically if using `try_recv()` in a loop.
+    pub fn poll(&self) {
+        self.device.poll(wgpu::Maintain::Poll);
+    }
+}
 
 /// GPU memory usage statistics.
 ///
@@ -366,6 +490,111 @@ impl GpuNetwork {
 
         // Download output
         workspace.download_output(&self.device, &self.queue, batch_size)
+    }
+
+    /// Performs asynchronous forward pass on GPU.
+    ///
+    /// Unlike `forward_batch`, this method returns immediately with a handle
+    /// that can be used to retrieve the result later. This allows overlapping
+    /// GPU computation with CPU work.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data `[batch_size * input_dim]`.
+    /// * `batch_size` - Number of samples in the batch.
+    /// * `workspace` - GPU workspace for intermediate buffers.
+    ///
+    /// # Returns
+    ///
+    /// A [`GpuForwardHandle`] that can be used to retrieve the output.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use arkan::{KanConfig, KanNetwork};
+    /// # use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork, GpuWorkspace};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let backend = WgpuBackend::init(WgpuOptions::default())?;
+    /// # let config = KanConfig::preset();
+    /// # let mut gpu_network = GpuNetwork::from_cpu(&backend, &KanNetwork::new(config.clone()))?;
+    /// # let mut workspace = GpuWorkspace::new(&backend.device, 64, config.input_dim, config.output_dim)?;
+    /// let input = vec![0.5f32; 64 * config.input_dim];
+    ///
+    /// // Submit work to GPU
+    /// let handle = gpu_network.forward_batch_async(&input, 64, &mut workspace)?;
+    ///
+    /// // Do CPU work while GPU computes...
+    /// let cpu_result = expensive_cpu_computation();
+    ///
+    /// // Get GPU result
+    /// let output = handle.wait()?;
+    /// # Ok(())
+    /// # }
+    /// # fn expensive_cpu_computation() -> i32 { 42 }
+    /// ```
+    pub fn forward_batch_async(
+        &mut self,
+        input: &[f32],
+        batch_size: usize,
+        workspace: &mut GpuWorkspace,
+    ) -> ArkanResult<GpuForwardHandle> {
+        // Validate input
+        let expected_input_len = batch_size * self.input_dim;
+        if input.len() != expected_input_len {
+            return Err(ArkanError::shape_mismatch(
+                &[batch_size, self.input_dim],
+                &[input.len() / self.input_dim, self.input_dim],
+            ));
+        }
+
+        // Ensure workspace capacity
+        workspace.ensure_capacity(&self.device, batch_size)?;
+
+        // Upload input
+        workspace.upload_input(&self.queue, input)?;
+
+        // Execute forward pass (submits GPU commands)
+        self.execute_forward(batch_size, workspace)?;
+
+        // Create staging buffer for async readback
+        let output_buffer = workspace
+            .output_buffer()
+            .ok_or_else(|| ArkanError::buffer("Output buffer not allocated"))?;
+
+        let output_size = batch_size * self.output_dim;
+        let size_bytes = (output_size * std::mem::size_of::<f32>()) as u64;
+
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Forward async staging"),
+            size: size_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Copy from output buffer to staging buffer
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Forward async copy encoder"),
+            });
+        encoder.copy_buffer_to_buffer(output_buffer, 0, &staging_buffer, 0, size_bytes);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Set up async map
+        let (tx, rx) = mpsc::channel();
+        staging_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+
+        Ok(GpuForwardHandle {
+            staging_buffer,
+            receiver: rx,
+            batch_size,
+            out_dim: self.output_dim,
+            device: Arc::clone(&self.device),
+        })
     }
 
     /// Executes the forward pass computation.
