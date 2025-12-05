@@ -218,12 +218,10 @@ fn generate_xor_dataset(
                 } else {
                     0.0
                 }
+            } else if sum <= 0.3 || sum >= 0.7 {
+                1.0
             } else {
-                if sum <= 0.3 || sum >= 0.7 {
-                    1.0
-                } else {
-                    0.0
-                }
+                0.0
             };
             targets.push(target);
         }

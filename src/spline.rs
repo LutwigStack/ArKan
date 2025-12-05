@@ -494,7 +494,7 @@ mod tests {
 
         // At grid maximum
         let span = find_span(1.0, &knots, order, grid_size);
-        assert!(span <= grid_size + order - 1);
+        assert!(span < grid_size + order);
 
         // Middle value
         let span = find_span(0.5, &knots, order, grid_size);
@@ -544,7 +544,7 @@ mod tests {
 
         // Check all values are in range
         for &val in &z {
-            assert!(val >= -3.0 && val <= 3.0);
+            assert!((-3.0..=3.0).contains(&val));
         }
     }
 }

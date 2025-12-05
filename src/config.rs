@@ -687,8 +687,10 @@ mod tests {
 
     #[test]
     fn test_invalid_grid_size() {
-        let mut config = KanConfig::default();
-        config.grid_size = 20;
+        let config = KanConfig {
+            grid_size: 20,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 

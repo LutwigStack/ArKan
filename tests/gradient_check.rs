@@ -246,8 +246,8 @@ fn run_gradient_check(config: &KanConfig, batch_size: usize, test_name: &str) {
     );
 
     // Extract analytical gradients from workspace
-    let ana_weight_grads: Vec<Vec<f32>> = workspace.weight_grads.iter().cloned().collect();
-    let ana_bias_grads: Vec<Vec<f32>> = workspace.bias_grads.iter().cloned().collect();
+    let ana_weight_grads: Vec<Vec<f32>> = workspace.weight_grads.to_vec();
+    let ana_bias_grads: Vec<Vec<f32>> = workspace.bias_grads.to_vec();
 
     // Restore original weights
     network = original_network;

@@ -1599,8 +1599,8 @@ mod tests {
         let mut network = KanNetwork::new(config.clone());
         let mut workspace = network.create_workspace(1);
 
-        let input = vec![0.25f32, -0.4];
-        let target = vec![0.1f32];
+        let input = [0.25f32, -0.4];
+        let target = [0.1f32];
 
         // Прямой проход с записью истории
         let mut preds = vec![0.0f32; 1];
@@ -1633,6 +1633,7 @@ mod tests {
         ws_num.reserve(1, &config);
         let mut out_buf = vec![0.0f32; 1];
 
+        #[allow(clippy::needless_range_loop)]
         for idx in 0..network.layers[0].weights.len() {
             let orig = network.layers[0].weights[idx];
 

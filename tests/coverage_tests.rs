@@ -203,6 +203,7 @@ fn test_gradient_check_deep_network() {
     let mut passed_checks = 0;
     let mut failed_details = Vec::new();
 
+    #[allow(clippy::needless_range_loop)]
     for layer_idx in 0..network.num_layers() {
         // Check 10 random weights per layer
         let num_weights = network.layers[layer_idx].weights.len();

@@ -105,8 +105,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ===== Test 6: Adam Optimizer =====
     print!("6. Adam Optimizer... ");
-    let mut network = KanNetwork::new(config.clone());
-    let mut workspace = network.create_workspace(16);
+    let network = KanNetwork::new(config.clone());
+    let _workspace = network.create_workspace(16);
     let adam_config = AdamConfig {
         lr: 0.001,
         beta1: 0.9,
@@ -125,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ===== Test 7: SGD Optimizer =====
     print!("7. SGD Optimizer... ");
-    let sgd = SGD::new(&network, 0.01, 0.9, 0.0);
+    let _sgd = SGD::new(&network, 0.01, 0.9, 0.0);
     // SGD doesn't have learning_rate() method, but we can check it was created
     println!("✅ PASSED (lr=0.01, momentum=0.9)");
     passed += 1;
@@ -311,7 +311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ===== Test 12: Workspace Reuse =====
     print!("12. Workspace Reuse... ");
-    let mut network = KanNetwork::new(config.clone());
+    let network = KanNetwork::new(config.clone());
     let mut workspace = network.create_workspace(32);
     let input8: Vec<f32> = (0..8 * 4).map(|i| (i as f32).sin()).collect();
     let input16: Vec<f32> = (0..16 * 4).map(|i| (i as f32).sin()).collect();

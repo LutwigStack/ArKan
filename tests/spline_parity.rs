@@ -325,13 +325,13 @@ fn test_knot_generation() {
     assert!((h - 0.4).abs() < 1e-6);
 
     // knots[i] = t_min + (i - order) * h
-    for i in 0..knots.len() {
+    for (i, &knot) in knots.iter().enumerate() {
         let expected = range.0 + (i as f32 - order as f32) * h;
         assert!(
-            (knots[i] - expected).abs() < 1e-6,
+            (knot - expected).abs() < 1e-6,
             "Knot {} mismatch: got {}, expected {}",
             i,
-            knots[i],
+            knot,
             expected
         );
     }
