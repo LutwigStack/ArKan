@@ -87,18 +87,26 @@ pub fn train(
                     local_agent.policy_net.layers[layer_idx].bias.copy_from_slice(b);
                 }
 
+                // Pre-allocated state buffers
+                let mut state_buffer = [0.0f32; 256];
+                let mut next_state_buffer = [0.0f32; 256];
+
                 while !env.is_done() {
+                    // Copy state to fixed-size buffer
                     let state = env.get_state();
+                    state_buffer.copy_from_slice(&state);
+                    
                     let action = local_agent.select_action(&state, &env, current_epsilon);
                     let (next_state, reward, done) = env.step(action);
+                    next_state_buffer.copy_from_slice(&next_state);
 
-                    experiences.push(Experience {
-                        state,
+                    experiences.push(Experience::from_arrays(
+                        &state_buffer,
                         action,
                         reward,
-                        next_state,
+                        &next_state_buffer,
                         done,
-                    });
+                    ));
                 }
 
                 (env.score(), env.max_tile(), experiences)

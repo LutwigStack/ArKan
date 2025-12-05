@@ -3,6 +3,8 @@
 //! Two modes:
 //! - Hybrid: GPU forward/backward + CPU optimizer (stable, has gradient clipping)
 //! - Native: All on GPU with GpuAdam (fastest, but no gradient clipping)
+//!
+//! Optimized for high throughput with large batch parallel training.
 
 use super::TrainingHistory;
 use crate::agents::kan_dqn::KanDqnAgent;
@@ -18,7 +20,17 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 /// Number of parallel environments for experience collection.
-const NUM_ENVS: usize = 8;
+/// Increased for better throughput.
+const NUM_ENVS: usize = 32;
+
+/// Batch size for GPU training (larger = better GPU utilization).
+const GPU_BATCH_SIZE: usize = 256;
+
+/// How often to sync weights to worker agents (in episodes).
+const WEIGHT_SYNC_INTERVAL: usize = 16;
+
+/// Pre-allocated batch size for compute_targets optimization.
+const TARGET_BATCH_SIZE: usize = 256;
 
 /// GPU DQN Agent for hybrid/native training.
 pub struct GpuDqnAgent {
@@ -30,16 +42,22 @@ pub struct GpuDqnAgent {
     pub cpu_target: KanNetwork,
     /// GPU policy network.
     pub gpu_policy: GpuNetwork,
-    /// CPU workspace for inference.
+    /// CPU workspace for single-sample inference.
     cpu_workspace: Workspace,
+    /// CPU workspace for batched forward (compute_targets).
+    cpu_batch_workspace: Workspace,
     /// GPU workspace for training.
     gpu_workspace: GpuWorkspace,
     /// CPU optimizer (for hybrid mode).
     cpu_optimizer: Adam,
     /// GPU optimizer (for native mode).
     gpu_optimizer: Option<GpuAdam>,
-    /// Output buffer.
+    /// Output buffer for single sample.
     output: Vec<f32>,
+    /// Pre-allocated buffer for batch current Q-values.
+    batch_current_q: Vec<f32>,
+    /// Pre-allocated buffer for batch next Q-values.
+    batch_next_q: Vec<f32>,
     /// Training options.
     train_opts: TrainOptions,
     /// Is native mode.
@@ -49,18 +67,22 @@ pub struct GpuDqnAgent {
 impl GpuDqnAgent {
     /// Creates a new GPU DQN agent.
     pub fn new(lr: f32, native_mode: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        // Network architecture must match KanDqnAgent!
+        // 256 inputs (one-hot: 16 cells * 16 possible values) -> hidden -> 4 outputs
         let config = KanConfigBuilder::new()
-            .input_dim(16)
-            .hidden_dims(vec![32, 16])
-            .output_dim(4)
-            .spline_order(3)
-            .grid_size(5)
-            .grid_range(-1.0, 1.0)
+            .input_dim(256)        // 16 cells * 16 possible values (one-hot)
+            .hidden_dims(vec![64, 32])  // Hidden layers (same as KanDqnAgent)
+            .output_dim(4)         // 4 actions
+            .spline_order(3)       // Cubic splines
+            .grid_size(5)          // 5 grid points
+            .grid_range(0.0, 1.0)  // One-hot values are 0 or 1
             .build()?;
 
         let cpu_policy = KanNetwork::new(config.clone());
         let cpu_target = KanNetwork::new(config.clone());
         let cpu_workspace = Workspace::new(&config);
+        // Batch workspace for compute_targets optimization
+        let cpu_batch_workspace = cpu_policy.create_workspace(TARGET_BATCH_SIZE);
 
         // Initialize WGPU backend
         let wgpu_opts = WgpuOptions::compute();
@@ -69,8 +91,8 @@ impl GpuDqnAgent {
         // Create GPU network from CPU
         let gpu_policy = GpuNetwork::from_cpu(&backend, &cpu_policy)?;
 
-        // GPU workspace for batch training (max batch 64)
-        let gpu_workspace = gpu_policy.create_workspace(64)?;
+        // GPU workspace for batch training (larger batch = better GPU utilization)
+        let gpu_workspace = gpu_policy.create_workspace(GPU_BATCH_SIZE)?;
 
         // CPU optimizer for hybrid mode
         let cpu_optimizer = Adam::new(&cpu_policy, AdamConfig::with_lr(lr));
@@ -106,10 +128,13 @@ impl GpuDqnAgent {
             cpu_target,
             gpu_policy,
             cpu_workspace,
+            cpu_batch_workspace,
             gpu_workspace,
             cpu_optimizer,
             gpu_optimizer,
             output: vec![0.0f32; 4],
+            batch_current_q: vec![0.0f32; TARGET_BATCH_SIZE * 4],
+            batch_next_q: vec![0.0f32; TARGET_BATCH_SIZE * 4],
             train_opts,
             native_mode,
         })
@@ -164,7 +189,7 @@ impl GpuDqnAgent {
         gamma: f32,
     ) -> Result<f32, Box<dyn std::error::Error>> {
         let batch_size = actions.len();
-        let state_dim = 16;
+        let state_dim = 256;  // one-hot: 16 cells * 16 values
         let action_dim = 4;
 
         // Compute target Q-values using CPU target network
@@ -225,7 +250,7 @@ impl GpuDqnAgent {
         gamma: f32,
     ) -> Result<f32, Box<dyn std::error::Error>> {
         let batch_size = actions.len();
-        let state_dim = 16;
+        let state_dim = 256;  // one-hot: 16 cells * 16 values
         let action_dim = 4;
 
         // For native mode, we still compute targets on CPU for simplicity
@@ -278,7 +303,8 @@ impl GpuDqnAgent {
         Ok(loss)
     }
 
-    /// Computes Q-learning targets for a batch.
+    /// Computes Q-learning targets for a batch using PARALLEL forward passes.
+    /// Uses ArKan's built-in forward_batch_parallel for optimal performance.
     pub fn compute_targets(
         &mut self,
         states: &[f32],
@@ -289,23 +315,32 @@ impl GpuDqnAgent {
         gamma: f32,
     ) -> Vec<f32> {
         let batch_size = actions.len();
-        let state_dim = 16;
         let action_dim = 4;
 
-        let mut targets = vec![0.0f32; batch_size * action_dim];
+        // Resize pre-allocated buffers if needed
+        if self.batch_current_q.len() < batch_size * action_dim {
+            self.batch_current_q.resize(batch_size * action_dim, 0.0);
+        }
+        if self.batch_next_q.len() < batch_size * action_dim {
+            self.batch_next_q.resize(batch_size * action_dim, 0.0);
+        }
+
+        // PARALLEL forward pass for current Q-values (policy network)
+        self.cpu_policy.forward_batch_parallel(
+            states,
+            &mut self.batch_current_q[..batch_size * action_dim],
+        );
+
+        // PARALLEL forward pass for next Q-values (target network)
+        self.cpu_target.forward_batch_parallel(
+            next_states,
+            &mut self.batch_next_q[..batch_size * action_dim],
+        );
+
+        // Build targets: copy current Q, then update the action taken
+        let mut targets = self.batch_current_q[..batch_size * action_dim].to_vec();
 
         for i in 0..batch_size {
-            let state = &states[i * state_dim..(i + 1) * state_dim];
-
-            // Current Q-values
-            let mut current_q = vec![0.0f32; 4];
-            self.cpu_policy
-                .forward_single(state, &mut current_q, &mut self.cpu_workspace);
-
-            for a in 0..action_dim {
-                targets[i * action_dim + a] = current_q[a];
-            }
-
             let action = actions[i];
             let reward = rewards[i];
             let done = dones[i];
@@ -313,9 +348,12 @@ impl GpuDqnAgent {
             let target_q = if done {
                 reward
             } else {
-                let next_state = &next_states[i * state_dim..(i + 1) * state_dim];
-                let next_q = self.get_target_q_values(next_state);
-                let max_next_q = next_q.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                // Max Q from target network for next state
+                let next_q_start = i * action_dim;
+                let max_next_q = self.batch_next_q[next_q_start..next_q_start + action_dim]
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
                 reward + gamma * max_next_q
             };
 
@@ -435,9 +473,10 @@ pub fn train_native(
 }
 
 /// Implementation of GPU training with parallel experience collection.
+/// Optimized for high throughput with large batches.
 fn train_impl(
     episodes: usize,
-    batch_size: usize,
+    _batch_size: usize, // Ignored, we use GPU_BATCH_SIZE
     lr: f32,
     gamma: f32,
     replay_capacity: usize,
@@ -447,12 +486,13 @@ fn train_impl(
     epsilon_decay: f32,
     native_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::cell::RefCell;
+    
     let mode_name = if native_mode { "Native" } else { "Hybrid" };
     
     // Initialize GPU agent for training
     let mut gpu_agent = GpuDqnAgent::new(lr, native_mode)?;
     let replay_buffer = Arc::new(RwLock::new(ReplayBuffer::new(replay_capacity)));
-    let epsilon = Arc::new(RwLock::new(epsilon_start));
 
     // Statistics
     let mut total_score = 0u64;
@@ -462,6 +502,27 @@ fn train_impl(
     let mut recent_losses: Vec<f32> = Vec::with_capacity(100);
     let mut nan_count = 0usize;
     let mut history = TrainingHistory::new();
+
+    // Shared weights for workers (updated less frequently for speed)
+    let shared_weights: Arc<RwLock<Vec<(Vec<f32>, Vec<f32>)>>> = Arc::new(RwLock::new(
+        gpu_agent.cpu_policy.layers.iter()
+            .map(|l| (l.weights.clone(), l.bias.clone()))
+            .collect()
+    ));
+
+    // Thread-local agent pool to avoid recreating agents
+    thread_local! {
+        static LOCAL_AGENT: RefCell<Option<KanDqnAgent>> = const { RefCell::new(None) };
+        static LOCAL_STATE_BUFFER: RefCell<[f32; 256]> = const { RefCell::new([0.0f32; 256]) };
+        static LOCAL_NEXT_STATE_BUFFER: RefCell<[f32; 256]> = const { RefCell::new([0.0f32; 256]) };
+    }
+
+    // Pre-allocated batch buffers for sampling
+    let mut batch_states = Vec::with_capacity(GPU_BATCH_SIZE * 256);
+    let mut batch_actions = Vec::with_capacity(GPU_BATCH_SIZE);
+    let mut batch_rewards = Vec::with_capacity(GPU_BATCH_SIZE);
+    let mut batch_next_states = Vec::with_capacity(GPU_BATCH_SIZE * 256);
+    let mut batch_dones = Vec::with_capacity(GPU_BATCH_SIZE);
 
     // Progress bar
     let pb = ProgressBar::new(episodes as u64);
@@ -475,9 +536,11 @@ fn train_impl(
     let start = Instant::now();
     let mut total_steps = 0usize;
     let mut train_steps = 0usize;
+    let mut current_epsilon = epsilon_start;
 
     println!();
-    println!("Training started (GPU {} + {} parallel envs)...", mode_name, NUM_ENVS);
+    println!("Training started (GPU {} + {} parallel envs, batch {})...", 
+             mode_name, NUM_ENVS, GPU_BATCH_SIZE);
     if native_mode {
         println!("⚠️  WARNING: Native mode has NO gradient clipping!");
     }
@@ -485,47 +548,74 @@ fn train_impl(
 
     // Process episodes in batches of NUM_ENVS
     let num_batches = (episodes + NUM_ENVS - 1) / NUM_ENVS;
+    let mut completed_episodes = 0usize;
 
     for batch_idx in 0..num_batches {
-        let batch_start = batch_idx * NUM_ENVS;
-        let batch_end = (batch_start + NUM_ENVS).min(episodes);
-        let batch_count = batch_end - batch_start;
+        let batch_count = NUM_ENVS.min(episodes - completed_episodes);
 
-        // Get current epsilon
-        let current_epsilon = *epsilon.read().unwrap();
+        // Update shared weights periodically (not every batch for speed)
+        if batch_idx % (WEIGHT_SYNC_INTERVAL / NUM_ENVS).max(1) == 0 {
+            let mut weights = shared_weights.write().unwrap();
+            *weights = gpu_agent.cpu_policy.layers.iter()
+                .map(|l| (l.weights.clone(), l.bias.clone()))
+                .collect();
+        }
 
-        // Get current weights for workers (from CPU policy in GPU agent)
-        let weights: Vec<(Vec<f32>, Vec<f32>)> = gpu_agent.cpu_policy.layers.iter()
-            .map(|l| (l.weights.clone(), l.bias.clone()))
-            .collect();
+        // Clone for parallel use
+        let weights_snapshot = shared_weights.read().unwrap().clone();
+        let eps = current_epsilon;
+        let lr_copy = lr;
 
-        // Run episodes in parallel using lightweight CPU agents for experience collection
+        // Run episodes in parallel using thread-local reusable CPU agents
         let episode_results: Vec<_> = (0..batch_count)
             .into_par_iter()
             .map(|_| {
+                use crate::utils::board_to_onehot_inplace;
+                
                 let mut env = Env::new();
                 let mut experiences = Vec::with_capacity(200);
-                let mut local_agent = KanDqnAgent::new(lr).unwrap();
+                
+                // Reuse thread-local agent (create only once per thread)
+                LOCAL_AGENT.with(|agent_cell| {
+                    let mut agent_ref = agent_cell.borrow_mut();
+                    if agent_ref.is_none() {
+                        *agent_ref = Some(KanDqnAgent::new(lr_copy).unwrap());
+                    }
+                    let local_agent = agent_ref.as_mut().unwrap();
 
-                // Copy weights from main agent
-                for (layer_idx, (w, b)) in weights.iter().enumerate() {
-                    local_agent.policy_net.layers[layer_idx].weights.copy_from_slice(w);
-                    local_agent.policy_net.layers[layer_idx].bias.copy_from_slice(b);
-                }
+                    // Copy weights from snapshot
+                    for (layer_idx, (w, b)) in weights_snapshot.iter().enumerate() {
+                        local_agent.policy_net.layers[layer_idx].weights.copy_from_slice(w);
+                        local_agent.policy_net.layers[layer_idx].bias.copy_from_slice(b);
+                    }
 
-                while !env.is_done() {
-                    let state = env.get_state();
-                    let action = local_agent.select_action(&state, &env, current_epsilon);
-                    let (next_state, reward, done) = env.step(action);
+                    // Use thread-local state buffers
+                    LOCAL_STATE_BUFFER.with(|state_buf| {
+                        LOCAL_NEXT_STATE_BUFFER.with(|next_state_buf| {
+                            let mut state_buffer = state_buf.borrow_mut();
+                            let mut next_state_buffer = next_state_buf.borrow_mut();
+                            
+                            while !env.is_done() {
+                                // Zero-allocation state encoding
+                                board_to_onehot_inplace(env.board(), &mut state_buffer[..]);
+                                
+                                let action = local_agent.select_action(&state_buffer[..], &env, eps);
+                                let (_, reward, done) = env.step(action);
+                                
+                                // Zero-allocation next state encoding
+                                board_to_onehot_inplace(env.board(), &mut next_state_buffer[..]);
 
-                    experiences.push(Experience {
-                        state,
-                        action,
-                        reward,
-                        next_state,
-                        done,
+                                experiences.push(Experience::from_arrays(
+                                    &*state_buffer,
+                                    action,
+                                    reward,
+                                    &*next_state_buffer,
+                                    done,
+                                ));
+                            }
+                        });
                     });
-                }
+                });
 
                 (env.score(), env.max_tile(), experiences)
             })
@@ -535,6 +625,7 @@ fn train_impl(
         for (score, max_tile, experiences) in episode_results {
             total_score += score as u64;
             total_steps += experiences.len();
+            completed_episodes += 1;
 
             if score > best_score {
                 best_score = score;
@@ -555,31 +646,47 @@ fn train_impl(
                     buffer.push(exp);
                 }
             }
+
+            // Decay epsilon per episode
+            current_epsilon = (current_epsilon * epsilon_decay).max(epsilon_end);
         }
 
-        // GPU Training: multiple updates per batch
-        let updates_per_batch = batch_count * 4;
+        // GPU Training: multiple large-batch updates
+        // More updates when buffer is fuller for better sample efficiency
+        let buffer_len = replay_buffer.read().unwrap().len();
+        let updates_per_batch = if buffer_len >= GPU_BATCH_SIZE * 4 {
+            batch_count * 2  // More updates when buffer is full
+        } else {
+            batch_count
+        };
+
         let mut batch_loss = 0.0f32;
         let mut batch_train_steps = 0;
 
         {
             let buffer = replay_buffer.read().unwrap();
 
-            if buffer.len() >= batch_size {
+            if buffer.len() >= GPU_BATCH_SIZE {
                 for _ in 0..updates_per_batch {
-                    if let Some((states, actions, rewards, next_states, dones)) =
-                        buffer.sample_batch(batch_size)
-                    {
+                    // Use optimized batch sampling into pre-allocated buffers
+                    if buffer.sample_batch_into(
+                        GPU_BATCH_SIZE,
+                        &mut batch_states,
+                        &mut batch_actions,
+                        &mut batch_rewards,
+                        &mut batch_next_states,
+                        &mut batch_dones,
+                    ).is_some() {
                         // Compute targets using CPU target network
                         let targets = gpu_agent.compute_targets(
-                            &states, &actions, &rewards, &next_states, &dones, gamma
+                            &batch_states, &batch_actions, &batch_rewards, &batch_next_states, &batch_dones, gamma
                         );
 
-                        // Train on GPU
+                        // Train on GPU with large batch
                         let loss_result = if native_mode {
-                            gpu_agent.train_on_targets_native(&states, &targets)
+                            gpu_agent.train_on_targets_native(&batch_states, &targets)
                         } else {
-                            gpu_agent.train_on_targets_hybrid(&states, &targets)
+                            gpu_agent.train_on_targets_hybrid(&batch_states, &targets)
                         };
 
                         match loss_result {
@@ -608,25 +715,16 @@ fn train_impl(
             }
         }
 
-        // Decay epsilon
-        {
-            let mut eps = epsilon.write().unwrap();
-            for _ in 0..batch_count {
-                *eps = (*eps * epsilon_decay).max(epsilon_end);
-            }
-        }
-
         // Update target network
-        let current_episode = batch_end;
-        if current_episode % target_update < batch_count || batch_idx == 0 {
+        if completed_episodes % target_update < batch_count || batch_idx == 0 {
             gpu_agent.update_target_network();
         }
 
         // Progress update
-        pb.set_position(batch_end as u64);
+        pb.set_position(completed_episodes as u64);
 
-        // Periodic logging
-        if current_episode % 50 < batch_count || batch_idx == 0 || batch_end == episodes {
+        // Periodic logging (every ~100 episodes for cleaner output)
+        if completed_episodes % 100 < batch_count || batch_idx == 0 || completed_episodes >= episodes {
             let avg_score: f32 =
                 recent_scores.iter().sum::<u32>() as f32 / recent_scores.len().max(1) as f32;
             let avg_loss: f32 = if recent_losses.is_empty() {
@@ -635,15 +733,14 @@ fn train_impl(
                 recent_losses.iter().sum::<f32>() / recent_losses.len() as f32
             };
             let elapsed = start.elapsed().as_secs_f64();
-            let eps_per_sec = current_episode as f64 / elapsed;
-            let current_eps = *epsilon.read().unwrap();
+            let eps_per_sec = completed_episodes as f64 / elapsed;
 
             // Record for graph
-            history.record(current_episode, avg_score, avg_loss);
+            history.record(completed_episodes, avg_score, avg_loss);
 
             pb.println(format!(
                 "Ep {:5} | Best: {:5} | Tile: {:4} | Avg: {:6.1} | Loss: {:7.4} | ε: {:.3} | {:.1} ep/s",
-                current_episode, best_score, best_tile, avg_score, avg_loss, current_eps, eps_per_sec
+                completed_episodes, best_score, best_tile, avg_score, avg_loss, current_epsilon, eps_per_sec
             ));
         }
     }
@@ -657,6 +754,7 @@ fn train_impl(
     println!("              TRAINING COMPLETE (GPU {})                ", mode_name);
     println!("═══════════════════════════════════════════════════════════════");
     println!("Parallel envs:      {}", NUM_ENVS);
+    println!("GPU batch size:     {}", GPU_BATCH_SIZE);
     println!("Total episodes:     {}", episodes);
     println!("Total steps:        {}", total_steps);
     println!("Training steps:     {}", train_steps);

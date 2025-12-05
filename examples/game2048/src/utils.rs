@@ -40,16 +40,26 @@ pub fn board_to_features(board: &Board) -> Vec<f32> {
 #[allow(dead_code)]
 pub fn board_to_onehot(board: &Board) -> Vec<f32> {
     let mut features = vec![0.0f32; 16 * 16]; // 16 cells * 16 possible values
+    board_to_onehot_inplace(board, &mut features);
+    features
+}
+
+/// Zero-allocation one-hot encoding - writes directly to pre-allocated buffer.
+/// Buffer must be at least 256 elements.
+#[inline]
+pub fn board_to_onehot_inplace(board: &Board, buffer: &mut [f32]) {
+    debug_assert!(buffer.len() >= 256, "Buffer must be at least 256 elements");
+    
+    // Clear the buffer (optimized: only clear if needed)
+    buffer[..256].fill(0.0);
     
     for row in 0..4 {
         for col in 0..4 {
             let cell_idx = row * 4 + col;
             let val = board.get(row, col) as usize;
-            features[cell_idx * 16 + val] = 1.0;
+            buffer[cell_idx * 16 + val] = 1.0;
         }
     }
-    
-    features
 }
 
 /// Extended features with additional game-relevant information.

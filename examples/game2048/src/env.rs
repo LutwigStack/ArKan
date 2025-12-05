@@ -2,43 +2,107 @@
 //!
 //! Provides a clean interface for agents to interact with the game.
 
-use crate::game::{Direction, Game};
+use crate::game::{Board, Direction, Game};
 use crate::utils;
 
+/// State dimension for one-hot encoding (16 cells * 16 values).
+pub const STATE_DIM: usize = 256;
+
 /// Experience tuple for replay buffer.
+/// Uses fixed-size arrays to avoid allocations.
 #[derive(Clone)]
 pub struct Experience {
-    pub state: Vec<f32>,
+    pub state: [f32; STATE_DIM],
     pub action: usize,
     pub reward: f32,
-    pub next_state: Vec<f32>,
+    pub next_state: [f32; STATE_DIM],
     pub done: bool,
 }
 
-/// RL Environment wrapper.
+impl Experience {
+    /// Creates a new experience with pre-allocated arrays.
+    pub fn new() -> Self {
+        Self {
+            state: [0.0; STATE_DIM],
+            action: 0,
+            reward: 0.0,
+            next_state: [0.0; STATE_DIM],
+            done: false,
+        }
+    }
+
+    /// Creates an experience from array references.
+    #[inline]
+    pub fn from_arrays(
+        state: &[f32; STATE_DIM],
+        action: usize,
+        reward: f32,
+        next_state: &[f32; STATE_DIM],
+        done: bool,
+    ) -> Self {
+        Self {
+            state: *state,
+            action,
+            reward,
+            next_state: *next_state,
+            done,
+        }
+    }
+}
+
+impl Default for Experience {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RL Environment wrapper with pre-allocated state buffers.
 pub struct Env {
     game: Game,
-    state_dim: usize,
+    /// Pre-allocated buffer for current state.
+    state_buffer: [f32; STATE_DIM],
 }
 
 impl Env {
     /// Creates a new environment.
     pub fn new() -> Self {
-        Self {
+        let mut env = Self {
             game: Game::new(),
-            state_dim: 16, // 4x4 board
-        }
+            state_buffer: [0.0; STATE_DIM],
+        };
+        env.update_state_buffer();
+        env
+    }
+
+    /// Updates internal state buffer from game board.
+    #[inline]
+    fn update_state_buffer(&mut self) {
+        utils::board_to_onehot_inplace(&self.game.board, &mut self.state_buffer);
     }
 
     /// Resets the environment and returns initial state.
     pub fn reset(&mut self) -> Vec<f32> {
         self.game = Game::new();
-        self.get_state()
+        self.update_state_buffer();
+        self.state_buffer.to_vec()
     }
 
     /// Gets the current state as one-hot encoded vector (256 features).
+    /// Note: Returns a clone. Use get_state_ref for zero-copy access.
     pub fn get_state(&self) -> Vec<f32> {
-        utils::board_to_onehot(&self.game.board)
+        self.state_buffer.to_vec()
+    }
+
+    /// Gets a reference to the current state buffer (zero-copy).
+    #[inline]
+    pub fn get_state_ref(&self) -> &[f32; STATE_DIM] {
+        &self.state_buffer
+    }
+
+    /// Copies current state into provided buffer.
+    #[inline]
+    pub fn copy_state_to(&self, dest: &mut [f32; STATE_DIM]) {
+        *dest = self.state_buffer;
     }
 
     /// Takes an action and returns (next_state, reward, done).
@@ -46,10 +110,36 @@ impl Env {
         let dir = Direction::from_index(action);
         let (reward, _changed) = self.game.make_move(dir);
         
-        let next_state = self.get_state();
+        self.update_state_buffer();
         let done = self.game.game_over;
 
-        (next_state, reward, done)
+        (self.state_buffer.to_vec(), reward, done)
+    }
+
+    /// Gets a reference to the game board.
+    #[inline]
+    pub fn board(&self) -> &Board {
+        &self.game.board
+    }
+
+    /// Takes an action and fills Experience struct (zero-copy friendly).
+    /// Returns reward and done flag.
+    #[inline]
+    pub fn step_into(&mut self, action: usize, exp: &mut Experience) -> (f32, bool) {
+        // Copy current state before move
+        exp.state = self.state_buffer;
+        exp.action = action;
+        
+        let dir = Direction::from_index(action);
+        let (reward, _changed) = self.game.make_move(dir);
+        
+        self.update_state_buffer();
+        
+        exp.reward = reward;
+        exp.next_state = self.state_buffer;
+        exp.done = self.game.game_over;
+        
+        (reward, self.game.game_over)
     }
 
     /// Returns current score.
@@ -69,7 +159,7 @@ impl Env {
 
     /// Returns the state dimension.
     pub fn state_dim(&self) -> usize {
-        self.state_dim
+        STATE_DIM
     }
 
     /// Returns the action dimension (4 directions).
@@ -100,6 +190,7 @@ impl Default for Env {
 }
 
 /// Replay buffer for experience replay.
+/// Optimized to minimize allocations during sampling.
 pub struct ReplayBuffer {
     buffer: Vec<Experience>,
     capacity: usize,
@@ -117,6 +208,7 @@ impl ReplayBuffer {
     }
 
     /// Stores an experience.
+    #[inline]
     pub fn push(&mut self, exp: Experience) {
         if self.buffer.len() < self.capacity {
             self.buffer.push(exp);
@@ -127,6 +219,7 @@ impl ReplayBuffer {
     }
 
     /// Returns the number of experiences stored.
+    #[inline]
     pub fn len(&self) -> usize {
         self.buffer.len()
     }
@@ -136,43 +229,85 @@ impl ReplayBuffer {
         self.buffer.is_empty()
     }
 
-    /// Samples a random batch.
-    pub fn sample(&self, batch_size: usize) -> Option<Vec<Experience>> {
+    /// Samples random indices for a batch (for lock-free pattern).
+    pub fn sample_indices(&self, batch_size: usize) -> Option<Vec<usize>> {
+        if self.buffer.len() < batch_size {
+            return None;
+        }
+        
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let len = self.buffer.len();
+        
+        Some((0..batch_size).map(|_| rng.gen_range(0..len)).collect())
+    }
+
+    /// Samples a batch into pre-allocated buffers (minimal allocations).
+    /// Returns batch_size on success.
+    pub fn sample_batch_into(
+        &self,
+        batch_size: usize,
+        states: &mut Vec<f32>,
+        actions: &mut Vec<usize>,
+        rewards: &mut Vec<f32>,
+        next_states: &mut Vec<f32>,
+        dones: &mut Vec<bool>,
+    ) -> Option<usize> {
         if self.buffer.len() < batch_size {
             return None;
         }
 
-        use rand::seq::SliceRandom;
+        use rand::Rng;
         let mut rng = rand::thread_rng();
-        Some(
-            self.buffer
-                .choose_multiple(&mut rng, batch_size)
-                .cloned()
-                .collect(),
-        )
+        let len = self.buffer.len();
+
+        // Clear and ensure capacity
+        states.clear();
+        actions.clear();
+        rewards.clear();
+        next_states.clear();
+        dones.clear();
+        
+        states.reserve(batch_size * STATE_DIM);
+        actions.reserve(batch_size);
+        rewards.reserve(batch_size);
+        next_states.reserve(batch_size * STATE_DIM);
+        dones.reserve(batch_size);
+
+        for _ in 0..batch_size {
+            let idx = rng.gen_range(0..len);
+            let exp = &self.buffer[idx];
+            
+            states.extend_from_slice(&exp.state);
+            actions.push(exp.action);
+            rewards.push(exp.reward);
+            next_states.extend_from_slice(&exp.next_state);
+            dones.push(exp.done);
+        }
+
+        Some(batch_size)
     }
 
     /// Samples a batch and returns as separate vectors.
+    /// Legacy API - prefer sample_batch_into for performance.
     pub fn sample_batch(
         &self,
         batch_size: usize,
     ) -> Option<(Vec<f32>, Vec<usize>, Vec<f32>, Vec<f32>, Vec<bool>)> {
-        let batch = self.sample(batch_size)?;
-        let state_dim = batch[0].state.len();
-
-        let mut states = Vec::with_capacity(batch_size * state_dim);
-        let mut actions = Vec::with_capacity(batch_size);
-        let mut rewards = Vec::with_capacity(batch_size);
-        let mut next_states = Vec::with_capacity(batch_size * state_dim);
-        let mut dones = Vec::with_capacity(batch_size);
-
-        for exp in batch {
-            states.extend(&exp.state);
-            actions.push(exp.action);
-            rewards.push(exp.reward);
-            next_states.extend(&exp.next_state);
-            dones.push(exp.done);
-        }
+        let mut states = Vec::new();
+        let mut actions = Vec::new();
+        let mut rewards = Vec::new();
+        let mut next_states = Vec::new();
+        let mut dones = Vec::new();
+        
+        self.sample_batch_into(
+            batch_size,
+            &mut states,
+            &mut actions,
+            &mut rewards,
+            &mut next_states,
+            &mut dones,
+        )?;
 
         Some((states, actions, rewards, next_states, dones))
     }
