@@ -117,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### **Ограничения GPU (wgpu 0.23)**
 
 - **Нет пробрасывания DeviceLost:** wgpu 0.23 не предоставляет ошибки `DeviceLost`. Падение GPU может выглядеть как зависание вместо корректной ошибки.
-- **Лимит памяти:** `MAX_VRAM_ALLOC = 2GB` на буфер. Превышение возвращает ошибку `BatchTooLarge`.
+- **Лимит памяти:** По умолчанию `MAX_VRAM_ALLOC = 2GB` на буфер. Настраивается через `WgpuOptions`. Для больших тензоров рекомендуется ~30% от реального VRAM (например, 3GB для RTX 4070 SUPER с 12GB).
 - **Vec4 выравнивание:** Веса дополняются до границы vec4 (4 элемента) для эффективности шейдеров.
 - **CPU fallback:** Если GPU недоступен, инициализация бэкенда корректно завершается с ошибкой `AdapterNotFound`.
 
@@ -369,18 +369,27 @@ let loss = gpu_network.train_step_with_options(
 ### **GPU Limitations (wgpu 0.23)**
 
 - **No DeviceLost propagation:** wgpu 0.23 does not expose `DeviceLost` errors. GPU crashes may appear as hangs instead of proper errors.
-- **Memory limits:** `MAX_VRAM_ALLOC = 2GB` per buffer. Exceeding this returns `BatchTooLarge` error.
+- **Memory limits:** Default `MAX_VRAM_ALLOC = 2GB` per buffer. Configurable via `WgpuOptions`. For large tensors, use ~30% of your actual VRAM (e.g., 3GB for RTX 4070 SUPER with 12GB).
 - **Vec4 alignment:** Weights are padded to vec4 (4-element) boundaries for shader efficiency.
 - **CPU fallback:** If GPU is unavailable, the backend initialization fails gracefully with `AdapterNotFound`.
 
 ### **Choosing Backend**
 
 ```rust,ignore
-// High-performance GPU (default)
+// High-performance GPU (default, 2GB limit)
 let backend = WgpuBackend::init(WgpuOptions::default())?;
 
-// Compute-optimized (larger buffers)
+// Compute-optimized (unlimited VRAM)
 let backend = WgpuBackend::init(WgpuOptions::compute())?;
+
+// Custom VRAM limit in GB (recommended for known hardware)
+let backend = WgpuBackend::init(WgpuOptions::with_max_vram(3))?; // 3GB
+
+// Percentage of device max (works on AMD/Intel, not useful for NVIDIA)
+let backend = WgpuBackend::init(WgpuOptions::with_max_vram_percent(30))?;
+
+// No VRAM limit (use device max)
+let backend = WgpuBackend::init(WgpuOptions::unlimited_vram())?;
 
 // Low-memory/integrated GPU
 let backend = WgpuBackend::init(WgpuOptions::low_memory())?;

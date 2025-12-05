@@ -121,6 +121,77 @@ impl GpuTensor {
         })
     }
 
+    /// Creates a new GPU tensor with a custom VRAM limit.
+    ///
+    /// Use this instead of `upload()` when you need to bypass the default 2GB limit.
+    /// For RTX 4070 SUPER (12GB), you can use 8GB or more.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - The wgpu device to create the buffer on.
+    /// * `data` - The f32 data to upload.
+    /// * `shape` - The logical shape of the tensor.
+    /// * `max_vram_alloc` - Maximum allowed allocation in bytes, or None for no limit.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use arkan::gpu::{GpuTensor, WgpuBackend, WgpuOptions};
+    ///
+    /// let backend = WgpuBackend::init(WgpuOptions::with_max_vram(8))?;
+    /// let data: Vec<f32> = vec![0.0; 1024 * 1024 * 1024]; // 4GB
+    ///
+    /// // Use backend's configured limit
+    /// let tensor = GpuTensor::upload_with_limit(
+    ///     &backend.device,
+    ///     &data,
+    ///     vec![data.len()],
+    ///     Some(backend.max_vram_alloc())
+    /// )?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn upload_with_limit(
+        device: &wgpu::Device,
+        data: &[f32],
+        shape: Vec<usize>,
+        max_vram_alloc: Option<u64>,
+    ) -> ArkanResult<Self> {
+        let expected_len: usize = shape.iter().product();
+        if data.len() != expected_len {
+            let got_shape = infer_got_shape(data.len(), &shape);
+            return Err(ArkanError::ShapeMismatch {
+                expected: shape,
+                got: got_shape,
+            });
+        }
+
+        let size_bytes = std::mem::size_of_val(data) as u64;
+
+        // Check limit if specified
+        if let Some(max_alloc) = max_vram_alloc {
+            if size_bytes > max_alloc {
+                return Err(ArkanError::batch_too_large(
+                    data.len(),
+                    (max_alloc / std::mem::size_of::<f32>() as u64) as usize,
+                ));
+            }
+        }
+
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("GpuTensor"),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        Ok(Self {
+            buffer,
+            shape,
+            capacity_bytes: size_bytes,
+        })
+    }
+
     /// Creates a new GPU tensor with uninitialized data.
     ///
     /// # Arguments

@@ -17,6 +17,41 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
+/// Unpads weight gradients from GPU format (basis_padded) to CPU format (global_basis_size).
+///
+/// GPU stores weights with padding for vec4 alignment:
+/// - GPU: [out_dim, in_dim, basis_padded] where basis_padded = align4(global_basis_size)
+/// - CPU: [out_dim, in_dim, global_basis_size]
+///
+/// This function strips the padding to make gradients compatible with CPU optimizer.
+fn unpad_weights(
+    padded: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+    global_basis_size: usize,
+    basis_padded: usize,
+) -> Vec<f32> {
+    // If no padding needed, return as-is
+    if global_basis_size == basis_padded {
+        return padded.to_vec();
+    }
+
+    let cpu_size = out_dim * in_dim * global_basis_size;
+    let mut result = Vec::with_capacity(cpu_size);
+
+    for o in 0..out_dim {
+        for i in 0..in_dim {
+            let padded_offset = (o * in_dim + i) * basis_padded;
+            // Copy only global_basis_size elements, skip padding
+            for b in 0..global_basis_size {
+                result.push(padded[padded_offset + b]);
+            }
+        }
+    }
+
+    result
+}
+
 /// Handle for asynchronous GPU forward pass result.
 ///
 /// Created by [`GpuNetwork::forward_batch_async`]. This handle allows you to
@@ -225,6 +260,9 @@ pub struct GpuNetwork {
     /// B-spline order (2-5).
     spline_order: usize,
 
+    /// Maximum VRAM allocation per buffer.
+    max_vram_alloc: u64,
+
     /// Workspace bind group layout.
     workspace_layout: wgpu::BindGroupLayout,
 }
@@ -268,6 +306,9 @@ impl GpuNetwork {
         let output_dim = cpu_network.config.output_dim;
         let spline_order = cpu_network.config.spline_order;
 
+        // Store max_vram_alloc from backend
+        let max_vram_alloc = backend.max_vram_alloc();
+
         // layer_dims: [input_dim, hidden_0, hidden_1, ..., output_dim]
         // Used for intermediate buffer sizing
         let mut layer_dims = vec![input_dim];
@@ -285,13 +326,25 @@ impl GpuNetwork {
             output_dim,
             layer_dims,
             spline_order,
+            max_vram_alloc,
             workspace_layout,
         })
     }
 
-    /// Creates a GPU workspace for this network.
+    /// Creates a GPU workspace for this network with configured VRAM limit.
     pub fn create_workspace(&self, max_batch: usize) -> ArkanResult<GpuWorkspace> {
-        GpuWorkspace::new(&self.device, max_batch, self.input_dim, self.output_dim)
+        GpuWorkspace::new_with_limit(
+            &self.device,
+            max_batch,
+            self.input_dim,
+            self.output_dim,
+            self.max_vram_alloc,
+        )
+    }
+
+    /// Returns the maximum VRAM allocation per buffer.
+    pub fn max_vram_alloc(&self) -> u64 {
+        self.max_vram_alloc
     }
 
     /// Warms up the GPU by compiling all necessary pipelines.
@@ -1195,11 +1248,22 @@ impl GpuNetwork {
             // Execute GPU backward for this layer
             self.backward_layer_gpu(layer_idx, batch_size, workspace, compute_input_grad)?;
 
-            // Download gradients from GPU
-            let layer_grad_weights =
+            // Download gradients from GPU (padded format)
+            let padded_grad_weights =
                 workspace.download_grad_weights(&self.device, &self.queue, layer_idx)?;
             let layer_grad_bias =
                 workspace.download_grad_bias(&self.device, &self.queue, layer_idx)?;
+
+            // Unpad gradients to match CPU weight layout
+            // GPU uses basis_padded (aligned to 4), CPU uses global_basis_size
+            let layer = &self.layers[layer_idx];
+            let layer_grad_weights = unpad_weights(
+                &padded_grad_weights,
+                layer.out_dim,
+                layer.in_dim,
+                layer.global_basis_size,
+                layer.basis_padded,
+            );
 
             grad_weights.push(layer_grad_weights);
             grad_biases.push(layer_grad_bias);
@@ -1991,10 +2055,28 @@ impl GpuNetwork {
         Ok(loss)
     }
 
-    /// Applies gradient clipping to gradients in workspace.
+    /// Applies gradient clipping to gradients in workspace (public API for testing).
     ///
     /// Computes L2 norm of all gradients and scales them down if norm > max_norm.
     /// This requires downloading gradients to CPU for norm calculation.
+    ///
+    /// # Arguments
+    ///
+    /// * `workspace` - GPU workspace containing gradient buffers
+    /// * `max_norm` - Maximum allowed L2 norm of gradients
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) if clipping was successful.
+    pub fn apply_gradient_clipping_public(
+        &self,
+        workspace: &mut GpuWorkspace,
+        max_norm: f32,
+    ) -> ArkanResult<()> {
+        self.apply_gradient_clipping(workspace, max_norm)
+    }
+
+    /// Internal gradient clipping implementation.
     fn apply_gradient_clipping(
         &self,
         workspace: &mut GpuWorkspace,

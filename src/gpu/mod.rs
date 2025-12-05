@@ -57,7 +57,7 @@ mod tensor;
 mod uniforms;
 mod workspace;
 
-pub use backend::{PowerPreference, WgpuBackend, WgpuOptions};
+pub use backend::{PowerPreference, VramLimit, WgpuBackend, WgpuOptions, DEFAULT_MAX_VRAM_ALLOC};
 pub use layer::GpuLayer;
 pub use network::{GpuForwardHandle, GpuMemoryStats, GpuNetwork};
 pub use optimizer::{
@@ -73,11 +73,16 @@ pub use tensor::{GpuTensor, GpuTensorView};
 pub use uniforms::LayerUniforms;
 pub use workspace::GpuWorkspace;
 
-/// Maximum VRAM allocation per buffer (2GB).
+/// Maximum VRAM allocation per buffer (2GB) - default value.
 ///
 /// This limit prevents excessive memory allocation on GPUs and ensures
 /// compatibility with most hardware configurations.
-pub const MAX_VRAM_ALLOC: u64 = 2 * 1024 * 1024 * 1024;
+///
+/// **Note:** This is the default limit. Use `WgpuOptions::with_max_vram(gb)`
+/// or `WgpuOptions::unlimited_vram()` to configure a custom limit.
+///
+/// For RTX 4070 SUPER (12GB), you can safely use 8GB or more.
+pub const MAX_VRAM_ALLOC: u64 = backend::DEFAULT_MAX_VRAM_ALLOC;
 
 /// Default alignment for GPU buffers (256 bytes).
 ///
@@ -85,10 +90,19 @@ pub const MAX_VRAM_ALLOC: u64 = 2 * 1024 * 1024 * 1024;
 /// meets the requirements for uniform buffer offsets.
 pub const GPU_BUFFER_ALIGNMENT: u64 = 256;
 
-/// Checks if a size in bytes exceeds the maximum VRAM allocation limit.
+/// Checks if a size in bytes exceeds the default VRAM allocation limit.
+///
+/// **Note:** For configurable limits, use `WgpuBackend::exceeds_vram_limit()`
+/// or `exceeds_vram_limit_with()`.
 #[inline]
 pub fn exceeds_vram_limit(size_bytes: u64) -> bool {
     size_bytes > MAX_VRAM_ALLOC
+}
+
+/// Checks if a size in bytes exceeds a custom VRAM allocation limit.
+#[inline]
+pub fn exceeds_vram_limit_with(size_bytes: u64, max_alloc: u64) -> bool {
+    size_bytes > max_alloc
 }
 
 /// Aligns a size to the specified alignment.
