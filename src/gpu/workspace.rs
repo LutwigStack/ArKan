@@ -326,11 +326,11 @@ impl GpuWorkspace {
         let max_dim = layer_dims.iter().max().copied().unwrap_or(self.in_dim);
 
         // Allocate grad_output if needed (uses max_dim for intermediate gradient propagation)
-        // Use map_or to avoid unwrap on Option
+        // Use is_none_or to avoid unwrap on Option
         let needs_grad_output_realloc = self
             .grad_output
             .as_ref()
-            .map_or(true, |g| g.shape[0] < batch_size || g.shape[1] < max_dim);
+            .is_none_or(|g| g.shape[0] < batch_size || g.shape[1] < max_dim);
         if needs_grad_output_realloc {
             self.grad_output = Some(GpuTensor::storage_read_write(
                 device,
@@ -343,7 +343,7 @@ impl GpuWorkspace {
         let needs_grad_input_realloc = self
             .grad_input
             .as_ref()
-            .map_or(true, |g| g.shape[0] < batch_size);
+            .is_none_or(|g| g.shape[0] < batch_size);
         if needs_grad_input_realloc {
             self.grad_input = Some(GpuTensor::storage_read_write(
                 device,
@@ -498,6 +498,46 @@ impl GpuWorkspace {
         let full_data = grad_input.download(device, queue)?;
         let used = batch_size * in_dim;
         Ok(full_data[..used].to_vec())
+    }
+
+    /// Copies grad_input to grad_output on GPU (no CPU round-trip).
+    ///
+    /// This is used during backward pass to propagate gradients between layers
+    /// without expensive GPU-to-CPU-to-GPU transfers.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - The wgpu device.
+    /// * `queue` - The wgpu queue.
+    /// * `batch_size` - Current batch size.
+    /// * `dim` - Dimension of the gradient (in_dim of current layer).
+    pub fn copy_grad_input_to_grad_output(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch_size: usize,
+        dim: usize,
+    ) -> ArkanResult<()> {
+        let grad_input = self
+            .grad_input
+            .as_ref()
+            .ok_or_else(|| ArkanError::buffer("grad_input not allocated"))?;
+        let grad_output = self
+            .grad_output
+            .as_ref()
+            .ok_or_else(|| ArkanError::buffer("grad_output not allocated"))?;
+
+        let copy_size = (batch_size * dim * std::mem::size_of::<f32>()) as u64;
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("copy_grad_input_to_grad_output"),
+        });
+
+        encoder.copy_buffer_to_buffer(&grad_input.buffer, 0, &grad_output.buffer, 0, copy_size);
+
+        queue.submit(std::iter::once(encoder.finish()));
+
+        Ok(())
     }
 
     /// Gets or creates the bind group for input/output buffers.
@@ -670,7 +710,7 @@ impl GpuWorkspace {
         if self
             .cached_training_bind_groups
             .get(layer_idx)
-            .map_or(false, |bg| bg.is_some())
+            .is_some_and(|bg| bg.is_some())
         {
             return self.cached_training_bind_groups[layer_idx]
                 .as_ref()

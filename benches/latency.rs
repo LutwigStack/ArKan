@@ -209,8 +209,8 @@ fn bench_poker_workload(c: &mut Criterion) {
                 .cloned()
                 .fold(f32::NEG_INFINITY, f32::max);
             let sum: f32 = output[..8].iter().map(|x| (x - max).exp()).sum();
-            for i in 0..8 {
-                output[i] = (output[i] - max).exp() / sum;
+            for out in output.iter_mut().take(8) {
+                *out = (*out - max).exp() / sum;
             }
             black_box(&output);
         });

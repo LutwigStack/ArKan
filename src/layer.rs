@@ -53,7 +53,7 @@ use rand::{Rng, SeedableRng};
 use wide::{f32x4, f32x8};
 
 #[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// A single KAN layer with learnable spline coefficients.
 ///
@@ -85,7 +85,7 @@ use serde::{Deserialize, Serialize};
 /// assert_eq!(layer.param_count(), 4 * 8 * (config.grid_size + config.spline_order) + 8);
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct KanLayer {
     /// Input dimension.
     pub in_dim: usize,
@@ -103,7 +103,7 @@ pub struct KanLayer {
     pub basis_aligned: usize,
     /// Grid range (min, max) for input normalization.
     pub grid_range: (f32, f32),
-    /// Precomputed knot vector (skipped during serialization).
+    /// Precomputed knot vector (recomputed after deserialization).
     #[cfg_attr(feature = "serde", serde(skip))]
     knots: Vec<f32>,
     /// Per-input normalization mean.
@@ -117,6 +117,55 @@ pub struct KanLayer {
     /// SIMD width for aligned operations.
     #[allow(dead_code)]
     simd_width: usize,
+}
+
+// Custom Deserialize implementation that recomputes knots after loading
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for KanLayer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Helper struct for deserialization (same fields minus knots)
+        #[derive(Deserialize)]
+        struct KanLayerData {
+            in_dim: usize,
+            out_dim: usize,
+            order: usize,
+            grid_size: usize,
+            global_basis_size: usize,
+            local_basis_size: usize,
+            basis_aligned: usize,
+            grid_range: (f32, f32),
+            mean: Vec<f32>,
+            std: Vec<f32>,
+            weights: Vec<f32>,
+            bias: Vec<f32>,
+            simd_width: usize,
+        }
+
+        let data = KanLayerData::deserialize(deserializer)?;
+
+        // Recompute knots from grid_size, order, and grid_range
+        let knots = compute_knots(data.grid_size, data.order, data.grid_range);
+
+        Ok(KanLayer {
+            in_dim: data.in_dim,
+            out_dim: data.out_dim,
+            order: data.order,
+            grid_size: data.grid_size,
+            global_basis_size: data.global_basis_size,
+            local_basis_size: data.local_basis_size,
+            basis_aligned: data.basis_aligned,
+            grid_range: data.grid_range,
+            knots,
+            mean: data.mean,
+            std: data.std,
+            weights: data.weights,
+            bias: data.bias,
+            simd_width: data.simd_width,
+        })
+    }
 }
 
 impl KanLayer {
@@ -213,7 +262,8 @@ impl KanLayer {
         };
 
         // Initialize weights with small random values (Xavier-like)
-        let scale = (2.0 / (in_dim + out_dim) as f32).sqrt() * 0.1;
+        // KAN needs larger initialization because B-splines have bounded support
+        let scale = (2.0 / (in_dim + out_dim) as f32).sqrt();
         let mut rng: SmallRng = if let Some(seed) = config.init_seed {
             SmallRng::seed_from_u64(seed)
         } else {

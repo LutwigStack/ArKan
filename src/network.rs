@@ -598,6 +598,74 @@ impl KanNetwork {
         result
     }
 
+    /// Parallel forward pass for batch inference.
+    ///
+    /// This method processes samples in parallel using rayon, which is faster
+    /// for large batches on multi-core CPUs. Each sample gets its own workspace
+    /// allocated via thread-local storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data `[batch_size * input_dim]`
+    /// * `output` - Output buffer `[batch_size * output_dim]`
+    ///
+    /// # Performance
+    ///
+    /// - Use for batch_size >= 32 on multi-core systems
+    /// - For small batches, use [`forward_batch`](Self::forward_batch) instead
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let config = KanConfig::preset();
+    /// let network = KanNetwork::new(config.clone());
+    ///
+    /// let batch_size = 256;
+    /// let input = vec![0.5f32; batch_size * config.input_dim];
+    /// let mut output = vec![0.0f32; batch_size * config.output_dim];
+    ///
+    /// network.forward_batch_parallel(&input, &mut output);
+    /// ```
+    pub fn forward_batch_parallel(&self, input: &[f32], output: &mut [f32]) {
+        use rayon::prelude::*;
+        use std::cell::RefCell;
+
+        let batch_size = input.len() / self.config.input_dim;
+        let in_dim = self.config.input_dim;
+        let out_dim = self.config.output_dim;
+
+        debug_assert_eq!(input.len(), batch_size * in_dim);
+        debug_assert_eq!(output.len(), batch_size * out_dim);
+
+        // Thread-local workspace
+        thread_local! {
+            static LOCAL_WORKSPACE: RefCell<Option<Workspace>> = const { RefCell::new(None) };
+        }
+
+        let config = &self.config;
+
+        // Process samples in parallel, writing directly to output slices
+        output
+            .par_chunks_mut(out_dim)
+            .enumerate()
+            .for_each(|(b, out_slice)| {
+                let in_start = b * in_dim;
+                let in_slice = &input[in_start..in_start + in_dim];
+
+                LOCAL_WORKSPACE.with(|ws_cell| {
+                    let mut ws_ref = ws_cell.borrow_mut();
+                    if ws_ref.is_none() {
+                        *ws_ref = Some(Workspace::new(config));
+                    }
+                    let workspace = ws_ref.as_mut().unwrap();
+
+                    self.forward_single(in_slice, out_slice, workspace);
+                });
+            });
+    }
+
     /// Forward pass for training: stores per-layer normalized inputs and grid indices.
     ///
     /// This method extends [`forward_batch`](Self::forward_batch) by saving
@@ -684,24 +752,24 @@ impl KanNetwork {
             buffer_a.try_resize(ping_pong_size)?;
             buffer_b.try_resize(ping_pong_size)?;
 
-            let mut current_is_a = true;
+            // Ping-pong buffer tracking:
+            // - After each layer, current_is_a indicates which buffer CONTAINS the output
+            // - Next layer reads from that buffer and writes to the other
+            let mut current_is_a = false; // Will become true after layer 0 writes to buffer_a
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let in_size = checked_buffer_size(batch_size, layer.in_dim)?;
                 let out_size = checked_buffer_size(batch_size, layer.out_dim)?;
 
+                // Determine input source and output destination
                 let (input_slice, output_buf): (&[f32], &mut _) = if layer_idx == 0 {
-                    (
-                        input,
-                        if current_is_a {
-                            &mut buffer_a
-                        } else {
-                            &mut buffer_b
-                        },
-                    )
+                    // First layer: read from input slice, write to buffer_a
+                    (input, &mut buffer_a)
                 } else if current_is_a {
+                    // Previous layer wrote to buffer_a, read from there, write to buffer_b
                     (&buffer_a.as_slice()[..in_size], &mut buffer_b)
                 } else {
+                    // Previous layer wrote to buffer_b, read from there, write to buffer_a
                     (&buffer_b.as_slice()[..in_size], &mut buffer_a)
                 };
 
@@ -723,7 +791,14 @@ impl KanNetwork {
                     output.copy_from_slice(&output_buf.as_slice()[..out_size]);
                 }
 
-                current_is_a = !current_is_a;
+                // After writing, update current_is_a to indicate where the output now lives
+                // Layer 0 always writes to buffer_a, so current_is_a becomes true
+                // Subsequent layers toggle: if we just read from A and wrote to B, current_is_a = false
+                if layer_idx == 0 {
+                    current_is_a = true; // Layer 0 always outputs to buffer_a
+                } else {
+                    current_is_a = !current_is_a;
+                }
             }
 
             Ok(())
@@ -1524,8 +1599,8 @@ mod tests {
         let mut network = KanNetwork::new(config.clone());
         let mut workspace = network.create_workspace(1);
 
-        let input = vec![0.25f32, -0.4];
-        let target = vec![0.1f32];
+        let input = [0.25f32, -0.4];
+        let target = [0.1f32];
 
         // Прямой проход с записью истории
         let mut preds = vec![0.0f32; 1];
@@ -1558,6 +1633,7 @@ mod tests {
         ws_num.reserve(1, &config);
         let mut out_buf = vec![0.0f32; 1];
 
+        #[allow(clippy::needless_range_loop)]
         for idx in 0..network.layers[0].weights.len() {
             let orig = network.layers[0].weights[idx];
 

@@ -1,0 +1,8 @@
+[package]
+name = "sinusoid"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arkan = { path = "../../" }
+rand = "0.8"

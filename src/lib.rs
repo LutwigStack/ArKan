@@ -188,7 +188,9 @@ mod tests {
 
     #[test]
     fn test_version() {
-        assert!(!VERSION.is_empty());
+        // VERSION is a static string, so we just verify it exists and is not empty
+        let v = VERSION;
+        assert!(!v.is_empty());
     }
 
     #[test]

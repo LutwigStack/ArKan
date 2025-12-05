@@ -1,0 +1,18 @@
+[package]
+name = "mnist"
+version = "0.1.0"
+edition = "2021"
+description = "MNIST classification using ArKan KAN network"
+
+[features]
+default = []
+gpu = ["arkan/gpu"]
+
+[dependencies]
+arkan = { path = "../.." }
+rand = "0.8"
+rayon = "1.10"
+indicatif = "0.17"
+
+# For loading MNIST data
+mnist = "0.6"
