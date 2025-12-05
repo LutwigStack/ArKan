@@ -6,19 +6,34 @@
 //! # Usage
 //!
 //! ```bash
-//! # Download MNIST data first (will be downloaded automatically)
+//! # CPU training
 //! cargo run --release
+//!
+//! # GPU training (requires 'gpu' feature)
+//! cargo run --release --features gpu -- --gpu
 //! ```
 
 use arkan::{KanConfigBuilder, KanNetwork, Workspace, TrainOptions};
-use indicatif::{ProgressBar, ProgressStyle};
 use mnist::{Mnist, MnistBuilder};
 use rand::seq::SliceRandom;
 use std::time::Instant;
 
-/// Normalize pixel values to [-1, 1] range (matching KAN grid range)
-fn normalize_image(pixels: &[u8]) -> Vec<f32> {
-    pixels.iter().map(|&p| (p as f32 / 127.5) - 1.0).collect()
+#[cfg(feature = "gpu")]
+use arkan::gpu::{GpuNetwork, GpuAdam, GpuAdamConfig, WgpuBackend, WgpuOptions};
+
+/// Normalize pixel values using z-score standardization
+fn normalize_image(pixels: &[u8], mean: f32, std: f32) -> Vec<f32> {
+    pixels.iter().map(|&p| ((p as f32) - mean) / std).collect()
+}
+
+/// Compute mean and std of the entire dataset
+fn compute_stats(images: &[u8]) -> (f32, f32) {
+    let total_pixels = images.len();
+    let mean = images.iter().map(|&p| p as f64).sum::<f64>() / total_pixels as f64;
+    let variance = images.iter()
+        .map(|&p| (p as f64 - mean).powi(2))
+        .sum::<f64>() / total_pixels as f64;
+    (mean as f32, variance.sqrt() as f32)
 }
 
 /// Convert label to one-hot encoding
@@ -26,14 +41,6 @@ fn one_hot(label: u8, num_classes: usize) -> Vec<f32> {
     let mut oh = vec![0.0f32; num_classes];
     oh[label as usize] = 1.0;
     oh
-}
-
-/// Softmax function for output probabilities
-fn softmax(x: &[f32]) -> Vec<f32> {
-    let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp: Vec<f32> = x.iter().map(|&v| (v - max).exp()).collect();
-    let sum: f32 = exp.iter().sum();
-    exp.iter().map(|&e| e / sum).collect()
 }
 
 /// Get predicted class from output
@@ -45,19 +52,20 @@ fn argmax(x: &[f32]) -> usize {
         .unwrap_or(0)
 }
 
-/// Cross-entropy loss
-fn cross_entropy_loss(predicted: &[f32], target: &[f32]) -> f32 {
-    let probs = softmax(predicted);
-    -target
-        .iter()
-        .zip(probs.iter())
-        .map(|(&t, &p)| t * (p + 1e-10).ln())
-        .sum::<f32>()
+/// Parse command line arguments
+fn parse_args() -> bool {
+    std::env::args().any(|arg| arg == "--gpu")
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let use_gpu = parse_args();
+    
     println!("╔═══════════════════════════════════════════════════════════╗");
-    println!("║         MNIST Classification with ArKan KAN               ║");
+    if use_gpu {
+        println!("║     MNIST Classification with ArKan KAN (GPU Mode)        ║");
+    } else {
+        println!("║     MNIST Classification with ArKan KAN (CPU Mode)        ║");
+    }
     println!("╚═══════════════════════════════════════════════════════════╝");
     println!();
 
@@ -81,53 +89,85 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Test samples:     {}", test_size);
     println!();
 
-    // Prepare training data
+    // Compute dataset statistics for z-score normalization
     println!("🔧 Preparing data...");
+    let (mean, std) = compute_stats(&trn_img);
+    
     let train_images: Vec<Vec<f32>> = (0..train_size)
-        .map(|i| normalize_image(&trn_img[i * 784..(i + 1) * 784]))
+        .map(|i| normalize_image(&trn_img[i * 784..(i + 1) * 784], mean, std))
         .collect();
     let train_labels: Vec<Vec<f32>> = trn_lbl.iter().map(|&l| one_hot(l, 10)).collect();
 
     let test_images: Vec<Vec<f32>> = (0..test_size)
-        .map(|i| normalize_image(&tst_img[i * 784..(i + 1) * 784]))
+        .map(|i| normalize_image(&tst_img[i * 784..(i + 1) * 784], mean, std))
         .collect();
     let test_labels: Vec<u8> = tst_lbl.clone();
 
-    // Create KAN network
-    // Architecture: 784 (28x28) -> 32 -> 10 (digits)
-    // Simpler network for faster convergence
+    // Create KAN network - optimized architecture
     println!("🧠 Creating KAN network...");
     let config = KanConfigBuilder::new()
-        .input_dim(784)           // 28x28 pixels
-        .hidden_dims(vec![32])    // Single hidden layer
-        .output_dim(10)           // 10 digit classes
-        .spline_order(3)          // Cubic splines
-        .grid_size(5)             // 5 grid points
-        .grid_range(-1.0, 1.0)    // Match normalized input range
+        .input_dim(784)                    // 28x28 pixels
+        .hidden_dims(vec![64, 32])         // Two hidden layers (best so far)
+        .output_dim(10)                    // 10 digit classes
+        .spline_order(3)                   // Cubic splines (optimal)
+        .grid_size(12)                     // Grid 12 (best result: 92.76%)
+        .grid_range(-3.0, 3.0)             // Z-score range
         .build()?;
 
-    println!("  Architecture: 784 -> 32 -> 10");
+    println!("  Architecture: 784 -> 64 -> 32 -> 10");
+    println!("  Grid size:    12, Spline order: 3");
     println!();
 
     let mut network = KanNetwork::new(config.clone());
     let mut workspace = Workspace::new(&config);
 
     let train_opts = TrainOptions {
-        max_grad_norm: Some(5.0),  // Increased clip threshold
-        weight_decay: 0.0,        // No weight decay for now
+        max_grad_norm: Some(1.0),
+        weight_decay: 0.0,                 // No weight decay - try without
     };
 
     // Training parameters
-    let epochs = 10;
-    let batch_size = 128;  // Larger batch
-    let learning_rate = 0.01f32;  // Much higher learning rate
+    let epochs = if use_gpu { 50 } else { 5 };
+    let batch_size = if use_gpu { 256 } else { 512 };
+    let initial_lr = if use_gpu { 0.02f32 } else { 0.03f32 };
     let num_batches = train_size / batch_size;
 
     println!("🎯 Training configuration:");
     println!("  Epochs:      {}", epochs);
     println!("  Batch size:  {}", batch_size);
-    println!("  Batches:     {}", num_batches);
+    println!("  Batches/epoch: {}", num_batches);
+    println!("  Initial LR:  {} (cosine decay)", initial_lr);
     println!();
+
+    // GPU setup if enabled
+    #[cfg(feature = "gpu")]
+    let (_gpu_backend, mut gpu_network, mut gpu_workspace, mut gpu_optimizer) = if use_gpu {
+        println!("🖥️  Initializing GPU backend...");
+        let backend = WgpuBackend::init(WgpuOptions::default())?;
+        println!("  Device: {}", backend.adapter_info().name);
+        
+        let mut gpu_net = GpuNetwork::from_cpu(&backend, &network)?;
+        let gpu_ws = gpu_net.create_workspace(batch_size)?;
+        
+        let layer_sizes = gpu_net.layer_param_sizes();
+        let optimizer = GpuAdam::new(
+            backend.device_arc(),
+            backend.queue_arc(),
+            &layer_sizes,
+            GpuAdamConfig::with_lr(initial_lr),
+        );
+        
+        let mem_stats = gpu_net.memory_stats();
+        println!("  GPU Memory: {:.2} MB", mem_stats.total_mb());
+        println!();
+        
+        (Some(backend), Some(gpu_net), Some(gpu_ws), Some(optimizer))
+    } else {
+        (None, None, None, None)
+    };
+
+    #[cfg(not(feature = "gpu"))]
+    let _use_gpu = false;
 
     // Training loop
     println!("🚀 Starting training...");
@@ -138,22 +178,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for epoch in 1..=epochs {
         let epoch_start = Instant::now();
+        
+        // Cosine annealing learning rate
+        let lr = initial_lr * 0.5 * (1.0 + (std::f32::consts::PI * epoch as f32 / epochs as f32).cos());
+        
+        // Update LR for GPU optimizer
+        #[cfg(feature = "gpu")]
+        if use_gpu {
+            if let Some(ref mut gpu_opt) = gpu_optimizer {
+                gpu_opt.set_lr(lr);
+            }
+        }
 
         // Shuffle training data
         indices.shuffle(&mut rand::thread_rng());
 
-        let pb = ProgressBar::new(num_batches as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} Epoch {msg} [{bar:30.cyan/blue}] {pos}/{len}")
-                .unwrap()
-                .progress_chars("█▓░"),
-        );
-        pb.set_message(format!("{}/{}", epoch, epochs));
-
-        let mut epoch_loss = 0.0f32;
-        let mut correct = 0usize;
-
+        // Train all batches - NO progress bar, NO accuracy check during training
+        // Just pure training for maximum speed
         for batch_idx in 0..num_batches {
             let batch_start = batch_idx * batch_size;
             let batch_indices = &indices[batch_start..batch_start + batch_size];
@@ -168,58 +209,107 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .flat_map(|&i| train_labels[i].iter().cloned())
                 .collect();
 
-            // Forward pass to compute predictions (for accuracy)
-            let mut batch_outputs = vec![0.0f32; batch_size * 10];
-            for (i, &idx) in batch_indices.iter().enumerate() {
-                let input = &train_images[idx];
-                let output = &mut batch_outputs[i * 10..(i + 1) * 10];
-                network.forward_single(input, output, &mut workspace);
-
-                // Check if prediction is correct
-                let predicted = argmax(output);
-                let actual = trn_lbl[idx] as usize;
-                if predicted == actual {
-                    correct += 1;
-                }
-
-                // Accumulate loss
-                epoch_loss += cross_entropy_loss(output, &train_labels[idx]);
+            #[cfg(feature = "gpu")]
+            if use_gpu {
+                let gpu_net = gpu_network.as_mut().unwrap();
+                let gpu_ws = gpu_workspace.as_mut().unwrap();
+                let gpu_opt = gpu_optimizer.as_mut().unwrap();
+                let _ = gpu_net.train_step_gpu_native(
+                    &batch_inputs, &batch_targets, batch_size, gpu_ws, gpu_opt,
+                )?;
             }
 
-            // Training step with SGD
-            network.train_step_with_options(
-                &batch_inputs,
-                &batch_targets,
-                None,  // No mask
-                learning_rate,
-                &mut workspace,
-                &train_opts,
-            );
-
-            pb.inc(1);
+            #[cfg(feature = "gpu")]
+            if !use_gpu {
+                network.train_step_with_options(
+                    &batch_inputs, &batch_targets, None, lr, &mut workspace, &train_opts,
+                );
+            }
+            
+            #[cfg(not(feature = "gpu"))]
+            {
+                network.train_step_with_options(
+                    &batch_inputs, &batch_targets, None, lr, &mut workspace, &train_opts,
+                );
+            }
         }
-
-        pb.finish_and_clear();
 
         let epoch_time = epoch_start.elapsed().as_secs_f64();
-        let train_acc = 100.0 * correct as f64 / (num_batches * batch_size) as f64;
-        let avg_loss = epoch_loss / (num_batches * batch_size) as f32;
-
-        // Evaluate on test set
+        
+        // Quick test accuracy using batch forward
         let mut test_correct = 0usize;
-        let mut test_output = vec![0.0f32; 10];
-        for i in 0..test_size {
-            network.forward_single(&test_images[i], &mut test_output, &mut workspace);
-            if argmax(&test_output) == test_labels[i] as usize {
-                test_correct += 1;
+        let eval_batch = 1000;  // Large eval batch for speed
+        
+        #[cfg(feature = "gpu")]
+        if use_gpu {
+            let gpu_net = gpu_network.as_mut().unwrap();
+            let gpu_ws = gpu_workspace.as_mut().unwrap();
+            
+            for chunk_start in (0..test_size).step_by(eval_batch) {
+                let chunk_end = (chunk_start + eval_batch).min(test_size);
+                let chunk_size = chunk_end - chunk_start;
+                let chunk_inputs: Vec<f32> = (chunk_start..chunk_end)
+                    .flat_map(|i| test_images[i].iter().cloned())
+                    .collect();
+                let output = gpu_net.forward_batch(&chunk_inputs, chunk_size, gpu_ws)?;
+                for (i, idx) in (chunk_start..chunk_end).enumerate() {
+                    if argmax(&output[i * 10..(i + 1) * 10]) == test_labels[idx] as usize {
+                        test_correct += 1;
+                    }
+                }
             }
         }
+        
+        #[cfg(feature = "gpu")]
+        if !use_gpu {
+            for chunk_start in (0..test_size).step_by(eval_batch) {
+                let chunk_end = (chunk_start + eval_batch).min(test_size);
+                let chunk_size = chunk_end - chunk_start;
+                let chunk_inputs: Vec<f32> = (chunk_start..chunk_end)
+                    .flat_map(|i| test_images[i].iter().cloned())
+                    .collect();
+                let mut chunk_outputs = vec![0.0f32; chunk_size * 10];
+                network.forward_batch(&chunk_inputs, &mut chunk_outputs, &mut workspace);
+                for (i, idx) in (chunk_start..chunk_end).enumerate() {
+                    if argmax(&chunk_outputs[i * 10..(i + 1) * 10]) == test_labels[idx] as usize {
+                        test_correct += 1;
+                    }
+                }
+            }
+        }
+        
+        #[cfg(not(feature = "gpu"))]
+        {
+            for chunk_start in (0..test_size).step_by(eval_batch) {
+                let chunk_end = (chunk_start + eval_batch).min(test_size);
+                let chunk_size = chunk_end - chunk_start;
+                let chunk_inputs: Vec<f32> = (chunk_start..chunk_end)
+                    .flat_map(|i| test_images[i].iter().cloned())
+                    .collect();
+                let mut chunk_outputs = vec![0.0f32; chunk_size * 10];
+                network.forward_batch(&chunk_inputs, &mut chunk_outputs, &mut workspace);
+                for (i, idx) in (chunk_start..chunk_end).enumerate() {
+                    if argmax(&chunk_outputs[i * 10..(i + 1) * 10]) == test_labels[idx] as usize {
+                        test_correct += 1;
+                    }
+                }
+            }
+        }
+        
         let test_acc = 100.0 * test_correct as f64 / test_size as f64;
 
         println!(
-            "Epoch {:2}/{} | Loss: {:.4} | Train Acc: {:5.2}% | Test Acc: {:5.2}% | Time: {:.1}s",
-            epoch, epochs, avg_loss, train_acc, test_acc, epoch_time
+            "Epoch {:2}/{} | Test Acc: {:5.2}% | LR: {:.5} | Time: {:.1}s",
+            epoch, epochs, test_acc, lr, epoch_time
         );
+    }
+
+    // Sync GPU weights back to CPU if needed
+    #[cfg(feature = "gpu")]
+    if use_gpu {
+        if let Some(ref gpu_net) = gpu_network {
+            gpu_net.sync_weights_to_cpu(&mut network)?;
+        }
     }
 
     let total_time = start.elapsed().as_secs_f64();
