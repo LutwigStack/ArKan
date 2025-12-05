@@ -598,6 +598,74 @@ impl KanNetwork {
         result
     }
 
+    /// Parallel forward pass for batch inference.
+    ///
+    /// This method processes samples in parallel using rayon, which is faster
+    /// for large batches on multi-core CPUs. Each sample gets its own workspace
+    /// allocated via thread-local storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data `[batch_size * input_dim]`
+    /// * `output` - Output buffer `[batch_size * output_dim]`
+    ///
+    /// # Performance
+    ///
+    /// - Use for batch_size >= 32 on multi-core systems
+    /// - For small batches, use [`forward_batch`](Self::forward_batch) instead
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let config = KanConfig::preset();
+    /// let network = KanNetwork::new(config.clone());
+    ///
+    /// let batch_size = 256;
+    /// let input = vec![0.5f32; batch_size * config.input_dim];
+    /// let mut output = vec![0.0f32; batch_size * config.output_dim];
+    ///
+    /// network.forward_batch_parallel(&input, &mut output);
+    /// ```
+    pub fn forward_batch_parallel(&self, input: &[f32], output: &mut [f32]) {
+        use rayon::prelude::*;
+        use std::cell::RefCell;
+
+        let batch_size = input.len() / self.config.input_dim;
+        let in_dim = self.config.input_dim;
+        let out_dim = self.config.output_dim;
+
+        debug_assert_eq!(input.len(), batch_size * in_dim);
+        debug_assert_eq!(output.len(), batch_size * out_dim);
+
+        // Thread-local workspace
+        thread_local! {
+            static LOCAL_WORKSPACE: RefCell<Option<Workspace>> = const { RefCell::new(None) };
+        }
+
+        let config = &self.config;
+
+        // Process samples in parallel, writing directly to output slices
+        output
+            .par_chunks_mut(out_dim)
+            .enumerate()
+            .for_each(|(b, out_slice)| {
+                let in_start = b * in_dim;
+                let in_slice = &input[in_start..in_start + in_dim];
+
+                LOCAL_WORKSPACE.with(|ws_cell| {
+                    let mut ws_ref = ws_cell.borrow_mut();
+                    if ws_ref.is_none() {
+                        *ws_ref = Some(Workspace::new(config));
+                    }
+                    let workspace = ws_ref.as_mut().unwrap();
+
+                    self.forward_single(in_slice, out_slice, workspace);
+                });
+            });
+    }
+
     /// Forward pass for training: stores per-layer normalized inputs and grid indices.
     ///
     /// This method extends [`forward_batch`](Self::forward_batch) by saving
