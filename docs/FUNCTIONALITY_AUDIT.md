@@ -649,13 +649,18 @@
 
 ## 7. Optimizers
 
-### `Adam` (CPU)
+### `Adam` (CPU) — v2.1 Updated
 | Аспект | Задумано | Реально |
 |--------|----------|---------|
 | Momentum (β1, β2) | ✓ | 🟢 |
 | Bias correction | ✓ | 🟢 |
 | Weight decay | ✓ | 🟢 |
 | Gradient clipping | В TrainOptions | 🟢 |
+| **v2.1: Thread Safety** | Send + Sync | 🟢 |
+| **v2.1: Versioning** | bump_version() для Grid Extension | 🟢 |
+| **v2.1: NaN Handling** | fail_on_nan / skip_step_on_nan | 🟢 |
+| **v2.1: AMP Placeholder** | grad_scaling_factor | 🟢 |
+| **v2.1: Optimizer Trait** | Unified API | 🟢 |
 
 **Тесты `Adam` CPU:**
 | Тест | Файл | Что проверяет | Оценка |
@@ -669,6 +674,64 @@
 | `test_adam_weight_decay_formula` | `tests/optimizer_correctness.rs` | AdamW decoupled decay | 🟢 Математический |
 | `test_adam_custom_betas` | `tests/optimizer_correctness.rs` | β1=0.5, β2=0.9999, weight_decay | 🟢 Конфигурации |
 | `test_adam_momentum_accumulation` | `tests/optimizer_correctness.rs` | m, v накапливают градиенты | 🟢 Состояние |
+| **v2.1 Tests:** | | | |
+| `test_optimizer_trait_get_set_lr` | `src/optimizer.rs` | Trait-based LR get/set, bounds check | 🟢 API |
+| `test_optimizer_versioning` | `src/optimizer.rs` | bump_version() resets state | 🟢 Версионирование |
+| `test_nan_detection_skip` | `src/optimizer.rs` | NaN → skip step, weights unchanged | 🟢 Safety |
+| `test_nan_detection_fail` | `src/optimizer.rs` | NaN + fail_on_nan → Error | 🟢 Safety |
+| `test_send_sync_bounds` | `src/optimizer.rs` | Adam implements Send+Sync | 🟢 Thread Safety |
+
+---
+
+### `SGD` (CPU) — v2.1 Updated
+| Аспект | Задумано | Реально |
+|--------|----------|---------|
+| Momentum | ✓ | 🟢 |
+| Weight decay | ✓ | 🟢 |
+| **v2.1: SGDConfig** | Builder pattern | 🟢 |
+| **v2.1: Thread Safety** | Send + Sync | 🟢 |
+| **v2.1: Versioning** | bump_version() | 🟢 |
+| **v2.1: NaN Handling** | SafetyConfig | 🟢 |
+| **v2.1: Optimizer Trait** | Unified API | 🟢 |
+
+**Тесты `SGD` CPU:**
+| Тест | Файл | Что проверяет | Оценка |
+|------|------|---------------|--------|
+| `test_sgd_new_api` | `src/optimizer.rs` | SGDConfig::with_momentum() | 🟢 API |
+| `test_send_sync_bounds` | `src/optimizer.rs` | SGD implements Send+Sync | 🟢 Thread Safety |
+
+---
+
+### `LBFGS` — v2.1 NEW (Scaffold)
+| Аспект | Задумано | Реально |
+|--------|----------|---------|
+| Two-loop recursion | L-BFGS algorithm | 🟡 Scaffold only |
+| Line search | Strong Wolfe / Backtracking | 🔴 TODO |
+| Atomicity/Rollback | Restore on failure | 🟡 Scaffold only |
+| **v2.1: Thread Safety** | Send + Sync | 🟢 |
+| **v2.1: Versioning** | bump_version() | 🟢 |
+| **v2.1: Optimizer Trait** | step_with_closure() | 🟢 |
+
+**Тесты `LBFGS`:**
+| Тест | Файл | Что проверяет | Оценка |
+|------|------|---------------|--------|
+| `test_lbfgs_creation` | `src/optimizer.rs` | LBFGSConfig defaults | 🟢 API |
+| `test_send_sync_bounds` | `src/optimizer.rs` | LBFGS implements Send+Sync | 🟢 Thread Safety |
+
+---
+
+### `SafetyConfig` — v2.1 NEW
+| Аспект | Задумано | Реально |
+|--------|----------|---------|
+| fail_on_nan | Return error on NaN | 🟢 |
+| skip_step_on_nan | Skip step, don't error | 🟢 |
+| grad_scaling_factor | AMP placeholder | 🟢 |
+| unscale_before_step | Unscale before weight decay | 🟢 |
+
+**Тесты `SafetyConfig`:**
+| Тест | Файл | Что проверяет | Оценка |
+|------|------|---------------|--------|
+| `test_safety_config` | `src/optimizer.rs` | strict() and with_amp() | 🟢 API |
 
 ---
 
@@ -1672,6 +1735,23 @@
     - Parity: single==batch==parallel
   - ✅ **CPU Forward** оценка повышена с ⭐⭐⭐⭐ (4/5) до ⭐⭐⭐⭐⭐ (5/5)
   - ✅ Закрыты мертвые зоны: SIMD paths, scalar fallback, wide layers
+- **2025-12-06:** Optimizer Module v2.1 реализация:
+  - ✅ **trait Optimizer** — Unified API с step(), zero_grad(), get_lr/set_lr(), versioning
+  - ✅ **Thread Safety** — Adam, SGD, LBFGS реализуют Send + Sync
+  - ✅ **Versioning** — bump_version() для Grid Extension, сброс state
+  - ✅ **SafetyConfig** — fail_on_nan, skip_step_on_nan, grad_scaling_factor (AMP placeholder)
+  - ✅ **SGDConfig** — Builder pattern аналогично AdamConfig
+  - ✅ **LBFGS каркас** — LBFGSConfig, two-loop recursion (scaffold), step_with_closure() API
+  - ✅ **OptimizerError variants** — GroupIndexOutOfBounds, TensorShapeMismatch, NaNEncountered, LineSearchFailed, StateVersionMismatch
+  - ✅ **13 новых unit tests** в `src/optimizer.rs`:
+    - Trait API (get_lr, set_lr, bounds check)
+    - Versioning (bump_version resets state)
+    - NaN handling (skip and fail modes)
+    - SafetyConfig (strict, with_amp)
+    - Send+Sync bounds (compile-time check)
+    - SGD new API, LBFGS creation
+  - ✅ **6 integration tests** в `tests/optimizer_correctness.rs` обновлены для нового API
+  - 🟡 **LBFGS**: Line search НЕ реализован (только scaffold)
 - **2025-01-20:** GPU Backward тесты и исправление бага:
   - ✅ **BUG FIX:** `compute_input_grad = layer_idx > 0` → `compute_input_grad = true`
     - Input gradients для single-layer сетей возвращались нулевыми

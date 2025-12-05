@@ -1,7 +1,7 @@
 //! Comprehensive functionality test for ArKan library
 //! Tests CPU, GPU, forward, backward, optimizers, etc.
 
-use arkan::optimizer::{Adam, AdamConfig, CosineAnnealingLR, LrScheduler, StepLR, SGD};
+use arkan::optimizer::{Adam, AdamConfig, CosineAnnealingLR, LrScheduler, StepLR, SGD, SGDConfig};
 use arkan::{KanConfig, KanNetwork, TrainOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -107,13 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print!("6. Adam Optimizer... ");
     let network = KanNetwork::new(config.clone());
     let _workspace = network.create_workspace(16);
-    let adam_config = AdamConfig {
-        lr: 0.001,
-        beta1: 0.9,
-        beta2: 0.999,
-        epsilon: 1e-8,
-        weight_decay: 0.0,
-    };
+    let adam_config = AdamConfig::with_lr(0.001);
     let adam = Adam::new(&network, adam_config);
     if adam.learning_rate() == 0.001 {
         println!("✅ PASSED (lr={})", adam.learning_rate());
@@ -125,9 +119,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ===== Test 7: SGD Optimizer =====
     print!("7. SGD Optimizer... ");
-    let _sgd = SGD::new(&network, 0.01, 0.9, 0.0);
-    // SGD doesn't have learning_rate() method, but we can check it was created
-    println!("✅ PASSED (lr=0.01, momentum=0.9)");
+    let sgd = SGD::new(&network, SGDConfig::with_momentum(0.01, 0.9));
+    // SGD has lr() method
+    println!("✅ PASSED (lr={}, momentum={})", sgd.lr(), sgd.momentum());
     passed += 1;
 
     // ===== Test 8: LR Schedulers =====

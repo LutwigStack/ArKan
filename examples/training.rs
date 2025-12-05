@@ -51,13 +51,7 @@ fn main() {
     println!("  Batch size: {}", batch_size);
 
     // 3. Create Adam optimizer
-    let optimizer_config = AdamConfig {
-        lr: 0.001,
-        beta1: 0.9,
-        beta2: 0.999,
-        epsilon: 1e-8,
-        weight_decay: 0.0,
-    };
+    let optimizer_config = AdamConfig::with_lr(0.001);
     let optimizer = Adam::new(&network, optimizer_config);
 
     println!("\nOptimizer: Adam");

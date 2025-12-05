@@ -11,7 +11,7 @@
 //! Run with: cargo test --test optimizer_correctness
 //! GPU tests: cargo test --features gpu --test optimizer_correctness -- --ignored
 
-use arkan::optimizer::{Adam, AdamConfig};
+use arkan::optimizer::{Adam, AdamConfig, Optimizer, SafetyConfig};
 use arkan::{KanConfig, KanNetwork};
 
 // =============================================================================
@@ -81,13 +81,7 @@ fn adam_step_reference(
 #[test]
 fn test_adam_formula_numerical() {
     let mut network = minimal_network();
-    let adam_config = AdamConfig {
-        lr: 0.01,
-        beta1: 0.9,
-        beta2: 0.999,
-        epsilon: 1e-8,
-        weight_decay: 0.0,
-    };
+    let adam_config = AdamConfig::with_decay(0.01, 0.0);
     let mut optimizer = Adam::new(&network, adam_config);
 
     // Get initial weights
@@ -103,7 +97,7 @@ fn test_adam_formula_numerical() {
     let bias_grads = vec![grad_bias.clone()];
 
     // Perform one step
-    optimizer.step(&mut network, &weight_grads, &bias_grads, None);
+    optimizer.step(&mut network, &weight_grads, &bias_grads, None).unwrap();
 
     // Compute expected values manually
     let mut expected_weights = Vec::new();
@@ -153,13 +147,7 @@ fn test_adam_formula_numerical() {
 #[test]
 fn test_adam_bias_correction_factors() {
     let mut network = minimal_network();
-    let adam_config = AdamConfig {
-        lr: 0.001,
-        beta1: 0.9,
-        beta2: 0.999,
-        epsilon: 1e-8,
-        weight_decay: 0.0,
-    };
+    let adam_config = AdamConfig::with_lr(0.001);
     let mut optimizer = Adam::new(&network, adam_config);
 
     // Same gradient each step
@@ -172,7 +160,7 @@ fn test_adam_bias_correction_factors() {
 
     for t in 1..=10 {
         let w_before = network.layers[0].weights[0];
-        optimizer.step(&mut network, &grad_weights, &grad_bias, None);
+        optimizer.step(&mut network, &grad_weights, &grad_bias, None).unwrap();
         let w_after = network.layers[0].weights[0];
         let update_magnitude = (w_before - w_after).abs();
         weight_at_t.push(w_after);
@@ -266,22 +254,10 @@ fn test_adam_weight_decay_formula() {
     let mut network = minimal_network();
 
     // With weight decay
-    let adam_config_decay = AdamConfig {
-        lr: 0.01,
-        beta1: 0.9,
-        beta2: 0.999,
-        epsilon: 1e-8,
-        weight_decay: 0.1,  // 10% decay
-    };
+    let adam_config_decay = AdamConfig::with_decay(0.01, 0.1);
 
     // Without weight decay (for comparison)
-    let adam_config_no_decay = AdamConfig {
-        lr: 0.01,
-        beta1: 0.9,
-        beta2: 0.999,
-        epsilon: 1e-8,
-        weight_decay: 0.0,
-    };
+    let adam_config_no_decay = AdamConfig::with_lr(0.01);
 
     let initial_weight = network.layers[0].weights[0];
 
@@ -296,11 +272,11 @@ fn test_adam_weight_decay_formula() {
     let zero_grad_bias = vec![vec![0.0f32; network.layers[0].bias.len()]];
 
     // Step with decay
-    optimizer_decay.step(&mut network, &zero_grad_weights, &zero_grad_bias, None);
+    optimizer_decay.step(&mut network, &zero_grad_weights, &zero_grad_bias, None).unwrap();
     let weight_with_decay = network.layers[0].weights[0];
 
     // Step without decay
-    optimizer_no_decay.step(&mut network_no_decay, &zero_grad_weights, &zero_grad_bias, None);
+    optimizer_no_decay.step(&mut network_no_decay, &zero_grad_weights, &zero_grad_bias, None).unwrap();
     let weight_no_decay = network_no_decay.layers[0].weights[0];
 
     // With zero gradient, weight should only change due to decay
@@ -348,10 +324,10 @@ fn test_adam_custom_betas() {
     // High momentum (β1=0.99) should be more stable
 
     let configs = [
-        ("low_beta1", AdamConfig { lr: 0.01, beta1: 0.5, beta2: 0.999, epsilon: 1e-8, weight_decay: 0.0 }),
-        ("high_beta1", AdamConfig { lr: 0.01, beta1: 0.99, beta2: 0.999, epsilon: 1e-8, weight_decay: 0.0 }),
-        ("low_beta2", AdamConfig { lr: 0.01, beta1: 0.9, beta2: 0.9, epsilon: 1e-8, weight_decay: 0.0 }),
-        ("high_beta2", AdamConfig { lr: 0.01, beta1: 0.9, beta2: 0.9999, epsilon: 1e-8, weight_decay: 0.0 }),
+        ("low_beta1", AdamConfig { lr: 0.01, beta1: 0.5, beta2: 0.999, epsilon: 1e-8, weight_decay: 0.0, safety: SafetyConfig::default() }),
+        ("high_beta1", AdamConfig { lr: 0.01, beta1: 0.99, beta2: 0.999, epsilon: 1e-8, weight_decay: 0.0, safety: SafetyConfig::default() }),
+        ("low_beta2", AdamConfig { lr: 0.01, beta1: 0.9, beta2: 0.9, epsilon: 1e-8, weight_decay: 0.0, safety: SafetyConfig::default() }),
+        ("high_beta2", AdamConfig { lr: 0.01, beta1: 0.9, beta2: 0.9999, epsilon: 1e-8, weight_decay: 0.0, safety: SafetyConfig::default() }),
     ];
 
     for (name, config) in &configs {
@@ -364,12 +340,12 @@ fn test_adam_custom_betas() {
         let grad_weights = vec![vec![1.0f32; network.layers[0].weights.len()]];
         let grad_bias = vec![vec![0.0f32; network.layers[0].bias.len()]];
 
-        optimizer.step(&mut network, &grad_weights, &grad_bias, None);
+        optimizer.step(&mut network, &grad_weights, &grad_bias, None).unwrap();
         let weight_after_pos = network.layers[0].weights[0];
 
         // Second step with negative gradient (direction change)
         let grad_weights_neg = vec![vec![-1.0f32; network.layers[0].weights.len()]];
-        optimizer.step(&mut network, &grad_weights_neg, &grad_bias, None);
+        optimizer.step(&mut network, &grad_weights_neg, &grad_bias, None).unwrap();
         let weight_after_neg = network.layers[0].weights[0];
 
         println!("{}: {} -> {} -> {}", name, initial_weight, weight_after_pos, weight_after_neg);
@@ -393,13 +369,7 @@ fn test_adam_custom_betas() {
 #[test]
 fn test_adam_momentum_accumulation() {
     let mut network = minimal_network();
-    let adam_config = AdamConfig {
-        lr: 0.01,
-        beta1: 0.9,
-        beta2: 0.999,
-        epsilon: 1e-8,
-        weight_decay: 0.0,
-    };
+    let adam_config = AdamConfig::with_lr(0.01);
     let mut optimizer = Adam::new(&network, adam_config);
 
     // Constant gradient
@@ -416,7 +386,7 @@ fn test_adam_momentum_accumulation() {
         expected_m = 0.9 * expected_m + 0.1 * grad;
         expected_v = 0.999 * expected_v + 0.001 * grad * grad;
 
-        optimizer.step(&mut network, &grad_weights, &grad_bias, None);
+        optimizer.step(&mut network, &grad_weights, &grad_bias, None).unwrap();
 
         // Check internal state
         let actual_m = optimizer.layer_states[0].weights.m[0];

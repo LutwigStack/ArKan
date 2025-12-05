@@ -149,6 +149,74 @@ pub enum ArkanError {
         /// Actual version found.
         got: u32,
     },
+
+    // =========================================================================
+    // Optimizer-specific errors (v2.1)
+    // =========================================================================
+
+    /// Parameter group index out of bounds.
+    ///
+    /// Occurs when trying to access or modify a parameter group that doesn't exist.
+    #[error("Group index {index} out of bounds (total groups: {total_groups})")]
+    GroupIndexOutOfBounds {
+        /// Requested index.
+        index: usize,
+        /// Total number of parameter groups.
+        total_groups: usize,
+    },
+
+    /// Tensor shape mismatch between parameter and gradient.
+    ///
+    /// Parameter and gradient tensors must have identical shapes for update.
+    #[error("Tensor shape mismatch: param shape {param_shape:?}, grad shape {grad_shape:?}")]
+    TensorShapeMismatch {
+        /// Shape of the parameter tensor.
+        param_shape: Vec<usize>,
+        /// Shape of the gradient tensor.
+        grad_shape: Vec<usize>,
+    },
+
+    /// NaN value encountered during optimization.
+    ///
+    /// This can occur in gradients or loss values, indicating numerical instability.
+    #[error("NaN encountered at param index {param_index} in {context}")]
+    NaNEncountered {
+        /// Index of the parameter where NaN was detected.
+        param_index: usize,
+        /// Context: "gradient", "loss", "param", etc.
+        context: String,
+    },
+
+    /// Line search failed in L-BFGS optimizer.
+    ///
+    /// The line search algorithm could not find a satisfactory step size.
+    #[error("Line search failed: {reason}")]
+    LineSearchFailed {
+        /// Description of why line search failed.
+        reason: String,
+    },
+
+    /// Optimizer state version mismatch.
+    ///
+    /// Occurs when optimizer state is out of sync with model topology
+    /// (e.g., after Grid Extension without calling bump_version).
+    #[error("State version mismatch: optimizer version {optimizer_version}, expected {expected_version}")]
+    StateVersionMismatch {
+        /// Current optimizer state version.
+        optimizer_version: u64,
+        /// Expected version (from model).
+        expected_version: u64,
+    },
+
+    /// Optimizer closure returned an error.
+    ///
+    /// Used by L-BFGS when the loss closure fails.
+    #[error("Closure error: {0}")]
+    ClosureError(String),
+
+    /// General optimizer error.
+    #[error("Optimizer error: {0}")]
+    Optimizer(String),
 }
 
 /// Result type alias for ArKan operations.
@@ -198,6 +266,56 @@ impl ArkanError {
     /// Creates an incompatible version error.
     pub fn incompatible_version(expected: u32, got: u32) -> Self {
         ArkanError::IncompatibleVersion { expected, got }
+    }
+
+    // =========================================================================
+    // Optimizer error constructors
+    // =========================================================================
+
+    /// Creates a group index out of bounds error.
+    pub fn group_index_out_of_bounds(index: usize, total_groups: usize) -> Self {
+        ArkanError::GroupIndexOutOfBounds { index, total_groups }
+    }
+
+    /// Creates a tensor shape mismatch error.
+    pub fn tensor_shape_mismatch(param_shape: &[usize], grad_shape: &[usize]) -> Self {
+        ArkanError::TensorShapeMismatch {
+            param_shape: param_shape.to_vec(),
+            grad_shape: grad_shape.to_vec(),
+        }
+    }
+
+    /// Creates a NaN encountered error.
+    pub fn nan_encountered<S: Into<String>>(param_index: usize, context: S) -> Self {
+        ArkanError::NaNEncountered {
+            param_index,
+            context: context.into(),
+        }
+    }
+
+    /// Creates a line search failed error.
+    pub fn line_search_failed<S: Into<String>>(reason: S) -> Self {
+        ArkanError::LineSearchFailed {
+            reason: reason.into(),
+        }
+    }
+
+    /// Creates a state version mismatch error.
+    pub fn state_version_mismatch(optimizer_version: u64, expected_version: u64) -> Self {
+        ArkanError::StateVersionMismatch {
+            optimizer_version,
+            expected_version,
+        }
+    }
+
+    /// Creates a closure error.
+    pub fn closure_error<S: Into<String>>(msg: S) -> Self {
+        ArkanError::ClosureError(msg.into())
+    }
+
+    /// Creates a general optimizer error.
+    pub fn optimizer<S: Into<String>>(msg: S) -> Self {
+        ArkanError::Optimizer(msg.into())
     }
 
     /// Creates an unsupported order error (GPU only).
