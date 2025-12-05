@@ -130,7 +130,3 @@ tests/*_investigation.rs
 
 # Example project lock files (use workspace Cargo.lock)
 examples/**/Cargo.lock
-
-# Comprehensive test examples (development only)
-examples/comprehensive_test.rs
-examples/gpu_comprehensive_test.rs
