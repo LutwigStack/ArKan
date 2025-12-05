@@ -151,6 +151,44 @@ fn test_gradient_check_spline_order_3() {
     run_gradient_check(&config, 4, "spline order 3");
 }
 
+/// Test gradient checking with spline order 4.
+#[test]
+fn test_gradient_check_spline_order_4() {
+    let config = KanConfig {
+        input_dim: 3,
+        output_dim: 2,
+        hidden_dims: vec![4],
+        grid_size: 4,
+        spline_order: 4,
+        grid_range: (-1.0, 1.0),
+        input_mean: vec![0.0; 3],
+        input_std: vec![1.0; 3],
+        init_seed: Some(42),
+        ..Default::default()
+    };
+
+    run_gradient_check(&config, 4, "spline order 4");
+}
+
+/// Test gradient checking with spline order 2.
+#[test]
+fn test_gradient_check_spline_order_2() {
+    let config = KanConfig {
+        input_dim: 3,
+        output_dim: 2,
+        hidden_dims: vec![4],
+        grid_size: 4,
+        spline_order: 2,
+        grid_range: (-1.0, 1.0),
+        input_mean: vec![0.0; 3],
+        input_std: vec![1.0; 3],
+        init_seed: Some(42),
+        ..Default::default()
+    };
+
+    run_gradient_check(&config, 4, "spline order 2");
+}
+
 /// Runs the gradient check for a given configuration.
 fn run_gradient_check(config: &KanConfig, batch_size: usize, test_name: &str) {
     println!("\n=== Gradient Check: {} ===", test_name);
