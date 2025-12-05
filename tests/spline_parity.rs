@@ -359,7 +359,10 @@ fn test_find_span_boundaries() {
 
     // Beyond boundaries (should be clamped)
     let span_below = find_span(-2.0, &knots, order, grid_size);
-    assert_eq!(span_below, order, "Span below range should be clamped to order");
+    assert_eq!(
+        span_below, order,
+        "Span below range should be clamped to order"
+    );
 
     let span_above = find_span(2.0, &knots, order, grid_size);
     assert_eq!(

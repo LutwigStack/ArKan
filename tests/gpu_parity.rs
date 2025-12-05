@@ -2605,12 +2605,12 @@ fn test_training_trajectory_parity() {
     let batch_size = 64;
     let num_samples = 128; // Multiple of batch_size for clean cycling
     let learning_rate = 0.01;
-    
+
     // Fixed seed for reproducible data
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
     let mut rng = SmallRng::seed_from_u64(12345);
-    
+
     let all_inputs: Vec<f32> = (0..num_samples * config.input_dim)
         .map(|_| rng.gen_range(-1.5..1.5))
         .collect();
@@ -2622,28 +2622,26 @@ fn test_training_trajectory_parity() {
     // CPU Training using train_step (SGD)
     // =========================================================================
     println!("Running CPU training (SGD)...");
-    
+
     let mut cpu_network = KanNetwork::new(config.clone());
     let mut cpu_workspace = cpu_network.create_workspace(batch_size);
-    
+
     let mut cpu_losses: Vec<f32> = Vec::new();
-    
+
     for step in 0..100 {
         // Cycle through data
         let batch_idx = step % (num_samples / batch_size);
         let start = batch_idx * batch_size * config.input_dim;
         let end = start + batch_size * config.input_dim;
         let inputs = &all_inputs[start..end];
-        
+
         let target_start = batch_idx * batch_size * config.output_dim;
         let target_end = target_start + batch_size * config.output_dim;
         let targets = &all_targets[target_start..target_end];
-        
+
         // CPU train_step uses SGD internally
-        let loss = cpu_network.train_step(
-            inputs, targets, None, learning_rate, &mut cpu_workspace
-        );
-        
+        let loss = cpu_network.train_step(inputs, targets, None, learning_rate, &mut cpu_workspace);
+
         if step % 10 == 0 {
             cpu_losses.push(loss);
             println!("  CPU step {:3}: loss = {:.6}", step, loss);
@@ -2654,7 +2652,7 @@ fn test_training_trajectory_parity() {
     // GPU Training (using GPU-native SGD)
     // =========================================================================
     println!("\nRunning GPU training (SGD)...");
-    
+
     // Create fresh network with same seed
     let gpu_cpu_network = KanNetwork::new(config.clone());
     let mut gpu_network =
@@ -2662,7 +2660,7 @@ fn test_training_trajectory_parity() {
     let mut gpu_workspace = gpu_network
         .create_workspace(batch_size)
         .expect("Failed to create GPU workspace");
-    
+
     // Create GPU SGD optimizer with same learning rate
     let layer_sizes = gpu_network.layer_param_sizes();
     let mut gpu_sgd = GpuSgd::new(
@@ -2675,24 +2673,30 @@ fn test_training_trajectory_parity() {
             weight_decay: 0.0,
         },
     );
-    
+
     let mut gpu_losses: Vec<f32> = Vec::new();
-    
+
     for step in 0..100 {
         // Same data cycling as CPU
         let batch_idx = step % (num_samples / batch_size);
         let start = batch_idx * batch_size * config.input_dim;
         let end = start + batch_size * config.input_dim;
         let inputs = &all_inputs[start..end];
-        
+
         let target_start = batch_idx * batch_size * config.output_dim;
         let target_end = target_start + batch_size * config.output_dim;
         let targets = &all_targets[target_start..target_end];
-        
+
         let loss = gpu_network
-            .train_step_gpu_native_sgd(inputs, targets, batch_size, &mut gpu_workspace, &mut gpu_sgd)
+            .train_step_gpu_native_sgd(
+                inputs,
+                targets,
+                batch_size,
+                &mut gpu_workspace,
+                &mut gpu_sgd,
+            )
             .expect("GPU training failed");
-        
+
         if step % 10 == 0 {
             gpu_losses.push(loss);
             println!("  GPU step {:3}: loss = {:.6}", step, loss);
@@ -2703,66 +2707,80 @@ fn test_training_trajectory_parity() {
     // Compare Loss Trajectories
     // =========================================================================
     println!("\n=== Loss Trajectory Comparison ===");
-    println!("{:>6} {:>12} {:>12} {:>12}", "Step", "CPU Loss", "GPU Loss", "Diff");
+    println!(
+        "{:>6} {:>12} {:>12} {:>12}",
+        "Step", "CPU Loss", "GPU Loss", "Diff"
+    );
     println!("{:-<48}", "");
-    
+
     let mut max_diff: f32 = 0.0;
     let mut max_diff_step = 0;
-    
+
     for (i, (cpu_loss, gpu_loss)) in cpu_losses.iter().zip(gpu_losses.iter()).enumerate() {
         let step = i * 10;
         let diff = (cpu_loss - gpu_loss).abs();
-        
+
         if diff > max_diff {
             max_diff = diff;
             max_diff_step = step;
         }
-        
+
         let status = if diff < 1e-3 { "✓" } else { "✗" };
         println!(
             "{:>6} {:>12.6} {:>12.6} {:>12.6} {}",
             step, cpu_loss, gpu_loss, diff, status
         );
     }
-    
-    println!("\nMax difference: {:.6} at step {}", max_diff, max_diff_step);
-    
+
+    println!(
+        "\nMax difference: {:.6} at step {}",
+        max_diff, max_diff_step
+    );
+
     // Assertions
     // Step 0: Should be identical (same initialization, same forward pass)
     let step0_diff = (cpu_losses[0] - gpu_losses[0]).abs();
     assert!(
         step0_diff < 1e-4,
         "Step 0 loss should match exactly: CPU={}, GPU={}, diff={}",
-        cpu_losses[0], gpu_losses[0], step0_diff
+        cpu_losses[0],
+        gpu_losses[0],
+        step0_diff
     );
-    
+
     // Step 100: Should match within tolerance
     let step100_diff = (cpu_losses.last().unwrap() - gpu_losses.last().unwrap()).abs();
     assert!(
         step100_diff < 1e-3,
         "Step 100 loss diverged too much: CPU={}, GPU={}, diff={}",
-        cpu_losses.last().unwrap(), gpu_losses.last().unwrap(), step100_diff
+        cpu_losses.last().unwrap(),
+        gpu_losses.last().unwrap(),
+        step100_diff
     );
-    
+
     // All steps should be within reasonable tolerance
     // (allowing for floating point accumulation)
     let tolerance_per_step = |step: usize| -> f32 {
         // Allow more tolerance as steps increase due to FP accumulation
         1e-4 + (step as f32 * 1e-5)
     };
-    
+
     for (i, (cpu_loss, gpu_loss)) in cpu_losses.iter().zip(gpu_losses.iter()).enumerate() {
         let step = i * 10;
         let diff = (cpu_loss - gpu_loss).abs();
         let tol = tolerance_per_step(step);
-        
+
         assert!(
             diff < tol,
             "Loss diverged at step {}: CPU={}, GPU={}, diff={}, tolerance={}",
-            step, cpu_loss, gpu_loss, diff, tol
+            step,
+            cpu_loss,
+            gpu_loss,
+            diff,
+            tol
         );
     }
-    
+
     println!("\n✅ Training trajectory parity test PASSED!");
 }
 
@@ -2771,7 +2789,7 @@ fn test_training_trajectory_parity() {
 #[ignore = "Requires GPU"]
 fn test_training_trajectory_short() {
     use arkan::gpu::optimizer::{GpuSgd, GpuSgdConfig};
-    
+
     println!("\n=== Short Training Trajectory Test (20 steps, SGD) ===\n");
 
     let backend =
@@ -2792,11 +2810,11 @@ fn test_training_trajectory_short() {
 
     let batch_size = 16;
     let learning_rate = 0.01;
-    
+
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
     let mut rng = SmallRng::seed_from_u64(99999);
-    
+
     let inputs: Vec<f32> = (0..batch_size * config.input_dim)
         .map(|_| rng.gen_range(-1.0..1.0))
         .collect();
@@ -2807,12 +2825,11 @@ fn test_training_trajectory_short() {
     // CPU using train_step (SGD)
     let mut cpu_network = KanNetwork::new(config.clone());
     let mut cpu_workspace = cpu_network.create_workspace(batch_size);
-    
+
     let mut cpu_losses = Vec::new();
     for _ in 0..20 {
-        let loss = cpu_network.train_step(
-            &inputs, &targets, None, learning_rate, &mut cpu_workspace
-        );
+        let loss =
+            cpu_network.train_step(&inputs, &targets, None, learning_rate, &mut cpu_workspace);
         cpu_losses.push(loss);
     }
 
@@ -2820,7 +2837,7 @@ fn test_training_trajectory_short() {
     let gpu_cpu_network = KanNetwork::new(config.clone());
     let mut gpu_network = GpuNetwork::from_cpu(&backend, &gpu_cpu_network).expect("Failed");
     let mut gpu_workspace = gpu_network.create_workspace(batch_size).expect("Failed");
-    
+
     let layer_sizes = gpu_network.layer_param_sizes();
     let mut gpu_sgd = GpuSgd::new(
         backend.device_arc(),
@@ -2832,11 +2849,17 @@ fn test_training_trajectory_short() {
             weight_decay: 0.0,
         },
     );
-    
+
     let mut gpu_losses = Vec::new();
     for _ in 0..20 {
         let loss = gpu_network
-            .train_step_gpu_native_sgd(&inputs, &targets, batch_size, &mut gpu_workspace, &mut gpu_sgd)
+            .train_step_gpu_native_sgd(
+                &inputs,
+                &targets,
+                batch_size,
+                &mut gpu_workspace,
+                &mut gpu_sgd,
+            )
             .expect("Failed");
         gpu_losses.push(loss);
     }
@@ -2844,15 +2867,22 @@ fn test_training_trajectory_short() {
     // Compare first and last
     let diff_first = (cpu_losses[0] - gpu_losses[0]).abs();
     let diff_last = (cpu_losses[19] - gpu_losses[19]).abs();
-    
-    println!("First step: CPU={:.6}, GPU={:.6}, diff={:.6}", 
-             cpu_losses[0], gpu_losses[0], diff_first);
-    println!("Last step:  CPU={:.6}, GPU={:.6}, diff={:.6}", 
-             cpu_losses[19], gpu_losses[19], diff_last);
-    
-    assert!(diff_first < 1e-4, "First step loss mismatch: {}", diff_first);
+
+    println!(
+        "First step: CPU={:.6}, GPU={:.6}, diff={:.6}",
+        cpu_losses[0], gpu_losses[0], diff_first
+    );
+    println!(
+        "Last step:  CPU={:.6}, GPU={:.6}, diff={:.6}",
+        cpu_losses[19], gpu_losses[19], diff_last
+    );
+
+    assert!(
+        diff_first < 1e-4,
+        "First step loss mismatch: {}",
+        diff_first
+    );
     assert!(diff_last < 1e-3, "Last step loss diverged: {}", diff_last);
-    
+
     println!("\n✅ Short trajectory test PASSED!");
 }
-

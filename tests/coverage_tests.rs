@@ -57,11 +57,16 @@ fn test_forward_batch_parallel_parity() {
         assert!(
             (s - p).abs() < 1e-6,
             "Mismatch at index {}: sequential={}, parallel={}",
-            i, s, p
+            i,
+            s,
+            p
         );
     }
 
-    println!("✓ forward_batch_parallel matches forward_batch for {} samples", batch_size);
+    println!(
+        "✓ forward_batch_parallel matches forward_batch for {} samples",
+        batch_size
+    );
 }
 
 /// Test forward_batch_parallel with various batch sizes
@@ -105,7 +110,8 @@ fn test_forward_batch_parallel_various_sizes() {
         assert!(
             max_diff < 1e-6,
             "Batch size {}: max diff = {} (should be < 1e-6)",
-            batch_size, max_diff
+            batch_size,
+            max_diff
         );
     }
 
@@ -117,7 +123,7 @@ fn test_forward_batch_parallel_various_sizes() {
 // ============================================================================
 
 /// Gradient check for deep network (4 layers: input → 16 → 8 → 4 → output)
-/// 
+///
 /// This test verifies gradient flow through multiple layers.
 ///
 /// # Analytical f32 Precision Limits
@@ -201,7 +207,7 @@ fn test_gradient_check_deep_network() {
         // Check 10 random weights per layer
         let num_weights = network.layers[layer_idx].weights.len();
         let check_count = num_weights.min(10);
-        
+
         // Pick evenly spaced indices
         let indices: Vec<usize> = (0..check_count)
             .map(|i| i * num_weights / check_count)
@@ -209,11 +215,11 @@ fn test_gradient_check_deep_network() {
 
         for &w_idx in &indices {
             let ana_grad = ana_weight_grads[layer_idx][w_idx];
-            
+
             // Try multiple epsilon values and find best numerical estimate
             let mut best_num_grad = 0.0f32;
             let mut best_rel_err = f32::MAX;
-            
+
             for &eps in &epsilons {
                 network = original_network.clone();
                 let orig = network.layers[layer_idx].weights[w_idx];
@@ -222,17 +228,23 @@ fn test_gradient_check_deep_network() {
                 network.layers[layer_idx].weights[w_idx] = orig + eps;
                 let mut out_plus = vec![0.0f32; batch_size * config.output_dim];
                 network.forward_batch(&input, &mut out_plus, &mut workspace);
-                let loss_plus: f32 = out_plus.iter().zip(target.iter())
+                let loss_plus: f32 = out_plus
+                    .iter()
+                    .zip(target.iter())
                     .map(|(p, t)| (p - t).powi(2))
-                    .sum::<f32>() / out_plus.len() as f32;
+                    .sum::<f32>()
+                    / out_plus.len() as f32;
 
                 // f(w - eps)
                 network.layers[layer_idx].weights[w_idx] = orig - eps;
                 let mut out_minus = vec![0.0f32; batch_size * config.output_dim];
                 network.forward_batch(&input, &mut out_minus, &mut workspace);
-                let loss_minus: f32 = out_minus.iter().zip(target.iter())
+                let loss_minus: f32 = out_minus
+                    .iter()
+                    .zip(target.iter())
                     .map(|(p, t)| (p - t).powi(2))
-                    .sum::<f32>() / out_minus.len() as f32;
+                    .sum::<f32>()
+                    / out_minus.len() as f32;
 
                 network.layers[layer_idx].weights[w_idx] = orig;
 
@@ -242,7 +254,7 @@ fn test_gradient_check_deep_network() {
                 } else {
                     (ana_grad - num_grad).abs() / ana_grad.abs().max(num_grad.abs())
                 };
-                
+
                 if rel_err < best_rel_err {
                     best_rel_err = rel_err;
                     best_num_grad = num_grad;
@@ -256,14 +268,18 @@ fn test_gradient_check_deep_network() {
             } else {
                 best_rel_err < 0.15 // 15% tolerance for f32
             };
-            
+
             total_checks += 1;
             if passes {
                 passed_checks += 1;
             } else {
                 failed_details.push(format!(
                     "Layer {} weight {}: ana={:.6e}, num={:.6e}, rel_err={:.2}%",
-                    layer_idx, w_idx, ana_grad, best_num_grad, best_rel_err * 100.0
+                    layer_idx,
+                    w_idx,
+                    ana_grad,
+                    best_num_grad,
+                    best_rel_err * 100.0
                 ));
             }
         }
@@ -272,7 +288,9 @@ fn test_gradient_check_deep_network() {
     let pass_rate = passed_checks as f32 / total_checks as f32;
     println!(
         "Deep network gradient check: {}/{} passed ({:.1}%)",
-        passed_checks, total_checks, pass_rate * 100.0
+        passed_checks,
+        total_checks,
+        pass_rate * 100.0
     );
 
     if !failed_details.is_empty() {
@@ -288,7 +306,7 @@ fn test_gradient_check_deep_network() {
         "Gradient check pass rate {:.1}% is below 95%. This may indicate a backward pass bug.",
         pass_rate * 100.0
     );
-    
+
     println!("✓ Deep network gradient check passed");
 }
 
@@ -326,9 +344,10 @@ mod serde_tests {
 
         // Serialize to JSON
         let json = serde_json::to_string(&network).expect("Failed to serialize to JSON");
-        
+
         // Deserialize - knots should be recomputed!
-        let network_restored: KanNetwork = serde_json::from_str(&json).expect("Failed to deserialize");
+        let network_restored: KanNetwork =
+            serde_json::from_str(&json).expect("Failed to deserialize");
 
         // Forward should work after deserialization
         let mut output_after = vec![0.0f32; config.output_dim];
@@ -340,7 +359,9 @@ mod serde_tests {
             assert!(
                 (before - after).abs() < 1e-6,
                 "Output mismatch at {}: before={}, after={}",
-                i, before, after
+                i,
+                before,
+                after
             );
         }
 
@@ -348,8 +369,9 @@ mod serde_tests {
 
         // Also test bincode
         let bytes = bincode::serialize(&network).expect("Failed to serialize to bincode");
-        let network_bincode: KanNetwork = bincode::deserialize(&bytes).expect("Failed to deserialize bincode");
-        
+        let network_bincode: KanNetwork =
+            bincode::deserialize(&bytes).expect("Failed to deserialize bincode");
+
         let mut output_bincode = vec![0.0f32; config.output_dim];
         let mut workspace3 = network_bincode.create_workspace(4);
         network_bincode.forward_single(&input, &mut output_bincode, &mut workspace3);
@@ -358,7 +380,9 @@ mod serde_tests {
             assert!(
                 (before - after).abs() < 1e-6,
                 "Bincode output mismatch at {}: before={}, after={}",
-                i, before, after
+                i,
+                before,
+                after
             );
         }
 
@@ -413,10 +437,10 @@ mod gpu_tests {
 
     fn assert_approx_eq(a: &[f32], b: &[f32], tol: f32, name: &str) {
         assert_eq!(a.len(), b.len(), "{}: length mismatch", name);
-        
+
         let mut max_diff = 0.0f32;
         let mut max_idx = 0;
-        
+
         for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
             let diff = (x - y).abs();
             if diff > max_diff {
@@ -428,7 +452,10 @@ mod gpu_tests {
         assert!(
             max_diff <= tol,
             "{}: max diff {} at index {} exceeds tolerance {}",
-            name, max_diff, max_idx, tol
+            name,
+            max_diff,
+            max_idx,
+            tol
         );
     }
 
@@ -436,8 +463,8 @@ mod gpu_tests {
     #[test]
     #[ignore = "Requires GPU"]
     fn test_gpu_forward_batch_parity() {
-        let backend = WgpuBackend::init(WgpuOptions::default())
-            .expect("Failed to initialize GPU backend");
+        let backend =
+            WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
 
         let config = KanConfig {
             input_dim: 8,
@@ -457,9 +484,10 @@ mod gpu_tests {
         let mut cpu_workspace = cpu_network.create_workspace(16);
 
         // Create GPU network from CPU (same weights)
-        let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
-            .expect("Failed to create GPU network");
-        let mut gpu_workspace = gpu_network.create_workspace(16)
+        let mut gpu_network =
+            GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+        let mut gpu_workspace = gpu_network
+            .create_workspace(16)
             .expect("Failed to create GPU workspace");
 
         // Test data
@@ -473,8 +501,9 @@ mod gpu_tests {
         let mut cpu_output = vec![0.0f32; batch_size * config.output_dim];
         cpu_network.forward_batch(&input, &mut cpu_output, &mut cpu_workspace);
 
-        // GPU forward  
-        let gpu_output = gpu_network.forward_batch(&input, batch_size, &mut gpu_workspace)
+        // GPU forward
+        let gpu_output = gpu_network
+            .forward_batch(&input, batch_size, &mut gpu_workspace)
             .expect("GPU forward failed");
 
         // Compare
@@ -487,8 +516,8 @@ mod gpu_tests {
     #[test]
     #[ignore = "Requires GPU"]
     fn test_gpu_training_convergence() {
-        let backend = WgpuBackend::init(WgpuOptions::default())
-            .expect("Failed to initialize GPU backend");
+        let backend =
+            WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
 
         let config = KanConfig {
             input_dim: 2,
@@ -516,7 +545,7 @@ mod gpu_tests {
         // CPU training
         let mut cpu_network = KanNetwork::new(config.clone());
         let mut cpu_workspace = cpu_network.create_workspace(batch_size);
-        
+
         let mut cpu_loss = 0.0;
         for _ in 0..100 {
             cpu_loss = cpu_network.train_step(&input, &target, None, 0.01, &mut cpu_workspace);
@@ -524,9 +553,10 @@ mod gpu_tests {
 
         // GPU training (hybrid mode)
         let mut cpu_net_for_gpu = KanNetwork::new(config.clone());
-        let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_net_for_gpu)
-            .expect("Failed to create GPU network");
-        let mut gpu_workspace = gpu_network.create_workspace(batch_size)
+        let mut gpu_network =
+            GpuNetwork::from_cpu(&backend, &cpu_net_for_gpu).expect("Failed to create GPU network");
+        let mut gpu_workspace = gpu_network
+            .create_workspace(batch_size)
             .expect("Failed to create GPU workspace");
         let mut optimizer = Adam::new(&cpu_net_for_gpu, AdamConfig::with_lr(0.01));
 
@@ -537,10 +567,18 @@ mod gpu_tests {
 
         let mut gpu_loss = 0.0;
         for _ in 0..100 {
-            gpu_loss = gpu_network.train_step_with_options(
-                &input, &target, None, batch_size, &mut gpu_workspace, 
-                &mut optimizer, &mut cpu_net_for_gpu, &train_opts
-            ).expect("GPU train failed");
+            gpu_loss = gpu_network
+                .train_step_with_options(
+                    &input,
+                    &target,
+                    None,
+                    batch_size,
+                    &mut gpu_workspace,
+                    &mut optimizer,
+                    &mut cpu_net_for_gpu,
+                    &train_opts,
+                )
+                .expect("GPU train failed");
         }
 
         println!("CPU final loss: {:.6}", cpu_loss);

@@ -1828,9 +1828,11 @@ impl GpuNetwork {
             mapped_at_creation: false,
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("download_encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("download_encoder"),
+            });
         encoder.copy_buffer_to_buffer(buffer, 0, &staging_buffer, 0, size as u64);
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -1840,7 +1842,8 @@ impl GpuNetwork {
             tx.send(result).unwrap();
         });
         self.device.poll(wgpu::Maintain::Wait);
-        rx.recv().map_err(|_| ArkanError::buffer("Failed to map buffer"))??;
+        rx.recv()
+            .map_err(|_| ArkanError::buffer("Failed to map buffer"))??;
 
         let data = slice.get_mapped_range();
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
@@ -1852,7 +1855,8 @@ impl GpuNetwork {
 
     /// Helper to upload f32 data to GPU buffer.
     fn upload_buffer_f32(&self, buffer: &wgpu::Buffer, data: &[f32]) {
-        self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
+        self.queue
+            .write_buffer(buffer, 0, bytemuck::cast_slice(data));
     }
 
     /// Performs backward pass, keeping gradients on GPU (no download).

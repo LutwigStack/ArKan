@@ -276,20 +276,20 @@ pub fn compute_basis_and_deriv(
         // But we only care about those in range [start_idx, span+1-p]
         // For derivatives, we need B_{j,p-1} for j in [start_idx, span+1]
         // That's (span+1 - start_idx + 1) = (span + 1 - (span - order) + 1) = order + 2 functions
-        
+
         // But at level p, the number of functions is reduced by p from level 0
         // Actually, the issue is: we need functions at level prev_order = order - 1
         // At level 0: we have (order + 2) functions initialized
         // At level 1: we need (order + 1) functions
         // At level prev_order = order - 1: we need 3 functions (when order >= 2)
-        
+
         // The correct formula: at level p, we need (order + 2 - p) functions
         // Final level is prev_order, so we need (order + 2 - prev_order) = (order + 2 - (order-1)) = 3 functions
         // But for derivatives of order p, we need (order + 2) basis functions of order (p-1)!
-        
+
         // The bug is: we're computing too few functions at the final level.
         // We need basis_prev[0..=order+1] but we're only computing num_funcs = order + 2 - p
-        
+
         // Fix: always compute (order + 2) functions at every level
         let num_funcs = order + 2; // Always need order+2 functions for derivative computation
 
@@ -298,13 +298,13 @@ pub fn compute_basis_and_deriv(
 
             // B_{j,p}(x) = (x - t_j)/(t_{j+p} - t_j) * B_{j,p-1}(x)
             //           + (t_{j+p+1} - x)/(t_{j+p+1} - t_{j+1}) * B_{j+1,p-1}(x)
-            
+
             // Make sure we don't go out of bounds on knots
             if j + p + 1 >= knots.len() {
                 new_basis[k] = 0.0;
                 continue;
             }
-            
+
             let denom1 = knots[j + p] - knots[j];
             let term1 = if denom1.abs() > EPSILON {
                 (x - knots[j]) / denom1 * basis_prev[k]

@@ -66,7 +66,7 @@ fn relative_error(ana: f32, num: f32) -> f32 {
 fn gradient_check_passes(ana: f32, num: f32) -> bool {
     let abs_err = (ana - num).abs();
     let max_abs = ana.abs().max(num.abs());
-    
+
     // For very small gradients, absolute error is more meaningful
     if max_abs < SMALL_GRAD_THRESHOLD {
         abs_err < MAX_ABSOLUTE_ERROR
@@ -260,7 +260,9 @@ fn run_gradient_check(config: &KanConfig, batch_size: usize, test_name: &str) {
     let mut max_error: f32 = 0.0;
 
     // First, collect layer info without borrowing network
-    let layer_info: Vec<(usize, usize)> = network.layers.iter()
+    let layer_info: Vec<(usize, usize)> = network
+        .layers
+        .iter()
         .map(|layer| (layer.weights.len(), layer.bias.len()))
         .collect();
 
@@ -286,7 +288,14 @@ fn run_gradient_check(config: &KanConfig, batch_size: usize, test_name: &str) {
         // Check selected weights
         for &w_idx in &weight_indices {
             let ana_grad = ana_weight_grads[layer_idx][w_idx];
-            let num_grad = numerical_gradient_weight(&mut network, &input, &target, &mut workspace, layer_idx, w_idx);
+            let num_grad = numerical_gradient_weight(
+                &mut network,
+                &input,
+                &target,
+                &mut workspace,
+                layer_idx,
+                w_idx,
+            );
 
             let rel_err = relative_error(ana_grad, num_grad);
             max_error = max_error.max(rel_err);
@@ -305,7 +314,14 @@ fn run_gradient_check(config: &KanConfig, batch_size: usize, test_name: &str) {
         // Check ALL biases (they're fewer)
         for b_idx in 0..num_biases {
             let ana_grad = ana_bias_grads[layer_idx][b_idx];
-            let num_grad = numerical_gradient_bias(&mut network, &input, &target, &mut workspace, layer_idx, b_idx);
+            let num_grad = numerical_gradient_bias(
+                &mut network,
+                &input,
+                &target,
+                &mut workspace,
+                layer_idx,
+                b_idx,
+            );
 
             let rel_err = relative_error(ana_grad, num_grad);
             max_error = max_error.max(rel_err);
@@ -331,7 +347,10 @@ fn run_gradient_check(config: &KanConfig, batch_size: usize, test_name: &str) {
     assert!(
         pass_rate >= MIN_PASS_RATE,
         "Gradient check failed: {}/{} checks passed ({:.1}%), min required: {:.0}%",
-        passed_checks, total_checks, pass_rate * 100.0, MIN_PASS_RATE * 100.0
+        passed_checks,
+        total_checks,
+        pass_rate * 100.0,
+        MIN_PASS_RATE * 100.0
     );
 }
 

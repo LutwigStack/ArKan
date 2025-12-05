@@ -145,7 +145,7 @@ impl<'de> Deserialize<'de> for KanLayer {
         }
 
         let data = KanLayerData::deserialize(deserializer)?;
-        
+
         // Recompute knots from grid_size, order, and grid_range
         let knots = compute_knots(data.grid_size, data.order, data.grid_range);
 
