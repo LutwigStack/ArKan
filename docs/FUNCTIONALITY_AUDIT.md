@@ -680,6 +680,13 @@
 | `test_nan_detection_skip` | `src/optimizer.rs` | NaN → skip step, weights unchanged | 🟢 Safety |
 | `test_nan_detection_fail` | `src/optimizer.rs` | NaN + fail_on_nan → Error | 🟢 Safety |
 | `test_send_sync_bounds` | `src/optimizer.rs` | Adam implements Send+Sync | 🟢 Thread Safety |
+| **PyTorch Reference Tests:** | | | |
+| `test_pytorch_adam_default_quadratic` | `tests/pytorch_reference.rs` | Adam formula vs PyTorch (tol=1e-5) | 🟢 PyTorch parity |
+| `test_pytorch_adam_with_weight_decay` | `tests/pytorch_reference.rs` | L2 decay in gradient | 🟢 PyTorch parity |
+| `test_pytorch_adamw_decoupled_weight_decay` | `tests/pytorch_reference.rs` | AdamW formula | 🟢 PyTorch parity |
+| `test_pytorch_adam_custom_betas` | `tests/pytorch_reference.rs` | β1=0.5, β2=0.9999 | 🟢 PyTorch parity |
+| `test_arkan_adam_integration` | `tests/pytorch_reference.rs` | ArKan Adam network integration | 🟢 Integration |
+| `test_arkan_adam_bias_correction` | `tests/pytorch_reference.rs` | Bias correction math | 🟢 Математический |
 
 ---
 
@@ -702,6 +709,13 @@
 | `test_send_sync_bounds` | `src/optimizer.rs` | SGD implements Send+Sync | 🟢 Thread Safety |
 | `test_sgd_nesterov` | `src/optimizer.rs` | Nesterov update formula: update = μ*v + g | 🟢 Algorithm |
 | `test_sgd_nesterov_vs_standard` | `src/optimizer.rs` | Nesterov more aggressive than standard | 🟢 Comparison |
+| **PyTorch Reference Tests:** | | | |
+| `test_pytorch_sgd_no_momentum` | `tests/pytorch_reference.rs` | SGD basic (0.8 decay) | 🟢 PyTorch parity |
+| `test_pytorch_sgd_with_momentum` | `tests/pytorch_reference.rs` | v = μ*v + g; θ -= lr*v | 🟢 PyTorch parity |
+| `test_pytorch_sgd_nesterov` | `tests/pytorch_reference.rs` | θ -= lr*(μ*v + g) | 🟢 PyTorch parity |
+| `test_pytorch_sgd_with_weight_decay` | `tests/pytorch_reference.rs` | L2 in gradient | 🟢 PyTorch parity |
+| `test_arkan_sgd_integration` | `tests/pytorch_reference.rs` | ArKan SGD network integration | 🟢 Integration |
+| `test_arkan_sgd_nesterov_more_aggressive` | `tests/pytorch_reference.rs` | Nesterov vs standard diverge | 🟢 Comparison |
 
 ---
 
@@ -728,6 +742,10 @@
 | `test_lbfgs_pack_unpack` | `src/optimizer.rs` | flatten_params/restore_params roundtrip | 🟢 Utility |
 | `test_line_search_method_default` | `src/optimizer.rs` | StrongWolfe is default | 🟢 Config |
 | `test_lbfgs_config_variants` | `src/optimizer.rs` | Different configs (history, lr, line search) | 🟢 Config |
+| **PyTorch Reference Tests:** | | | |
+| `test_pytorch_lbfgs_quadratic_convergence` | `tests/pytorch_reference.rs` | Quadratic loss verification | 🟢 Convergence |
+| `test_pytorch_lbfgs_rosenbrock` | `tests/pytorch_reference.rs` | Rosenbrock gradient check | 🟢 Gradient |
+| `test_arkan_lbfgs_creation` | `tests/pytorch_reference.rs` | LBFGS initialization | 🟢 API |
 
 ---
 
@@ -1828,6 +1846,21 @@
     - Parity: single==batch==parallel
   - ✅ **CPU Forward** оценка повышена с ⭐⭐⭐⭐ (4/5) до ⭐⭐⭐⭐⭐ (5/5)
   - ✅ Закрыты мертвые зоны: SIMD paths, scalar fallback, wide layers
+- **2025-01-20:** PyTorch reference tests для оптимизаторов:
+  - ✅ **tests/pytorch_reference.rs** — 15 новых тестов сравнения с PyTorch:
+    - Adam: default, weight_decay, custom betas (3 теста формул)
+    - AdamW: decoupled weight decay (1 тест формулы)
+    - SGD: no momentum, with momentum, Nesterov, weight decay (4 теста формул)
+    - LBFGS: quadratic convergence, Rosenbrock gradient check (2 теста)
+    - ArKan integration: Adam, SGD, Nesterov, bias correction, LBFGS creation (5 тестов)
+  - ✅ **scripts/pytorch_optimizer_reference.py** — генератор reference values
+  - ✅ **scripts/pytorch_reference_values.json** — сохранённые траектории из PyTorch
+  - ✅ Проверены формулы:
+    - Adam: m_t = β1*m + (1-β1)*g; v_t = β2*v + (1-β2)*g²; bias correction
+    - AdamW: decoupled weight decay (не через gradient)
+    - SGD: v = μ*v + g; θ -= lr*v
+    - SGD Nesterov: θ -= lr*(μ*v + g)
+  - ✅ ArKan реализации соответствуют PyTorch с точностью 1e-5
 - **2025-12-06:** Optimizer Module v2.1 реализация:
   - ✅ **trait Optimizer** — Unified API с step(), zero_grad(), get_lr/set_lr(), versioning
   - ✅ **Thread Safety** — Adam, SGD, LBFGS реализуют Send + Sync
