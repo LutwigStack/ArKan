@@ -4,7 +4,7 @@
 
 ---
 
-## `GpuNetwork::train_step_with_options` (Hybrid)
+## 6.1 `GpuNetwork::train_step_with_options` (Hybrid)
 
 | Аспект | Задумано | Реально |
 |--------|----------|---------|
@@ -22,7 +22,7 @@
 
 ---
 
-## `train_step_gpu_native` и `train_step_gpu_native_with_options`
+## 6.2 `train_step_gpu_native` и `train_step_gpu_native_with_options`
 
 | Аспект | Задумано | Реально |
 |--------|----------|---------|
@@ -33,7 +33,7 @@
 
 ---
 
-## Тесты (`tests/gpu_training_parity.rs`)
+## 6.3 Тесты (`tests/gpu_training_parity.rs`)
 
 | Тест | Что проверяет | Оценка |
 |------|---------------|--------|
@@ -52,7 +52,7 @@
 
 ---
 
-## Выводы
+## 6.4 Выводы
 
 | Аспект | Статус |
 |--------|--------|
@@ -70,7 +70,7 @@
 
 ---
 
-## Мертвые зоны
+## 6.5 Мертвые зоны
 
 | Область | Риск | Причина |
 |---------|------|----------|

@@ -26,9 +26,9 @@
 | Loss Functions | ⭐⭐⭐⭐⭐ (5/5) | PyTorch parity (8 тестов) | [11-loss-functions.md](11-loss-functions.md) |
 | BakedModel | ⭐⭐⭐ (3/5) | Serialization roundtrip нет | [12-baked-model.md](12-baked-model.md) |
 | Config | ⭐⭐⭐⭐⭐ (5/5) | Builder API полное покрытие | [13-config.md](13-config.md) |
-| game2048 | ⭐⭐ (2/5) | Только manual testing | [14-game2048.md](14-game2048.md) |
+| Examples | ⭐⭐⭐⭐ (4/5) | 6 примеров: basic, training, GPU, sinusoid, MNIST, game2048 | [14-examples.md](14-examples.md) |
 
-**Средняя оценка:** 4.4/5 ⭐⭐⭐⭐ (хорошо)
+**Средняя оценка:** 4.5/5 ⭐⭐⭐⭐ (хорошо)
 
 ---
 
@@ -42,7 +42,7 @@
 | ~~Bias gradients~~ | ~~CPU Backward~~ | ✅ Покрыто (parity тесты) |
 | Versioning моделей | Serialization | Старые модели могут не загрузиться |
 | BakedModel serialization | BakedModel | to_bytes/from_bytes не проверяется |
-| DQN корректность | game2048 | Bellman equation не тестируется |
+| game2048 DQN корректность | Examples | Bellman equation не тестируется |
 | ~~Hybrid Adam bug~~ | ~~GPU Training~~ | ✅ **ИСПРАВЛЕНО** — `unpad_weights` |
 
 ---
