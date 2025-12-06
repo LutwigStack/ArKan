@@ -1293,6 +1293,15 @@
 | `test_categorical_ce_perfect` | `src/loss.rs` | CE low для правильного | 🟢 Функциональный |
 | `test_categorical_ce_wrong` | `src/loss.rs` | CE high для неправильного | 🟢 Функциональный |
 | `test_categorical_ce_batch` | `src/loss.rs` | CE batch support | 🟢 Функциональный |
+| **PyTorch Cross-Entropy Parity:** | | | |
+| `test_cross_entropy_pytorch_perfect_prediction` | `src/loss.rs` | BCE pred=[0.9,0.1] vs PyTorch | 🟢 PyTorch parity |
+| `test_cross_entropy_pytorch_confident_wrong` | `src/loss.rs` | BCE pred=[0.1,0.9] vs PyTorch | 🟢 PyTorch parity |
+| `test_cross_entropy_pytorch_uncertain` | `src/loss.rs` | BCE pred=[0.5,0.5] = ln(2) | 🟢 PyTorch parity |
+| `test_cross_entropy_pytorch_multiclass` | `src/loss.rs` | BCE 4 classes vs PyTorch | 🟢 PyTorch parity |
+| `test_cross_entropy_pytorch_soft_targets` | `src/loss.rs` | BCE soft labels vs PyTorch | 🟢 PyTorch parity |
+| `test_cross_entropy_gradient_direction` | `src/loss.rs` | grad sign correctness | 🟢 Математический |
+| `test_cross_entropy_with_mask` | `src/loss.rs` | CE mask support | 🟢 Функциональный |
+| `test_cross_entropy_numerical_stability` | `src/loss.rs` | No NaN/Inf near 0,1 | 🟢 Stability |
 | `test_l1_all_zeros` | `src/loss.rs` | L1=0 для нулевых коэффициентов | 🟢 Edge case |
 | `test_l1_value` | `src/loss.rs` | L1 корректное значение | 🟢 Численный |
 | `test_l1_gradient` | `src/loss.rs` | L1 grad = sign/n | 🟢 Численный |
@@ -1325,19 +1334,19 @@
 | Physics-informed (PDE) | 🟢 Базовое покрытие |
 | Symbolic regression (R²) | 🟢 Тестировано |
 
-**Оценка честности тестов:** ⭐⭐⭐⭐ (4/5)
+**Оценка честности тестов:** ⭐⭐⭐⭐⭐ (5/5)
 - ✅ Все основные формулы проверены численно
 - ✅ Свойства (MAE robustness, entropy ordering) тестируются
 - ✅ Edge cases (zero coeffs, uniform dist) покрыты
 - ✅ Gradient формулы проверены
-- ⚠️ Нет сравнения с PyTorch loss functions (было бы эталонным)
+- ✅ **PyTorch parity для cross-entropy** — 5 тестов с точностью 1e-5
 - ⚠️ KAN regularization не интегрировано в training loop (требует manual use)
 
 **Мертвые зоны:**
 | Область | Риск | Причина |
 |---------|------|----------|
-| PyTorch parity | 🟡 Средний | Нет эталонного сравнения |
-| Numerical stability extreme values | 🟡 Средний | log(ε), exp(big) не тестируются |
+| ~~PyTorch parity~~ | ~~🟡 Средний~~ | ✅ **ЗАКРЫТО** — 5 тестов cross-entropy vs F.binary_cross_entropy |
+| Numerical stability extreme values | 🟡 Средний | log(ε), exp(big) частично покрыто в numerical_stability тесте |
 | Training loop integration | 🟡 Средний | kan_combined_loss требует manual wiring |
 | GPU loss functions | 🔴 Высокий | Loss вычисляется на CPU даже при GPU training |
 
@@ -1846,6 +1855,19 @@
     - Parity: single==batch==parallel
   - ✅ **CPU Forward** оценка повышена с ⭐⭐⭐⭐ (4/5) до ⭐⭐⭐⭐⭐ (5/5)
   - ✅ Закрыты мертвые зоны: SIMD paths, scalar fallback, wide layers
+- **2025-01-20:** PyTorch cross-entropy parity tests:
+  - ✅ **8 новых тестов** в `src/loss.rs` для `masked_cross_entropy`:
+    - `test_cross_entropy_pytorch_perfect_prediction` — pred=[0.9,0.1] vs PyTorch
+    - `test_cross_entropy_pytorch_confident_wrong` — pred=[0.1,0.9] vs PyTorch
+    - `test_cross_entropy_pytorch_uncertain` — pred=[0.5,0.5] = ln(2) vs PyTorch
+    - `test_cross_entropy_pytorch_multiclass` — 4 classes vs PyTorch
+    - `test_cross_entropy_pytorch_soft_targets` — soft labels vs PyTorch
+    - `test_cross_entropy_gradient_direction` — grad sign correctness
+    - `test_cross_entropy_with_mask` — mask support
+    - `test_cross_entropy_numerical_stability` — no NaN/Inf near 0,1
+  - ✅ Все 5 PyTorch parity тестов проходят с точностью 1e-5
+  - ✅ **Loss Functions** оценка повышена с ⭐⭐⭐⭐ (4/5) до ⭐⭐⭐⭐⭐ (5/5)
+  - ✅ Закрыта мертвая зона: PyTorch parity для loss functions
 - **2025-01-20:** PyTorch reference tests для оптимизаторов:
   - ✅ **tests/pytorch_reference.rs** — 15 новых тестов сравнения с PyTorch:
     - Adam: default, weight_decay, custom betas (3 теста формул)

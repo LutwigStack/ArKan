@@ -1642,4 +1642,166 @@ mod tests {
         assert!(loss < 0.5); // Good predictions
         assert_eq!(grad.len(), 4);
     }
+
+    // =========================================================================
+    // Cross-Entropy PyTorch Parity Tests
+    // =========================================================================
+    //
+    // These tests compare masked_cross_entropy (binary CE) with PyTorch's
+    // F.binary_cross_entropy. Reference values generated via:
+    //   python -c "import torch; import torch.nn.functional as F; ..."
+    //
+    // Formula: BCE = -Σ[t*log(p) + (1-t)*log(1-p)] / n
+    
+    #[test]
+    fn test_cross_entropy_pytorch_perfect_prediction() {
+        // PyTorch: pred=[0.9,0.1], target=[1.0,0.0], loss=0.10536053776741028
+        let predictions = vec![0.9f32, 0.1];
+        let targets = vec![1.0f32, 0.0];
+        
+        let (loss, _) = masked_cross_entropy(&predictions, &targets, None);
+        
+        // PyTorch reference: 0.10536053776741028
+        let pytorch_loss = 0.10536053776741028f32;
+        let tolerance = 1e-5;
+        
+        assert!(
+            (loss - pytorch_loss).abs() < tolerance,
+            "Cross-entropy perfect prediction: ArKan={}, PyTorch={}, diff={}",
+            loss, pytorch_loss, (loss - pytorch_loss).abs()
+        );
+    }
+    
+    #[test]
+    fn test_cross_entropy_pytorch_confident_wrong() {
+        // PyTorch: pred=[0.1,0.9], target=[1.0,0.0], loss=2.3025851249694824
+        let predictions = vec![0.1f32, 0.9];
+        let targets = vec![1.0f32, 0.0];
+        
+        let (loss, _) = masked_cross_entropy(&predictions, &targets, None);
+        
+        // PyTorch reference: 2.3025851249694824
+        let pytorch_loss = 2.3025851249694824f32;
+        let tolerance = 1e-4; // Slightly higher tolerance for large loss
+        
+        assert!(
+            (loss - pytorch_loss).abs() < tolerance,
+            "Cross-entropy confident wrong: ArKan={}, PyTorch={}, diff={}",
+            loss, pytorch_loss, (loss - pytorch_loss).abs()
+        );
+    }
+    
+    #[test]
+    fn test_cross_entropy_pytorch_uncertain() {
+        // PyTorch: pred=[0.5,0.5], target=[1.0,0.0], loss=0.6931471824645996
+        let predictions = vec![0.5f32, 0.5];
+        let targets = vec![1.0f32, 0.0];
+        
+        let (loss, _) = masked_cross_entropy(&predictions, &targets, None);
+        
+        // PyTorch reference: 0.6931471824645996 (= ln(2))
+        let pytorch_loss = 0.6931471824645996f32;
+        let tolerance = 1e-5;
+        
+        assert!(
+            (loss - pytorch_loss).abs() < tolerance,
+            "Cross-entropy uncertain: ArKan={}, PyTorch={}, diff={}",
+            loss, pytorch_loss, (loss - pytorch_loss).abs()
+        );
+    }
+    
+    #[test]
+    fn test_cross_entropy_pytorch_multiclass() {
+        // PyTorch: pred=[0.7,0.1,0.1,0.1], target=[1.0,0.0,0.0,0.0], loss=0.1681891232728958
+        let predictions = vec![0.7f32, 0.1, 0.1, 0.1];
+        let targets = vec![1.0f32, 0.0, 0.0, 0.0];
+        
+        let (loss, _) = masked_cross_entropy(&predictions, &targets, None);
+        
+        // PyTorch reference: 0.1681891232728958
+        let pytorch_loss = 0.1681891232728958f32;
+        let tolerance = 1e-5;
+        
+        assert!(
+            (loss - pytorch_loss).abs() < tolerance,
+            "Cross-entropy multiclass: ArKan={}, PyTorch={}, diff={}",
+            loss, pytorch_loss, (loss - pytorch_loss).abs()
+        );
+    }
+    
+    #[test]
+    fn test_cross_entropy_pytorch_soft_targets() {
+        // PyTorch: pred=[0.6,0.4], target=[0.7,0.3], loss=0.632465124130249
+        let predictions = vec![0.6f32, 0.4];
+        let targets = vec![0.7f32, 0.3]; // Soft labels (not one-hot)
+        
+        let (loss, _) = masked_cross_entropy(&predictions, &targets, None);
+        
+        // PyTorch reference: 0.632465124130249
+        let pytorch_loss = 0.632465124130249f32;
+        let tolerance = 1e-5;
+        
+        assert!(
+            (loss - pytorch_loss).abs() < tolerance,
+            "Cross-entropy soft targets: ArKan={}, PyTorch={}, diff={}",
+            loss, pytorch_loss, (loss - pytorch_loss).abs()
+        );
+    }
+    
+    #[test]
+    fn test_cross_entropy_gradient_direction() {
+        // Gradient should point toward correct answer
+        // If prediction < target, gradient should be negative (increase prediction)
+        // If prediction > target, gradient should be positive (decrease prediction)
+        
+        let predictions = vec![0.3f32, 0.7]; // pred[0] < target[0], pred[1] > target[1]
+        let targets = vec![0.6f32, 0.4];
+        
+        let (_, grad) = masked_cross_entropy(&predictions, &targets, None);
+        
+        // grad = (p - t) / (p * (1-p)) but we use simplified (p - t)
+        // For p=0.3, t=0.6: gradient should be negative (0.3 - 0.6 = -0.3)
+        assert!(grad[0] < 0.0, "Gradient should be negative when pred < target");
+        // For p=0.7, t=0.4: gradient should be positive (0.7 - 0.4 = 0.3)
+        assert!(grad[1] > 0.0, "Gradient should be positive when pred > target");
+    }
+    
+    #[test]
+    fn test_cross_entropy_with_mask() {
+        // Test that masking works correctly
+        let predictions = vec![0.9f32, 0.1, 0.5, 0.5];
+        let targets = vec![1.0f32, 0.0, 1.0, 0.0];
+        let mask = vec![1.0f32, 1.0, 0.0, 0.0]; // Only first two elements
+        
+        let (loss_masked, grad_masked) = masked_cross_entropy(&predictions, &targets, Some(&mask));
+        let (loss_first_two, _) = masked_cross_entropy(&predictions[..2], &targets[..2], None);
+        
+        // Masked loss should equal loss of first two elements only
+        let tolerance = 1e-6;
+        assert!(
+            (loss_masked - loss_first_two).abs() < tolerance,
+            "Masked loss should match: masked={}, first_two={}",
+            loss_masked, loss_first_two
+        );
+        
+        // Masked elements should have zero gradient
+        assert!(grad_masked[2].abs() < EPSILON, "Masked element should have zero gradient");
+        assert!(grad_masked[3].abs() < EPSILON, "Masked element should have zero gradient");
+    }
+    
+    #[test]
+    fn test_cross_entropy_numerical_stability() {
+        // Test edge cases near 0 and 1 (should not produce NaN/Inf)
+        let predictions = vec![0.0001f32, 0.9999, 0.5]; // Very close to boundaries
+        let targets = vec![0.0f32, 1.0, 0.5];
+        
+        let (loss, grad) = masked_cross_entropy(&predictions, &targets, None);
+        
+        assert!(loss.is_finite(), "Loss should be finite, got {}", loss);
+        assert!(grad.iter().all(|g| g.is_finite()), "All gradients should be finite");
+        
+        // Loss should be reasonable (not exploding)
+        // Note: p=0.5, t=0.5 gives -0.5*ln(0.5) - 0.5*ln(0.5) = ln(2) ≈ 0.693
+        assert!(loss < 1.0, "Loss should not explode, got {}", loss);
+    }
 }
