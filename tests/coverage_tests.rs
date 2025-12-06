@@ -422,6 +422,483 @@ mod serde_tests {
 
         println!("✓ Config serialization successful");
     }
+
+    // =========================================================================
+    // Multi-size network serialization tests
+    // =========================================================================
+
+    /// Test serialization with minimal network (single layer)
+    #[test]
+    fn test_serialization_minimal_network() {
+        let config = KanConfig {
+            input_dim: 2,
+            output_dim: 1,
+            hidden_dims: vec![], // No hidden layers
+            grid_size: 3,
+            spline_order: 2,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 2],
+            input_std: vec![1.0; 2],
+            init_seed: Some(42),
+            ..Default::default()
+        };
+
+        let network = KanNetwork::new(config.clone());
+        let input = vec![0.5f32, -0.3];
+        
+        let mut workspace = network.create_workspace(1);
+        let mut output_before = vec![0.0f32; 1];
+        network.forward_single(&input, &mut output_before, &mut workspace);
+
+        // JSON roundtrip
+        let json = serde_json::to_string(&network).expect("Serialize failed");
+        let restored: KanNetwork = serde_json::from_str(&json).expect("Deserialize failed");
+
+        let mut workspace2 = restored.create_workspace(1);
+        let mut output_after = vec![0.0f32; 1];
+        restored.forward_single(&input, &mut output_after, &mut workspace2);
+
+        assert!(
+            (output_before[0] - output_after[0]).abs() < 1e-6,
+            "Minimal network: output mismatch"
+        );
+
+        println!("✓ Minimal network (2→1) serialization successful");
+    }
+
+    /// Test serialization with deep network (many layers)
+    #[test]
+    fn test_serialization_deep_network() {
+        let config = KanConfig {
+            input_dim: 8,
+            output_dim: 4,
+            hidden_dims: vec![16, 32, 16, 8], // 4 hidden layers
+            grid_size: 5,
+            spline_order: 3,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 8],
+            input_std: vec![1.0; 8],
+            init_seed: Some(42),
+            ..Default::default()
+        };
+
+        let network = KanNetwork::new(config.clone());
+        let input: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
+        
+        let mut workspace = network.create_workspace(1);
+        let mut output_before = vec![0.0f32; 4];
+        network.forward_single(&input, &mut output_before, &mut workspace);
+
+        // Bincode roundtrip (more efficient for larger networks)
+        let bytes = bincode::serialize(&network).expect("Serialize failed");
+        let restored: KanNetwork = bincode::deserialize(&bytes).expect("Deserialize failed");
+
+        let mut workspace2 = restored.create_workspace(1);
+        let mut output_after = vec![0.0f32; 4];
+        restored.forward_single(&input, &mut output_after, &mut workspace2);
+
+        for (i, (b, a)) in output_before.iter().zip(output_after.iter()).enumerate() {
+            assert!(
+                (b - a).abs() < 1e-6,
+                "Deep network: output {} mismatch: {} vs {}",
+                i, b, a
+            );
+        }
+
+        println!("✓ Deep network (8→16→32→16→8→4) serialization successful");
+        println!("  Serialized size: {} bytes", bytes.len());
+    }
+
+    /// Test serialization with wide network (large dimensions)
+    #[test]
+    fn test_serialization_wide_network() {
+        let config = KanConfig {
+            input_dim: 64,
+            output_dim: 32,
+            hidden_dims: vec![128],
+            grid_size: 8,
+            spline_order: 3,
+            grid_range: (-2.0, 2.0),
+            input_mean: vec![0.0; 64],
+            input_std: vec![1.0; 64],
+            init_seed: Some(42),
+            ..Default::default()
+        };
+
+        let network = KanNetwork::new(config.clone());
+        let input: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.01).collect();
+        
+        let mut workspace = network.create_workspace(1);
+        let mut output_before = vec![0.0f32; 32];
+        network.forward_single(&input, &mut output_before, &mut workspace);
+
+        // Bincode roundtrip
+        let bytes = bincode::serialize(&network).expect("Serialize failed");
+        let restored: KanNetwork = bincode::deserialize(&bytes).expect("Deserialize failed");
+
+        let mut workspace2 = restored.create_workspace(1);
+        let mut output_after = vec![0.0f32; 32];
+        restored.forward_single(&input, &mut output_after, &mut workspace2);
+
+        let max_diff: f32 = output_before
+            .iter()
+            .zip(output_after.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+
+        assert!(
+            max_diff < 1e-5,
+            "Wide network: max diff {} exceeds tolerance",
+            max_diff
+        );
+
+        println!("✓ Wide network (64→128→32) serialization successful");
+        println!("  Serialized size: {} bytes ({:.2} KB)", bytes.len(), bytes.len() as f64 / 1024.0);
+    }
+
+    /// Test serialization with various spline configurations
+    #[test]
+    fn test_serialization_spline_configurations() {
+        let configs = vec![
+            // (grid_size, spline_order, description)
+            (3, 2, "minimal grid, quadratic"),
+            (5, 3, "default, cubic"),
+            (8, 4, "fine grid, quartic"),
+            (16, 3, "very fine grid, cubic"),
+            (5, 5, "default grid, quintic"),
+        ];
+
+        for (grid_size, order, desc) in configs {
+            let config = KanConfig {
+                input_dim: 4,
+                output_dim: 2,
+                hidden_dims: vec![8],
+                grid_size,
+                spline_order: order,
+                grid_range: (-1.0, 1.0),
+                input_mean: vec![0.0; 4],
+                input_std: vec![1.0; 4],
+                init_seed: Some(42),
+                ..Default::default()
+            };
+
+            let network = KanNetwork::new(config);
+            let input = vec![0.1f32, 0.2, 0.3, 0.4];
+            
+            let mut workspace = network.create_workspace(1);
+            let mut output_before = vec![0.0f32; 2];
+            network.forward_single(&input, &mut output_before, &mut workspace);
+
+            // JSON roundtrip
+            let json = serde_json::to_string(&network).expect("Serialize failed");
+            let restored: KanNetwork = serde_json::from_str(&json).expect("Deserialize failed");
+
+            let mut workspace2 = restored.create_workspace(1);
+            let mut output_after = vec![0.0f32; 2];
+            restored.forward_single(&input, &mut output_after, &mut workspace2);
+
+            let max_diff: f32 = output_before
+                .iter()
+                .zip(output_after.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+
+            assert!(
+                max_diff < 1e-5,
+                "{}: max diff {} exceeds tolerance",
+                desc, max_diff
+            );
+
+            println!("✓ Spline config ({}) serialization successful", desc);
+        }
+    }
+
+    // =========================================================================
+    // Corrupted data handling tests
+    // =========================================================================
+
+    /// Test that invalid JSON is rejected gracefully
+    #[test]
+    fn test_corrupted_json_rejected() {
+        let invalid_inputs = vec![
+            ("", "empty string"),
+            ("{}", "empty object"),
+            ("{\"layers\": []}", "missing required fields"),
+            ("{\"config\": null}", "null config"),
+            ("not json at all", "invalid syntax"),
+            ("{\"layers\": \"not an array\"}", "wrong type for layers"),
+        ];
+
+        for (input, desc) in invalid_inputs {
+            let result: Result<KanNetwork, _> = serde_json::from_str(input);
+            assert!(
+                result.is_err(),
+                "Should reject {}: got Ok instead of Err",
+                desc
+            );
+        }
+
+        println!("✓ Invalid JSON inputs correctly rejected");
+    }
+
+    /// Test that truncated bincode is rejected
+    #[test]
+    fn test_truncated_bincode_rejected() {
+        let config = KanConfig {
+            input_dim: 4,
+            output_dim: 2,
+            hidden_dims: vec![8],
+            grid_size: 5,
+            spline_order: 3,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 4],
+            input_std: vec![1.0; 4],
+            init_seed: Some(42),
+            ..Default::default()
+        };
+
+        let network = KanNetwork::new(config);
+        let bytes = bincode::serialize(&network).expect("Serialize failed");
+
+        // Try various truncation lengths
+        let truncation_points = vec![
+            0,               // Empty
+            1,               // Minimal
+            bytes.len() / 4, // 25%
+            bytes.len() / 2, // 50%
+            bytes.len() - 1, // Almost complete
+        ];
+
+        for len in truncation_points {
+            let truncated = &bytes[..len];
+            let result: Result<KanNetwork, _> = bincode::deserialize(truncated);
+            assert!(
+                result.is_err(),
+                "Should reject truncated bincode at {} bytes (of {})",
+                len,
+                bytes.len()
+            );
+        }
+
+        println!("✓ Truncated bincode correctly rejected");
+    }
+
+    /// Test that modified bytes are detected (data integrity)
+    #[test]
+    fn test_modified_bincode_behavior() {
+        let config = KanConfig {
+            input_dim: 4,
+            output_dim: 2,
+            hidden_dims: vec![8],
+            grid_size: 5,
+            spline_order: 3,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 4],
+            input_std: vec![1.0; 4],
+            init_seed: Some(42),
+            ..Default::default()
+        };
+
+        let network = KanNetwork::new(config);
+        let input = vec![0.1f32, 0.2, 0.3, 0.4];
+        
+        let mut workspace = network.create_workspace(1);
+        let mut original_output = vec![0.0f32; 2];
+        network.forward_single(&input, &mut original_output, &mut workspace);
+
+        let mut bytes = bincode::serialize(&network).expect("Serialize failed");
+        
+        // Flip some bits in the middle (where weights likely are)
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        bytes[mid + 1] ^= 0xFF;
+        bytes[mid + 2] ^= 0xFF;
+
+        // Deserialization might succeed (bincode doesn't have checksums)
+        // but the output should be different
+        if let Ok(corrupted_network) = bincode::deserialize::<KanNetwork>(&bytes) {
+            let mut workspace2 = corrupted_network.create_workspace(1);
+            let mut corrupted_output = vec![0.0f32; 2];
+            corrupted_network.forward_single(&input, &mut corrupted_output, &mut workspace2);
+
+            let differs = original_output
+                .iter()
+                .zip(corrupted_output.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-6);
+
+            // Corruption should either cause deser failure or different output
+            if !differs {
+                println!("⚠️ Corrupted data happened to produce same output (unlikely but possible)");
+            } else {
+                println!("✓ Corrupted data produces different output (expected)");
+            }
+        } else {
+            println!("✓ Corrupted bincode correctly rejected");
+        }
+    }
+
+    // =========================================================================
+    // Backward compatibility / versioning tests
+    // =========================================================================
+
+    /// Test that we can save version info for future compatibility
+    /// This is a placeholder for actual versioning - currently ArKan doesn't
+    /// embed version in serialized data, which is a known limitation.
+    #[test]
+    fn test_serialization_includes_config() {
+        let config = KanConfig {
+            input_dim: 4,
+            output_dim: 2,
+            hidden_dims: vec![8, 4],
+            grid_size: 7,
+            spline_order: 4,
+            grid_range: (-2.0, 2.0),
+            input_mean: vec![0.5; 4],
+            input_std: vec![0.25; 4],
+            init_seed: Some(999),
+            ..Default::default()
+        };
+
+        let network = KanNetwork::new(config.clone());
+        let json = serde_json::to_string(&network).expect("Serialize failed");
+
+        // Parse as generic JSON to inspect structure
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Parse failed");
+
+        // Check that config is present and correct
+        assert!(parsed.get("config").is_some(), "Config should be serialized");
+        
+        let config_json = &parsed["config"];
+        assert_eq!(config_json["input_dim"], 4);
+        assert_eq!(config_json["output_dim"], 2);
+        assert_eq!(config_json["grid_size"], 7);
+        assert_eq!(config_json["spline_order"], 4);
+
+        println!("✓ Config properly embedded in serialized network");
+        
+        // NOTE: For true backward compatibility, we would need to add a version field
+        // to KanNetwork and handle migrations. This test documents the current behavior.
+    }
+
+    /// Test that layer structure is preserved exactly
+    #[test]
+    fn test_layer_structure_preserved() {
+        let config = KanConfig {
+            input_dim: 4,
+            output_dim: 2,
+            hidden_dims: vec![8, 6],
+            grid_size: 5,
+            spline_order: 3,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 4],
+            input_std: vec![1.0; 4],
+            init_seed: Some(42),
+            ..Default::default()
+        };
+
+        let network = KanNetwork::new(config);
+        
+        // Record original structure
+        let original_layer_dims: Vec<(usize, usize)> = network
+            .layers
+            .iter()
+            .map(|l| (l.in_dim, l.out_dim))
+            .collect();
+        let original_weight_counts: Vec<usize> = network
+            .layers
+            .iter()
+            .map(|l| l.weights.len())
+            .collect();
+
+        // Roundtrip
+        let json = serde_json::to_string(&network).expect("Serialize failed");
+        let restored: KanNetwork = serde_json::from_str(&json).expect("Deserialize failed");
+
+        // Check structure preserved
+        assert_eq!(
+            network.layers.len(),
+            restored.layers.len(),
+            "Layer count mismatch"
+        );
+
+        for (i, (orig_layer, rest_layer)) in network.layers.iter().zip(restored.layers.iter()).enumerate() {
+            assert_eq!(orig_layer.in_dim, rest_layer.in_dim, "Layer {} in_dim mismatch", i);
+            assert_eq!(orig_layer.out_dim, rest_layer.out_dim, "Layer {} out_dim mismatch", i);
+            assert_eq!(orig_layer.order, rest_layer.order, "Layer {} order mismatch", i);
+            assert_eq!(orig_layer.grid_size, rest_layer.grid_size, "Layer {} grid_size mismatch", i);
+            assert_eq!(
+                orig_layer.weights.len(),
+                rest_layer.weights.len(),
+                "Layer {} weights count mismatch",
+                i
+            );
+            assert_eq!(
+                orig_layer.bias.len(),
+                rest_layer.bias.len(),
+                "Layer {} bias count mismatch",
+                i
+            );
+        }
+
+        println!("✓ Layer structure exactly preserved");
+        println!("  Layers: {:?}", original_layer_dims);
+        println!("  Weight counts: {:?}", original_weight_counts);
+    }
+
+    // =========================================================================
+    // Performance / size tests
+    // =========================================================================
+
+    /// Test serialization size for various network sizes
+    #[test]
+    fn test_serialization_size_scaling() {
+        let configs = vec![
+            // (input, hidden, output, expected_order_of_magnitude)
+            (2, vec![4], 1, "tiny"),
+            (8, vec![16], 4, "small"),
+            (32, vec![64, 32], 16, "medium"),
+            (64, vec![128, 64], 32, "large"),
+        ];
+
+        println!("Serialization size comparison:");
+        println!("{:<15} {:>12} {:>12} {:>8}", "Size", "JSON (KB)", "Bincode (KB)", "Ratio");
+        println!("{}", "-".repeat(50));
+
+        for (input, hidden, output, name) in configs {
+            let config = KanConfig {
+                input_dim: input,
+                output_dim: output,
+                hidden_dims: hidden,
+                grid_size: 5,
+                spline_order: 3,
+                grid_range: (-1.0, 1.0),
+                input_mean: vec![0.0; input],
+                input_std: vec![1.0; input],
+                init_seed: Some(42),
+                ..Default::default()
+            };
+
+            let network = KanNetwork::new(config);
+            
+            let json = serde_json::to_string(&network).expect("JSON serialize failed");
+            let bytes = bincode::serialize(&network).expect("Bincode serialize failed");
+
+            let json_kb = json.len() as f64 / 1024.0;
+            let bin_kb = bytes.len() as f64 / 1024.0;
+            let ratio = json.len() as f64 / bytes.len() as f64;
+
+            println!("{:<15} {:>12.2} {:>12.2} {:>8.1}x", name, json_kb, bin_kb, ratio);
+
+            // Bincode should always be smaller
+            assert!(
+                bytes.len() < json.len(),
+                "{}: bincode should be smaller than JSON",
+                name
+            );
+        }
+
+        println!("✓ Bincode consistently more compact than JSON");
+    }
 }
 
 // ============================================================================

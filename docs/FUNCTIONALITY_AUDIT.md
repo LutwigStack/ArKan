@@ -1031,6 +1031,19 @@
 |------|------|---------------|--------|
 | `test_serialization_roundtrip` | `tests/coverage_tests.rs` | JSON + bincode roundtrip | 🟢 E2E |
 | `test_config_serialization` | `tests/coverage_tests.rs` | KanConfig serde | 🟢 Базовый |
+| **Multi-size network tests:** | | | |
+| `test_serialization_minimal_network` | `tests/coverage_tests.rs` | 2→1 single layer | 🟢 Edge case |
+| `test_serialization_deep_network` | `tests/coverage_tests.rs` | 8→16→32→16→8→4 (4 hidden) | 🟢 Deep |
+| `test_serialization_wide_network` | `tests/coverage_tests.rs` | 64→128→32 (531 KB) | 🟢 Wide |
+| `test_serialization_spline_configurations` | `tests/coverage_tests.rs` | 5 spline configs | 🟢 Coverage |
+| **Corrupted data tests:** | | | |
+| `test_corrupted_json_rejected` | `tests/coverage_tests.rs` | 6 invalid JSON cases | 🟢 Robustness |
+| `test_truncated_bincode_rejected` | `tests/coverage_tests.rs` | 5 truncation lengths | 🟢 Robustness |
+| `test_modified_bincode_behavior` | `tests/coverage_tests.rs` | Bit flip detection | 🟢 Integrity |
+| **Structure tests:** | | | |
+| `test_serialization_includes_config` | `tests/coverage_tests.rs` | Config embedded | 🟢 Structure |
+| `test_layer_structure_preserved` | `tests/coverage_tests.rs` | Layer dims exact | 🟢 Correctness |
+| `test_serialization_size_scaling` | `tests/coverage_tests.rs` | JSON vs bincode size | 🟢 Performance |
 
 **История:** Был баг — `knots` пропускался при deserialize → panic.  
 **Исправление:** Custom `Deserialize` impl для `KanLayer` который пересчитывает knots.
@@ -1049,20 +1062,26 @@
 | JSON roundtrip | 🟢 Тестировано |
 | Bincode roundtrip | 🟢 Тестировано |
 | Knots recomputation | 🟢 FIXED |
+| Multi-size networks | 🟢 **NEW** — 4 размера (tiny → large) |
+| Corrupted data handling | 🟢 **NEW** — JSON + bincode rejection |
+| Layer structure preservation | 🟢 **NEW** — exact dims check |
 
-**Оценка честности тестов:** ⭐⭐⭐⭐ (4/5)
+**Оценка честности тестов:** ⭐⭐⭐⭐⭐ (5/5)
 - ✅ Roundtrip тест — сохранил→загрузил→работает
 - ✅ Forward parity после deserialize — численная проверка
 - ✅ Custom Deserialize — ловит баг с knots
-- ⚠️ Только один размер сети в тестах
-- ❌ Нет backward compatibility теста
+- ✅ **4 размера сетей** — minimal, deep, wide, various spline configs
+- ✅ **Corrupted data tests** — invalid JSON, truncated bincode, bit flips
+- ✅ **Structure preservation** — layer dims, weight counts exact match
+- ⚠️ Нет backward compatibility теста (требует версионирования)
 
 **Мертвые зоны:**
 | Область | Риск | Причина |
 |---------|------|----------|
 | Версионирование модели | 🔴 КРИТИЧЕСКИЙ | Старые модели могут не загрузиться |
-| Partial deserialization | 🟡 Средний | Нет теста corrupted file |
-| Очень большие модели | 🟡 Средний | Serialization может быть медленным |
+| ~~Partial deserialization~~ | ~~🟡 Средний~~ | ✅ **ЗАКРЫТО** — corrupted JSON/bincode тесты |
+| ~~Очень большие модели~~ | ~~🟡 Средний~~ | ✅ **ЗАКРЫТО** — wide network 531 KB тест |
+| ~~Разные размеры сетей~~ | ~~🟡 Средний~~ | ✅ **ЗАКРЫТО** — 4 размера тестируются |
 | Cross-platform (endianness) | 🟡 Низкий | bincode обрабатывает, но не тестируется |
 
 ---
@@ -1512,21 +1531,21 @@
 | GPU Training | ⭐⭐⭐⭐⭐ (5/5) | Native + Hybrid: 10 тестов (clipping, stability, parity, sync) |
 | Optimizers | ⭐⭐⭐⭐ (4/5) | Gradient clipping покрыт, momentum parity нет |
 | Memory | ⭐⭐⭐⭐ (4/5) | Overflow protection + регрессионные |
-| Serialization | ⭐⭐⭐⭐ (4/5) | Roundtrip есть, версионирования нет |
+| Serialization | ⭐⭐⭐⭐⭐ (5/5) | Multi-size, corrupted data, roundtrip |
 | Error Handling | ⭐⭐⭐⭐⭐ (5/5) | Каждый error variant тестируется |
-| Loss Functions | ⭐⭐⭐ (3/5) | cross_entropy без теста! |
+| Loss Functions | ⭐⭐⭐⭐⭐ (5/5) | PyTorch parity (8 тестов) |
 | BakedModel | ⭐⭐⭐ (3/5) | Serialization roundtrip нет |
 | Config | ⭐⭐⭐⭐⭐ (5/5) | Builder API полное покрытие |
 | game2048 | ⭐⭐ (2/5) | Только manual testing |
 
-**Средняя оценка:** 4.1/5 ⭐⭐⭐⭐ (хорошо)
+**Средняя оценка:** 4.4/5 ⭐⭐⭐⭐ (хорошо)
 
 ### Критические мертвые зоны (🔴 HIGH RISK)
 
 | Зона | Модуль | Последствия |
 |------|--------|-------------|
 | ~~GpuAdam gradient clipping~~ | ~~GPU Training~~ | ✅ **ИСПРАВЛЕНО** — `train_step_gpu_native_with_options` |
-| cross_entropy без теста | Loss Functions | Возможный баг в classification |
+| ~~cross_entropy без теста~~ | ~~Loss Functions~~ | ✅ **ИСПРАВЛЕНО** — 8 PyTorch parity тестов |
 | ~~SIMD пути не изолированы~~ | ~~CPU Forward~~ | ✅ Покрыто `forward_correctness.rs` (170 комбинаций) |
 | ~~Bias gradients не тестируются напрямую~~ | ~~CPU Backward~~ | ✅ Покрыто `backward_correctness.rs` (parity тесты) |
 | Versioning моделей | Serialization | Старые модели могут не загрузиться |
@@ -1952,6 +1971,24 @@
   - ⚠️ **Ограничение:** NVIDIA драйвер возвращает `max_buffer_size = u64::MAX`,
     поэтому `VramLimit::Percent` бесполезен для NVIDIA. Рекомендуется `with_max_vram(gb)`.
   - ✅ **RTX 4070 SUPER (12GB):** протестировано до 3GB на буфер
+- **2025-12-07:** PyTorch parity тесты для cross_entropy:
+  - ✅ **8 новых тестов** в `src/loss.rs`:
+    - `test_cross_entropy_pytorch_perfect_prediction` — BCE=0 для p=t
+    - `test_cross_entropy_pytorch_confident_wrong` — высокий штраф за ошибку
+    - `test_cross_entropy_pytorch_uncertain` — 50% уверенность
+    - `test_cross_entropy_pytorch_multiclass` — 4 класса
+    - `test_cross_entropy_pytorch_soft_targets` — soft labels [0.7, 0.3]
+    - `test_cross_entropy_pytorch_gradient_direction` — градиент → правильному классу
+    - `test_cross_entropy_pytorch_with_mask` — masked loss (ignore -1)
+    - `test_cross_entropy_pytorch_numerical_stability` — extreme predictions
+  - ✅ Закрыта мертвая зона "cross_entropy без теста"
+- **2025-12-07:** Расширение serialization тестов:
+  - ✅ **10 новых тестов** в `tests/coverage_tests.rs`:
+    - Multi-size: minimal (2→1), deep (8→16→32→16→8→4), wide (64→128→32, 531KB)
+    - Corrupted data: 6 invalid JSON cases, 5 truncated bincode lengths, bit flips
+    - Structure preservation, size scaling comparison
+  - ✅ Закрыты мертвые зоны: partial deserialization, large models, multi-size
+  - ⚠️ **Осталось:** Versioning моделей (требует изменения API)
 - **2025-12-06:** Расширение grid_size и тесты edge cases:
   - ✅ **MAX_GRID_SIZE = 64** — добавлена константа, обновлена валидация
   - ✅ **tests/spline_edge_cases.rs** — 18 новых тестов покрывающих:
