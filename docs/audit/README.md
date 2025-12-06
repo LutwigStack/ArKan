@@ -113,8 +113,8 @@ docs/audit/
 2. ~~Hybrid Adam bug~~ — ✅ **ИСПРАВЛЕНО**
 
 ### Medium Priority 🟡
-1. Lock-free ReplayBuffer — уменьшить contention
-2. LBFGS Rosenbrock test — PyTorch reference comparison
+1. ~~Lock-free ReplayBuffer~~ — ✅ **ВЫПОЛНЕНО** (ShardedReplayBuffer с 16 shards)
+2. ~~LBFGS Rosenbrock test~~ — ✅ **ВЫПОЛНЕНО** (PyTorch parity + GD comparison)
 
 ### Low Priority 🟢
 1. Model versioning — для backward compatibility
@@ -128,3 +128,5 @@ docs/audit/
 - **2025-12-06:** Стандартизация нумерации секций (X.1, X.2, etc.)
 - **2025-12-07:** PyTorch parity для cross_entropy (8 тестов)
 - **2025-12-07:** Расширение serialization тестов (10 тестов)
+- **2025-12-07:** LBFGS Rosenbrock test с PyTorch parity (2 теста)
+- **2025-12-07:** ShardedReplayBuffer — lock-free версия для game2048

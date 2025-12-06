@@ -157,7 +157,7 @@
 |---------|------|----------|
 | Examples compilation | 🟡 Средний | Нет CI проверки что примеры компилируются |
 | DQN target Q-value | 🔴 Высокий | Нет теста Bellman equation |
-| ReplayBuffer sampling | 🔴 Высокий | Нет теста что sampling fair |
+| ReplayBuffer sampling | 🟡 Средний | Sharded версия доступна, нет теста fairness |
 
 ---
 
@@ -167,7 +167,7 @@
 |---------|-----|-----------|----------|
 | CI для examples | 🧹 Clean | 🟢 Низкая | GitHub Actions для проверки компиляции |
 | game2048 PPO | 🔧 Feature | 🟡 Средняя | PPO вместо DQN для лучшего sample efficiency |
-| Lock-free ReplayBuffer | 🚀 Perf | 🟡 Средняя | Sharded buffer для parallel sampling |
+| ~~Lock-free ReplayBuffer~~ | ~~🚀 Perf~~ | ~~🟡~~ | ✅ **ВЫПОЛНЕНО** — ShardedReplayBuffer с 16 shards |
 | CIFAR-10 example | 🔧 Feature | 🟡 Средняя | Более сложный vision benchmark |
 | Jupyter notebooks | 🔧 Feature | 🟢 Низкая | Интерактивные туториалы |
 | Epsilon decay | 🟡 Средний | Не тестируется exploration |

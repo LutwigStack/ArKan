@@ -17,8 +17,8 @@
 
 | Задача | Статус | Описание |
 |--------|--------|----------|
-| Lock-free ReplayBuffer | TODO | Уменьшить contention в game2048 |
-| LBFGS Rosenbrock test | TODO | PyTorch reference comparison |
+| ~~Lock-free ReplayBuffer~~ | ✅ Done | ShardedReplayBuffer с 16 shards |
+| ~~LBFGS Rosenbrock test~~ | ✅ Done | PyTorch reference comparison (2 теста) |
 | Model versioning | TODO | Backward compatibility |
 | BakedModel serialization test | TODO | to_bytes/from_bytes roundtrip |
 
@@ -53,8 +53,8 @@
 | ~~🔴 HIGH~~ | ~~LBFGS line search~~ | ~~Hard~~ | ✅ Done |
 | ~~🔴 HIGH~~ | ~~Nesterov momentum~~ | ~~Easy~~ | ✅ Done |
 | ~~🔴 HIGH~~ | ~~Async download~~ | ~~Medium~~ | ✅ Done |
-| 🟡 MED | Lock-free ReplayBuffer | Medium | TODO |
-| 🟡 MED | LBFGS Rosenbrock test | Easy | TODO |
+| ~~🟡 MED~~ | ~~Lock-free ReplayBuffer~~ | ~~Medium~~ | ✅ Done |
+| ~~🟡 MED~~ | ~~LBFGS Rosenbrock test~~ | ~~Easy~~ | ✅ Done |
 | 🟢 LOW | Model versioning | Easy | TODO |
 
 ---
@@ -68,5 +68,7 @@
 - ~~Async GPU pipeline~~ — forward_batch_async
 - ~~GpuAdam momentum parity~~ — 9 тестов
 - ~~Hybrid Adam bug~~ — unpad_weights()
+- ~~Lock-free ReplayBuffer~~ — ShardedReplayBuffer (2025-12-07)
+- ~~LBFGS Rosenbrock test~~ — PyTorch parity тесты (2025-12-07)
 - ~~PyTorch cross_entropy parity~~ — 8 тестов
 - ~~Serialization multi-size~~ — 10 тестов

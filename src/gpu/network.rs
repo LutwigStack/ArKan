@@ -12,7 +12,7 @@ use crate::gpu::pipeline::{workgroup_count, PipelineCache, WORKGROUP_SIZE};
 use crate::gpu::workspace::GpuWorkspace;
 use crate::loss::{masked_cross_entropy, masked_mse};
 use crate::network::{KanNetwork, TrainOptions};
-use crate::optimizer::{Adam, SGD};
+use crate::optimizer::{Adam, Optimizer, SGD};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -1577,7 +1577,7 @@ impl GpuNetwork {
         )?;
 
         // 4. Optimizer step on CPU network
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, Some(1.0));
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, Some(1.0))?;
 
         // 5. Sync weights from CPU to GPU
         self.sync_weights(cpu_network)?;
@@ -1622,7 +1622,7 @@ impl GpuNetwork {
         )?;
 
         // 4. Optimizer step on CPU network
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, Some(1.0));
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, Some(1.0))?;
 
         // 5. Sync weights from CPU to GPU
         self.sync_weights(cpu_network)?;
@@ -1697,7 +1697,7 @@ impl GpuNetwork {
         }
 
         // 5. Optimizer step on CPU network with gradient clipping
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, opts.max_grad_norm);
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, opts.max_grad_norm)?;
 
         // 6. Sync weights from CPU to GPU
         self.sync_weights(cpu_network)?;
@@ -1757,7 +1757,7 @@ impl GpuNetwork {
         )?;
 
         // 4. Optimizer step on CPU network
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, None);
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, None)?;
 
         // 5. Sync weights from CPU to GPU
         self.sync_weights(cpu_network)?;
@@ -1821,7 +1821,7 @@ impl GpuNetwork {
 
         // 4. Apply weight decay override if specified in opts
         if opts.weight_decay > 0.0 {
-            let lr = optimizer.lr;
+            let lr = optimizer.lr();
             for layer in &mut cpu_network.layers {
                 for w in layer.weights.as_mut_slice() {
                     *w *= 1.0 - lr * opts.weight_decay;
@@ -1830,7 +1830,7 @@ impl GpuNetwork {
         }
 
         // 5. Optimizer step on CPU network with gradient clipping
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, opts.max_grad_norm);
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, opts.max_grad_norm)?;
 
         // 6. Sync weights from CPU to GPU
         self.sync_weights(cpu_network)?;

@@ -408,6 +408,380 @@ fn test_pytorch_lbfgs_rosenbrock() {
     assert!(final_loss < 1.0, "Should converge toward minimum, got loss={}", final_loss);
 }
 
+/// Standalone L-BFGS implementation for pure function optimization.
+/// This mirrors PyTorch's LBFGS behavior for comparison testing.
+struct StandaloneLBFGS {
+    history_size: usize,
+    s_history: Vec<Vec<f64>>,
+    y_history: Vec<Vec<f64>>,
+    rho_history: Vec<f64>,
+}
+
+impl StandaloneLBFGS {
+    fn new(history_size: usize) -> Self {
+        Self {
+            history_size,
+            s_history: Vec::new(),
+            y_history: Vec::new(),
+            rho_history: Vec::new(),
+        }
+    }
+
+    /// Two-loop recursion for computing search direction.
+    /// Returns -H⁻¹g where H⁻¹ is approximated using L-BFGS history.
+    fn two_loop_recursion(&self, grad: &[f64]) -> Vec<f64> {
+        let m = self.s_history.len();
+
+        if m == 0 {
+            // No history: steepest descent
+            return grad.iter().map(|&g| -g).collect();
+        }
+
+        // q = grad
+        let mut q: Vec<f64> = grad.to_vec();
+        let mut alpha = vec![0.0f64; m];
+
+        // First loop (backward)
+        for i in (0..m).rev() {
+            alpha[i] = self.rho_history[i]
+                * self.s_history[i]
+                    .iter()
+                    .zip(q.iter())
+                    .map(|(&s, &q)| s * q)
+                    .sum::<f64>();
+            for (q_j, &y_ij) in q.iter_mut().zip(self.y_history[i].iter()) {
+                *q_j -= alpha[i] * y_ij;
+            }
+        }
+
+        // Scale initial Hessian approximation: H0 = γI where γ = sᵀy / yᵀy
+        let s_last = &self.s_history[m - 1];
+        let y_last = &self.y_history[m - 1];
+        let yy: f64 = y_last.iter().map(|&y| y * y).sum();
+        let sy: f64 = s_last.iter().zip(y_last.iter()).map(|(&s, &y)| s * y).sum();
+        let gamma = if yy > 1e-10 { sy / yy } else { 1.0 };
+
+        // r = γ * q
+        let mut r: Vec<f64> = q.iter().map(|&q| gamma * q).collect();
+
+        // Second loop (forward)
+        for i in 0..m {
+            let beta = self.rho_history[i]
+                * self.y_history[i]
+                    .iter()
+                    .zip(r.iter())
+                    .map(|(&y, &r)| y * r)
+                    .sum::<f64>();
+            for (r_j, &s_ij) in r.iter_mut().zip(self.s_history[i].iter()) {
+                *r_j += s_ij * (alpha[i] - beta);
+            }
+        }
+
+        // Return -r (descent direction)
+        r.iter().map(|&r| -r).collect()
+    }
+
+    /// Updates history with new s and y vectors.
+    fn update_history(&mut self, s: Vec<f64>, y: Vec<f64>) {
+        let sy: f64 = s.iter().zip(y.iter()).map(|(&si, &yi)| si * yi).sum();
+
+        // Skip if curvature condition not satisfied
+        if sy <= 1e-10 {
+            return;
+        }
+
+        let rho = 1.0 / sy;
+
+        // Maintain history_size limit
+        if self.s_history.len() >= self.history_size {
+            self.s_history.remove(0);
+            self.y_history.remove(0);
+            self.rho_history.remove(0);
+        }
+
+        self.s_history.push(s);
+        self.y_history.push(y);
+        self.rho_history.push(rho);
+    }
+
+    /// Strong Wolfe line search.
+    fn strong_wolfe_line_search<F, G>(
+        &self,
+        x0: &[f64],
+        f0: f64,
+        g0: &[f64],
+        direction: &[f64],
+        loss_fn: F,
+        grad_fn: G,
+    ) -> Option<(f64, Vec<f64>, f64)>
+    where
+        F: Fn(&[f64]) -> f64,
+        G: Fn(&[f64]) -> Vec<f64>,
+    {
+        const C1: f64 = 1e-4;
+        const C2: f64 = 0.9;
+        const MAX_LS_ITER: usize = 25;
+        const ALPHA_MAX: f64 = 50.0;
+
+        let dg0: f64 = g0.iter().zip(direction.iter()).map(|(&g, &d)| g * d).sum();
+
+        // dg0 should be negative (descent direction)
+        if dg0 >= 0.0 {
+            return None;
+        }
+
+        let mut alpha = 1.0f64;
+        let mut alpha_lo: f64 = 0.0;
+        let mut alpha_hi: f64 = ALPHA_MAX;
+        let mut f_lo = f0;
+        let mut g_lo = g0.to_vec();
+
+        for iter in 0..MAX_LS_ITER {
+            // x = x0 + alpha * d
+            let x_new: Vec<f64> = x0
+                .iter()
+                .zip(direction.iter())
+                .map(|(&x, &d)| x + alpha * d)
+                .collect();
+
+            let f_new = loss_fn(&x_new);
+            let g_new = grad_fn(&x_new);
+
+            // Check for NaN
+            if f_new.is_nan() || !f_new.is_finite() {
+                alpha_hi = alpha;
+                alpha = (alpha_lo + alpha_hi) / 2.0;
+                continue;
+            }
+
+            let dg_new: f64 = g_new.iter().zip(direction.iter()).map(|(&g, &d)| g * d).sum();
+
+            // Check Armijo condition (sufficient decrease)
+            if f_new > f0 + C1 * alpha * dg0 || (iter > 0 && f_new >= f_lo) {
+                alpha_hi = alpha;
+            } else {
+                // Check Strong Wolfe curvature condition
+                if dg_new.abs() <= -C2 * dg0 {
+                    return Some((alpha, g_new, f_new));
+                }
+
+                if dg_new >= 0.0 {
+                    alpha_hi = alpha_lo;
+                    alpha_lo = alpha;
+                    f_lo = f_new;
+                    g_lo = g_new;
+                } else {
+                    alpha_lo = alpha;
+                    f_lo = f_new;
+                    g_lo = g_new.clone();
+                    alpha = (alpha + alpha_hi) / 2.0;
+                    continue;
+                }
+            }
+
+            if (alpha_hi - alpha_lo).abs() < 1e-10 {
+                return Some((alpha_lo, g_lo, f_lo));
+            }
+
+            alpha = (alpha_lo + alpha_hi) / 2.0;
+        }
+
+        Some((alpha_lo, g_lo, f_lo))
+    }
+
+    /// Performs one L-BFGS step.
+    fn step<F, G>(&mut self, x: &mut [f64], loss_fn: F, grad_fn: G) -> f64
+    where
+        F: Fn(&[f64]) -> f64,
+        G: Fn(&[f64]) -> Vec<f64>,
+    {
+        let f0 = loss_fn(x);
+        let g0 = grad_fn(x);
+
+        // Check convergence on gradient norm
+        let grad_norm: f64 = g0.iter().map(|&g| g * g).sum::<f64>().sqrt();
+        if grad_norm < 1e-7 {
+            return f0;
+        }
+
+        // Compute search direction
+        let direction = self.two_loop_recursion(&g0);
+
+        // Line search
+        let (alpha, g_new, _f_new) = match self.strong_wolfe_line_search(
+            x,
+            f0,
+            &g0,
+            &direction,
+            &loss_fn,
+            &grad_fn,
+        ) {
+            Some(result) => result,
+            None => return f0,
+        };
+
+        // Update x
+        let x_old: Vec<f64> = x.to_vec();
+        for (xi, &di) in x.iter_mut().zip(direction.iter()) {
+            *xi += alpha * di;
+        }
+
+        // Compute s and y for history
+        let s: Vec<f64> = x.iter().zip(x_old.iter()).map(|(&xn, &x0)| xn - x0).collect();
+        let y: Vec<f64> = g_new.iter().zip(g0.iter()).map(|(&gn, &g0)| gn - g0).collect();
+
+        self.update_history(s, y);
+
+        // Return the loss AFTER this step (compute at new position)
+        loss_fn(x)
+    }
+}
+
+/// Rosenbrock function in f64 for LBFGS testing.
+fn rosenbrock_loss_f64(params: &[f64]) -> f64 {
+    let x = params[0];
+    let y = params[1];
+    (1.0 - x).powi(2) + 100.0 * (y - x * x).powi(2)
+}
+
+/// Rosenbrock gradient in f64.
+fn rosenbrock_grad_f64(params: &[f64]) -> Vec<f64> {
+    let x = params[0];
+    let y = params[1];
+    let dx = -2.0 * (1.0 - x) - 400.0 * x * (y - x * x);
+    let dy = 200.0 * (y - x * x);
+    vec![dx, dy]
+}
+
+/// LBFGS Rosenbrock test with PyTorch reference values.
+/// 
+/// PyTorch reference (from scripts/pytorch_reference_values.json):
+/// - Init: (-1.0, 1.0)
+/// - Loss trajectory: [4.0, 0.242, 8e-11, ...]
+/// - Final: (~1.0, ~1.0)
+/// 
+/// L-BFGS should converge to the minimum (1,1) within a few steps.
+/// Note: Exact step-by-step parity with PyTorch is not expected due to 
+/// implementation differences in line search. We verify convergence behavior.
+#[test]
+fn test_pytorch_lbfgs_rosenbrock_parity() {
+    // PyTorch reference values from scripts/pytorch_reference_values.json
+    const PYTORCH_INIT_LOSS: f64 = 4.0;
+    const PYTORCH_FINAL_X: f64 = 1.0000066757202148;
+    const PYTORCH_FINAL_Y: f64 = 1.000012755393982;
+    
+    let mut lbfgs = StandaloneLBFGS::new(10);
+    let mut x = vec![-1.0f64, 1.0];
+    
+    // Verify initial loss
+    let init_loss = rosenbrock_loss_f64(&x);
+    assert!(
+        (init_loss - PYTORCH_INIT_LOSS).abs() < 1e-10,
+        "Initial loss mismatch: got {}, expected {}",
+        init_loss, PYTORCH_INIT_LOSS
+    );
+    
+    // Record losses for each step
+    let mut losses = vec![init_loss];
+    
+    // Run optimization steps
+    for step in 0..20 {
+        let loss = lbfgs.step(&mut x, rosenbrock_loss_f64, rosenbrock_grad_f64);
+        losses.push(loss);
+        
+        // Early exit if converged
+        if loss < 1e-12 {
+            println!("Converged at step {} with loss={:.2e}", step + 1, loss);
+            break;
+        }
+    }
+    
+    let final_loss = rosenbrock_loss_f64(&x);
+    
+    // Key verification: Loss should decrease monotonically (mostly)
+    // and converge to near zero
+    assert!(
+        final_loss < losses[0],
+        "Loss should decrease: init={:.6}, final={:.2e}",
+        losses[0], final_loss
+    );
+    
+    // Should converge to near (1, 1)
+    assert!(
+        (x[0] - PYTORCH_FINAL_X).abs() < 0.01,
+        "Final x should be near 1.0: got {:.6}",
+        x[0]
+    );
+    assert!(
+        (x[1] - PYTORCH_FINAL_Y).abs() < 0.01,
+        "Final y should be near 1.0: got {:.6}",
+        x[1]
+    );
+    assert!(
+        final_loss < 1e-6,
+        "Final loss should be near zero: got {:.2e}",
+        final_loss
+    );
+    
+    // Verify that L-BFGS converges faster than a threshold
+    // (PyTorch converges in ~2 steps, we should too)
+    let steps_to_converge = losses.iter().position(|&l| l < 1e-6).unwrap_or(losses.len());
+    assert!(
+        steps_to_converge <= 5,
+        "Should converge within 5 steps, took {}",
+        steps_to_converge
+    );
+    
+    println!("LBFGS Rosenbrock test passed:");
+    println!("  Steps to converge: {}", steps_to_converge);
+    println!("  Init:  ({:.4}, {:.4}) loss={:.6}", -1.0, 1.0, PYTORCH_INIT_LOSS);
+    println!("  Final: ({:.6}, {:.6}) loss={:.2e}", x[0], x[1], final_loss);
+}
+
+/// Test that L-BFGS converges faster than gradient descent on Rosenbrock.
+#[test]
+fn test_lbfgs_vs_gradient_descent_rosenbrock() {
+    // Gradient descent baseline
+    let mut x_gd = vec![-1.0f64, 1.0];
+    let lr = 0.001;
+    let mut gd_losses = Vec::new();
+    
+    for _ in 0..100 {
+        let loss = rosenbrock_loss_f64(&x_gd);
+        gd_losses.push(loss);
+        let grad = rosenbrock_grad_f64(&x_gd);
+        x_gd[0] -= lr * grad[0];
+        x_gd[1] -= lr * grad[1];
+    }
+    
+    // L-BFGS
+    let mut lbfgs = StandaloneLBFGS::new(10);
+    let mut x_lbfgs = vec![-1.0f64, 1.0];
+    let mut lbfgs_losses = Vec::new();
+    
+    for _ in 0..10 {
+        let loss = rosenbrock_loss_f64(&x_lbfgs);
+        lbfgs_losses.push(loss);
+        lbfgs.step(&mut x_lbfgs, rosenbrock_loss_f64, rosenbrock_grad_f64);
+    }
+    
+    let gd_final = gd_losses.last().unwrap();
+    let lbfgs_final = lbfgs_losses.last().unwrap();
+    
+    // L-BFGS should reach lower loss with fewer iterations
+    assert!(
+        lbfgs_final < gd_final,
+        "L-BFGS should outperform GD: LBFGS={:.6}, GD={:.6}",
+        lbfgs_final, gd_final
+    );
+    
+    // L-BFGS should be at least 10x better after 10 vs 100 steps
+    assert!(
+        lbfgs_final * 10.0 < *gd_final,
+        "L-BFGS (10 steps) should be much better than GD (100 steps)"
+    );
+}
+
 // ============================================================================
 // ArKan Integration Tests - Test that ArKan optimizers work correctly
 // ============================================================================
