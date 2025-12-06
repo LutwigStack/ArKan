@@ -2,11 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, gpu-backend]
   pull_request:
-    branches: [main]
+    branches: [main, gpu-backend]
 
 jobs:
+  # ==========================================================================
+  # Main Library Build & Test
+  # ==========================================================================
   build:
     runs-on: ubuntu-latest
     steps:
@@ -19,11 +22,118 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
 
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Cargo fmt
         run: cargo fmt -- --check
 
       - name: Cargo clippy
         run: cargo clippy -- -D warnings
 
-      - name: Cargo test
-        run: cargo test --all-features
+      - name: Cargo test (no GPU)
+        run: cargo test --lib --tests
+
+  # ==========================================================================
+  # Examples Compilation Check
+  # ==========================================================================
+  examples:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            examples/*/target/
+          key: ${{ runner.os }}-cargo-examples-${{ hashFiles('**/Cargo.lock') }}
+
+      # Standalone examples (part of main crate)
+      - name: Build standalone examples
+        run: |
+          cargo build --example basic
+          cargo build --example training
+          # gpu_forward requires GPU feature which needs wgpu runtime
+
+      # Separate crate examples
+      - name: Build sinusoid example
+        working-directory: examples/sinusoid
+        run: cargo build --release
+
+      - name: Build MNIST example (CPU)
+        working-directory: examples/mnist
+        run: cargo build --release
+
+      - name: Build game2048 example
+        working-directory: examples/game2048
+        run: cargo build --release
+
+  # ==========================================================================
+  # GPU Build Check (compile only, no runtime)
+  # ==========================================================================
+  gpu-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-gpu-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build with GPU feature
+        run: cargo build --features gpu
+
+      - name: Build GPU example
+        run: cargo build --example gpu_forward --features gpu
+
+  # ==========================================================================
+  # Documentation Build
+  # ==========================================================================
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Build documentation
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -Dwarnings

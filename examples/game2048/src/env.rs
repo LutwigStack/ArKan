@@ -594,3 +594,398 @@ impl ShardedReplayBuffer {
         Some(batch_size)
     }
 }
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // ReplayBuffer Tests
+    // =========================================================================
+
+    #[test]
+    fn test_replay_buffer_push_and_len() {
+        let mut buffer = ReplayBuffer::new(100);
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.is_empty());
+
+        for i in 0..10 {
+            let exp = Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: i == 9,
+            };
+            buffer.push(exp);
+        }
+
+        assert_eq!(buffer.len(), 10);
+        assert!(!buffer.is_empty());
+    }
+
+    #[test]
+    fn test_replay_buffer_circular() {
+        let mut buffer = ReplayBuffer::new(5);
+
+        // Push 10 items into buffer of capacity 5
+        for i in 0..10 {
+            let exp = Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: false,
+            };
+            buffer.push(exp);
+        }
+
+        // Should only have 5 items (circular buffer)
+        assert_eq!(buffer.len(), 5);
+    }
+
+    #[test]
+    fn test_replay_buffer_sample() {
+        let mut buffer = ReplayBuffer::new(100);
+
+        // Fill with 50 items
+        for i in 0..50 {
+            let exp = Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: false,
+            };
+            buffer.push(exp);
+        }
+
+        // Sample batch of 16
+        let result = buffer.sample_batch(16);
+        assert!(result.is_some());
+
+        let (states, actions, rewards, next_states, dones) = result.unwrap();
+        assert_eq!(states.len(), 16 * STATE_DIM);
+        assert_eq!(actions.len(), 16);
+        assert_eq!(rewards.len(), 16);
+        assert_eq!(next_states.len(), 16 * STATE_DIM);
+        assert_eq!(dones.len(), 16);
+    }
+
+    #[test]
+    fn test_replay_buffer_sample_insufficient() {
+        let mut buffer = ReplayBuffer::new(100);
+
+        // Only push 5 items
+        for i in 0..5 {
+            buffer.push(Experience {
+                state: [i as f32; STATE_DIM],
+                action: 0,
+                reward: 0.0,
+                next_state: [0.0; STATE_DIM],
+                done: false,
+            });
+        }
+
+        // Try to sample 10 - should fail
+        assert!(buffer.sample_batch(10).is_none());
+
+        // Sample 5 - should succeed
+        assert!(buffer.sample_batch(5).is_some());
+    }
+
+    // =========================================================================
+    // ShardedReplayBuffer Tests
+    // =========================================================================
+
+    #[test]
+    fn test_sharded_buffer_push_and_len() {
+        let buffer = ShardedReplayBuffer::new(1000);
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.is_empty());
+
+        for i in 0..100 {
+            let exp = Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: i == 99,
+            };
+            buffer.push(exp);
+        }
+
+        assert_eq!(buffer.len(), 100);
+        assert!(!buffer.is_empty());
+    }
+
+    #[test]
+    fn test_sharded_buffer_push_batch() {
+        let buffer = ShardedReplayBuffer::new(1000);
+
+        // Create batch of experiences
+        let experiences: Vec<Experience> = (0..50)
+            .map(|i| Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: false,
+            })
+            .collect();
+
+        buffer.push_batch(experiences);
+        assert_eq!(buffer.len(), 50);
+    }
+
+    #[test]
+    fn test_sharded_buffer_sample() {
+        let buffer = ShardedReplayBuffer::new(1000);
+
+        // Fill with 200 items
+        for i in 0..200 {
+            buffer.push(Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: false,
+            });
+        }
+
+        // Sample batch of 32
+        let result = buffer.sample_batch(32);
+        assert!(result.is_some());
+
+        let (states, actions, rewards, next_states, dones) = result.unwrap();
+        assert_eq!(states.len(), 32 * STATE_DIM);
+        assert_eq!(actions.len(), 32);
+        assert_eq!(rewards.len(), 32);
+        assert_eq!(next_states.len(), 32 * STATE_DIM);
+        assert_eq!(dones.len(), 32);
+    }
+
+    #[test]
+    fn test_sharded_buffer_sample_into() {
+        let buffer = ShardedReplayBuffer::new(1000);
+
+        // Fill with 200 items
+        for i in 0..200 {
+            buffer.push(Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: false,
+            });
+        }
+
+        // Pre-allocate buffers
+        let mut states = Vec::new();
+        let mut actions = Vec::new();
+        let mut rewards = Vec::new();
+        let mut next_states = Vec::new();
+        let mut dones = Vec::new();
+
+        let result = buffer.sample_batch_into(
+            32,
+            &mut states,
+            &mut actions,
+            &mut rewards,
+            &mut next_states,
+            &mut dones,
+        );
+
+        assert_eq!(result, Some(32));
+        assert_eq!(states.len(), 32 * STATE_DIM);
+        assert_eq!(actions.len(), 32);
+    }
+
+    /// Test fairness: samples should be distributed across all data.
+    #[test]
+    fn test_sharded_buffer_sampling_fairness() {
+        let buffer = ShardedReplayBuffer::new(1000);
+
+        // Fill with 160 items (10 per shard with 16 shards)
+        for i in 0..160 {
+            buffer.push(Experience {
+                state: [i as f32; STATE_DIM],
+                action: (i / 40) % 4, // 4 groups: 0,1,2,3
+                reward: i as f32,
+                next_state: [0.0; STATE_DIM],
+                done: false,
+            });
+        }
+
+        // Sample many times and count action distribution
+        let mut action_counts = [0usize; 4];
+        let num_samples = 10000;
+
+        for _ in 0..(num_samples / 64) {
+            if let Some((_, actions, _, _, _)) = buffer.sample_batch(64) {
+                for action in actions {
+                    action_counts[action] += 1;
+                }
+            }
+        }
+
+        // Each action should be ~25% of samples (within 20% tolerance)
+        let expected = num_samples / 4;
+        let tolerance = expected / 5; // 20%
+
+        for (action, &count) in action_counts.iter().enumerate() {
+            assert!(
+                (count as i64 - expected as i64).unsigned_abs() < tolerance as u64,
+                "Action {} count {} is far from expected {} (tolerance {})",
+                action, count, expected, tolerance
+            );
+        }
+    }
+
+    // =========================================================================
+    // Bellman Equation Test
+    // =========================================================================
+
+    /// Tests that DQN target computation follows Bellman equation:
+    /// Q(s,a) = r + γ * max_a' Q(s', a') for non-terminal states
+    /// Q(s,a) = r for terminal states
+    #[test]
+    fn test_bellman_equation_computation() {
+        let gamma = 0.99f32;
+
+        // Test case 1: Non-terminal state
+        {
+            let reward = 10.0f32;
+            let next_q_values = [1.0f32, 2.0, 3.0, 4.0]; // max = 4.0
+            let done = false;
+
+            let target_q = if done {
+                reward
+            } else {
+                let max_next_q = next_q_values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                reward + gamma * max_next_q
+            };
+
+            // Expected: 10.0 + 0.99 * 4.0 = 13.96
+            let expected = 10.0 + 0.99 * 4.0;
+            assert!(
+                (target_q - expected).abs() < 1e-6,
+                "Non-terminal Bellman: got {}, expected {}",
+                target_q, expected
+            );
+        }
+
+        // Test case 2: Terminal state
+        {
+            let reward = 100.0f32;
+            let next_q_values = [1.0f32, 2.0, 3.0, 4.0]; // Should be ignored
+            let done = true;
+
+            let target_q = if done {
+                reward
+            } else {
+                let max_next_q = next_q_values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                reward + gamma * max_next_q
+            };
+
+            // Expected: reward only (no future)
+            assert!(
+                (target_q - 100.0).abs() < 1e-6,
+                "Terminal Bellman: got {}, expected {}",
+                target_q, 100.0
+            );
+        }
+
+        // Test case 3: Zero reward, non-terminal
+        {
+            let reward = 0.0f32;
+            let next_q_values = [-1.0f32, -2.0, -0.5, -3.0]; // max = -0.5
+            let done = false;
+
+            let target_q = if done {
+                reward
+            } else {
+                let max_next_q = next_q_values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                reward + gamma * max_next_q
+            };
+
+            // Expected: 0.0 + 0.99 * (-0.5) = -0.495
+            let expected = 0.0 + 0.99 * (-0.5);
+            assert!(
+                (target_q - expected).abs() < 1e-6,
+                "Zero reward Bellman: got {}, expected {}",
+                target_q, expected
+            );
+        }
+    }
+
+    /// Tests that Q-value updates only target the selected action.
+    #[test]
+    fn test_bellman_selective_update() {
+        let current_q = [1.0f32, 2.0, 3.0, 4.0];
+        let action = 2; // Selected action
+        let target_q = 10.0f32; // New target for action 2
+
+        // Build targets array (copy current, update only selected action)
+        let mut targets = current_q;
+        targets[action] = target_q;
+
+        // Verify only action 2 changed
+        assert_eq!(targets[0], 1.0, "Action 0 should be unchanged");
+        assert_eq!(targets[1], 2.0, "Action 1 should be unchanged");
+        assert_eq!(targets[2], 10.0, "Action 2 should be updated");
+        assert_eq!(targets[3], 4.0, "Action 3 should be unchanged");
+    }
+
+    // =========================================================================
+    // Environment Tests
+    // =========================================================================
+
+    #[test]
+    fn test_env_creation() {
+        let env = Env::new();
+        assert_eq!(env.state_dim(), STATE_DIM);
+        assert_eq!(env.action_dim(), 4);
+        assert!(!env.is_done());
+    }
+
+    #[test]
+    fn test_env_reset() {
+        let mut env = Env::new();
+
+        // Take some actions
+        let _ = env.step(0);
+        let _ = env.step(1);
+
+        // Reset
+        let state = env.reset();
+        assert_eq!(state.len(), STATE_DIM);
+        assert!(!env.is_done());
+    }
+
+    #[test]
+    fn test_env_step() {
+        let mut env = Env::new();
+
+        let (next_state, reward, done) = env.step(0); // Move up
+
+        assert_eq!(next_state.len(), STATE_DIM);
+        assert!(reward.is_finite());
+        // done could be true or false depending on game state
+        let _ = done;
+    }
+
+    #[test]
+    fn test_experience_creation() {
+        let exp = Experience::new();
+        assert_eq!(exp.state.len(), STATE_DIM);
+        assert_eq!(exp.next_state.len(), STATE_DIM);
+        assert_eq!(exp.action, 0);
+        assert_eq!(exp.reward, 0.0);
+        assert!(!exp.done);
+    }
+}

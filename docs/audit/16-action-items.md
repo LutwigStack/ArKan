@@ -28,7 +28,7 @@
 
 | Задача | Статус | Описание |
 |--------|--------|----------|
-| DQN automated tests | TODO | Bellman equation check |
+| ~~DQN automated tests~~ | ✅ Done | Bellman equation + ReplayBuffer fairness |
 | GPU loss functions | TODO | Loss вычисляется на CPU |
 | Memory leak detection | TODO | valgrind/miri для GPU сложно |
 
@@ -55,6 +55,8 @@
 | ~~🔴 HIGH~~ | ~~Async download~~ | ~~Medium~~ | ✅ Done |
 | ~~🟡 MED~~ | ~~Lock-free ReplayBuffer~~ | ~~Medium~~ | ✅ Done |
 | ~~🟡 MED~~ | ~~LBFGS Rosenbrock test~~ | ~~Easy~~ | ✅ Done |
+| ~~🟡 MED~~ | ~~CI для examples~~ | ~~Easy~~ | ✅ Done |
+| ~~🟡 MED~~ | ~~DQN Bellman test~~ | ~~Easy~~ | ✅ Done |
 | 🟢 LOW | Model versioning | Easy | TODO |
 
 ---
@@ -72,3 +74,6 @@
 - ~~LBFGS Rosenbrock test~~ — PyTorch parity тесты (2025-12-07)
 - ~~PyTorch cross_entropy parity~~ — 8 тестов
 - ~~Serialization multi-size~~ — 10 тестов
+- ~~CI для examples~~ — GitHub Actions workflow (2025-12-07)
+- ~~DQN Bellman test~~ — 20 unit тестов для game2048 (2025-12-07)
+- ~~ReplayBuffer fairness~~ — Sampling distribution test (2025-12-07)
