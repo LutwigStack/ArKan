@@ -1,6 +1,8 @@
 # 2. CPU Backward Pass
 
-**Оценка:** ⭐⭐⭐⭐⭐ (5/5)
+**Оценка:** ⭐⭐⭐⭐ (4/5)
+
+**⚠️ ВНИМАНИЕ:** Gradient check использует ослабленные допуски (1e-2, 90% pass, 10 весов/слой).
 
 ---
 
@@ -29,12 +31,20 @@
 
 ## 2.3 Тесты через gradient check
 
+**⚠️ Параметры gradient check (`tests/gradient_check.rs`):**
+- `EPSILON = 1e-3` — шаг для numerical differentiation
+- `MAX_RELATIVE_ERROR = 1e-2` (1%) — допускается до 1% ошибки
+- `MIN_PASS_RATE = 0.90` (90%) — 10% проверок могут фейлиться
+- `WEIGHTS_TO_CHECK_PER_LAYER = 10` — выборка только 10 весов на слой
+
+**Это скорее "среднее покрытие", не "gold standard".**
+
 | Тест | Файл | Что проверяет | Оценка |
 |------|------|---------------|--------|
-| `test_gradient_check_simple_network` | `tests/gradient_check.rs` | Numerical vs Ana, простая сеть | 🟢 Базовый |
-| `test_gradient_check_single_hidden` | `tests/gradient_check.rs` | 1 hidden layer | 🟢 Базовый |
-| `test_gradient_check_multi_layer` | `tests/gradient_check.rs` | 3 hidden layers | 🟢 Полный |
-| `test_gradient_check_deep_network` | `tests/coverage_tests.rs` | 4 layers, 95% pass | 🟢 Регрессионный |
+| `test_gradient_check_simple_network` | `tests/gradient_check.rs` | Numerical vs Ana, простая сеть | 🟡 Ослабленный |
+| `test_gradient_check_single_hidden` | `tests/gradient_check.rs` | 1 hidden layer | 🟡 Ослабленный |
+| `test_gradient_check_multi_layer` | `tests/gradient_check.rs` | 3 hidden layers | 🟡 Ослабленный |
+| `test_gradient_check_deep_network` | `tests/coverage_tests.rs` | 4 layers, 95% pass | 🟡 Ослабленный |
 | `test_gradcheck_single_layer` | `src/network.rs` | Маленькая сеть | 🟢 Базовый |
 | `test_gradient_zero_at_optimum` | `tests/gradient_check.rs` | grad≈0 при target==output | 🟢 Математический |
 | `test_gradient_descent_direction` | `tests/gradient_check.rs` | grad указывает на убывание | 🟢 Математический |
@@ -73,19 +83,19 @@
 
 | Аспект | Статус |
 |--------|--------|
-| Gradient correctness | 🟢 Численная проверка |
+| Gradient correctness | 🟡 Ослабленная проверка (1e-2, 90%, 10 весов) |
 | Multi-layer flow | 🟢 До 4 слоёв |
 | Spline orders | 🟢 2, 3, 4, 5, 6 |
 | Sequential/Parallel parity | 🟢 11 тестов, до 5e-5 |
 | Wide layers (1024) | 🟢 Протестировано |
 | Network integration | 🟢 Auto-select по threshold |
 
-**Оценка честности тестов:** ⭐⭐⭐⭐⭐ (5/5)
-- ✅ Numerical gradient check — ловит большинство багов
+**Оценка честности тестов:** ⭐⭐⭐ (3/5)
 - ✅ Parity тесты sequential vs parallel — 11 тестов
 - ✅ Wide layer coverage до 1024 нейронов
-- ✅ Spline orders 2-6 покрыты
-- ✅ Edge cases: batch=1, zero grad, sparse grad
+- ⚠️ **Gradient check слишком мягкий:** 1e-2 допуск, 90% pass rate
+- ⚠️ **Малая выборка:** только 10 весов на слой
+- ⚠️ **Не "gold standard"** — скорее "среднее покрытие"
 
 ---
 

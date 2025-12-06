@@ -1,6 +1,8 @@
 # 1. CPU Forward Pass
 
-**Оценка:** ⭐⭐⭐⭐⭐ (5/5)
+**Оценка:** ⭐⭐⭐⭐ (4/5)
+
+**⚠️ ВНИМАНИЕ:** SIMD тесты проверяют только `is_finite()`, нужны эталонные сравнения scalar vs SIMD.
 
 ---
 
@@ -64,19 +66,21 @@
 | Тест | Что проверяет | Оценка |
 |------|---------------|--------|
 | `test_simd8_vs_simd4_parity` | SIMD8 == SIMD4 результат | 🟢 SIMD parity |
-| `test_scalar_fallback_odd_dimensions` | in_dim=7 (не делится на 4/8) | 🟢 Scalar path |
-| `test_scalar_fallback_large_basis` | basis_size=7 > simd_width | 🟢 Scalar path |
-| `test_simd8_exact_multiple` | in_dim=24 (без tail) | 🟢 SIMD path |
-| `test_simd4_exact_multiple` | in_dim=20 (без tail) | 🟢 SIMD path |
-| `test_simd8_with_tail` | in_dim=19 (с tail) | 🟢 SIMD+scalar |
-| `test_simd4_with_tail` | in_dim=11 (с tail) | 🟢 SIMD+scalar |
-| `test_simd_coverage_matrix` | 170 комбинаций | 🟢 Полное |
+| `test_scalar_fallback_odd_dimensions` | in_dim=7 (не делится на 4/8) | 🟡 **Только is_finite** |
+| `test_scalar_fallback_large_basis` | basis_size=7 > simd_width | 🟡 **Только is_finite** |
+| `test_simd8_exact_multiple` | in_dim=24 (без tail) | 🟡 **Только is_finite** |
+| `test_simd4_exact_multiple` | in_dim=20 (без tail) | 🟡 **Только is_finite** |
+| `test_simd8_with_tail` | in_dim=19 (с tail) | 🟡 **Только is_finite** |
+| `test_simd4_with_tail` | in_dim=11 (с tail) | 🟡 **Только is_finite** |
+| `test_simd_coverage_matrix` | 170 комбинаций | 🟡 **Только is_finite** |
 | `test_forward_deterministic` | Повторный вызов == идентичный | 🟢 Детерминизм |
 | `test_forward_single_vs_batch_parity` | single == batch | 🟢 Parity |
 | `test_forward_batch_vs_parallel_parity` | sequential == parallel | 🟢 Parity |
-| `test_output_bounded` | Выход < 1000 | 🟢 Sanity |
+| `test_output_bounded` | Выход < 1000 | 🟡 Sanity, не строгая |
 | `test_input_sensitivity` | Изменение input → output | 🟢 Sensitivity |
 | `test_batch_position_invariance` | Позиция в batch не влияет | 🟢 Invariance |
+
+**⚠️ ПРОБЛЕМА:** Большинство SIMD тестов проверяют только `is_finite()`, а не эталонное сравнение scalar vs SIMD. Арифметические ошибки, дающие конечные числа, НЕ ловятся.
 
 ---
 
@@ -112,11 +116,15 @@
 | Unit tests | 🟢 Хорошее покрытие |
 | Error handling | 🟢 Полное |
 | Edge cases | 🟢 batch=0,1, orders, deep |
-| SIMD paths | 🟢 Изолированные тесты (170 комбинаций) |
+| SIMD paths | 🟡 **Тесты только is_finite** |
 | Wide layers | 🟢 До 1024 |
-| Numerical correctness | 🟢 Parity тесты |
+| Numerical correctness | 🟡 **Нет эталонного сравнения scalar vs SIMD** |
 
-**Оценка честности тестов:** ⭐⭐⭐⭐⭐ (5/5)
+**Оценка честности тестов:** ⭐⭐⭐⭐ (4/5)
+- ✅ Parity тесты (single vs batch, sequential vs parallel)
+- ✅ Детерминизм и sensitivity
+- ⚠️ **SIMD тесты проверяют только is_finite, не арифметику**
+- ⚠️ **Нет эталонного сравнения SIMD vs scalar**
 
 ---
 
@@ -124,8 +132,9 @@
 
 | Область | Риск | Причина |
 |---------|------|----------|
-| ~~SIMD accumulate_simd4/8~~ | ~~🔴~~ | ✅ Покрыто (170 комбинаций) |
-| ~~Scalar fallback path~~ | ~~🟡~~ | ✅ Покрыто `test_scalar_fallback_*` |
+| ~~SIMD accumulate_simd4/8~~ | 🟡 Средний | **ЧАСТИЧНО** — 170 комбинаций, но только is_finite |
+| **SIMD vs Scalar parity** | 🔴 Высокий | **НЕ ПОКРЫТО** — арифметические ошибки не ловятся |
+| ~~Scalar fallback path~~ | 🟡 Средний | Покрыто, но только is_finite |
 | ~~Параллельный vs последовательный parity~~ | ~~🟢~~ | ✅ Покрыто |
 | ~~Очень широкие слои (>1000)~~ | ~~🟡~~ | ✅ Покрыто (до 1024) |
 

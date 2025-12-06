@@ -1,6 +1,6 @@
 # ArKan Functionality Audit
 
-**Дата последнего аудита:** 7 декабря 2025  
+**Дата последнего аудита:** 6 декабря 2025  
 **Версия:** 0.3.0 (gpu-backend branch)
 
 Этот каталог содержит аудит функциональности проекта ArKan.  
@@ -8,27 +8,39 @@
 
 ---
 
-## 📊 Рейтинг по модулям
+## 🔴 КРИТИЧЕСКИЕ СЛЕПЫЕ ЗОНЫ (выявлено при аудите)
+
+| Зона | Модуль | Проблема | Влияние |
+|------|--------|----------|---------|
+| **GPU тесты не бегают** | GPU (04-06) | `#[ignore]` + `#[cfg(feature)]` | Регрессии не ловятся |
+| **SIMD не сравнивается** | CPU Forward | Только `is_finite()` | Арифметические баги не ловятся |
+| **Gradient check слабый** | CPU Backward | 1e-2 допуск, 90% pass, 10 весов | Не "gold standard" |
+| **Serde тесты не бегают** | Serialization | `#[cfg(feature = "serde")]` | Регрессии не ловятся |
+| **Convergence не проверяется** | Examples | Нет CI для accuracy/MSE | Заявления не подтверждены |
+
+---
+
+## 📊 Рейтинг по модулям (ПЕРЕСМОТРЕННЫЙ)
 
 | Модуль | Оценка | Комментарий | Файл |
 |--------|--------|-------------|------|
 | B-Spline | ⭐⭐⭐⭐⭐ (5/5) | Эталон: scipy parity + математические инварианты | [00-bspline.md](00-bspline.md) |
-| CPU Forward | ⭐⭐⭐⭐⭐ (5/5) | SIMD изоляция (170 комбинаций) + wide layers (1024) | [01-cpu-forward.md](01-cpu-forward.md) |
-| CPU Backward | ⭐⭐⭐⭐⭐ (5/5) | Parallel parity (11 тестов) + wide layers (1024) | [02-cpu-backward.md](02-cpu-backward.md) |
-| CPU Training | ⭐⭐⭐⭐⭐ (5/5) | Реальные задачи (sinusoid, MNIST, 2048) | [03-cpu-training.md](03-cpu-training.md) |
-| GPU Forward | ⭐⭐⭐⭐ (4/5) | Parity с CPU — надежно | [04-gpu-forward.md](04-gpu-forward.md) |
-| GPU Backward | ⭐⭐⭐⭐ (4/5) | Parity с CPU + gradient check | [05-gpu-backward.md](05-gpu-backward.md) |
-| GPU Training | ⭐⭐⭐⭐⭐ (5/5) | Native + Hybrid: 10 тестов | [06-gpu-training.md](06-gpu-training.md) |
+| CPU Forward | ⭐⭐⭐⭐ (4/5) | ⚠️ SIMD тесты только is_finite | [01-cpu-forward.md](01-cpu-forward.md) |
+| CPU Backward | ⭐⭐⭐⭐ (4/5) | ⚠️ Gradient check ослаблен (1e-2, 90%, 10 весов) | [02-cpu-backward.md](02-cpu-backward.md) |
+| CPU Training | ⭐⭐⭐⭐ (4/5) | ⚠️ Convergence не в CI | [03-cpu-training.md](03-cpu-training.md) |
+| GPU Forward | ⭐⭐⭐ (3/5) | 🔴 **ВСЕ тесты #[ignore]** | [04-gpu-forward.md](04-gpu-forward.md) |
+| GPU Backward | ⭐⭐⭐ (3/5) | 🔴 **ВСЕ тесты #[ignore]** | [05-gpu-backward.md](05-gpu-backward.md) |
+| GPU Training | ⭐⭐⭐ (3/5) | 🔴 **ВСЕ тесты #[ignore]** | [06-gpu-training.md](06-gpu-training.md) |
 | Optimizers | ⭐⭐⭐⭐ (4/5) | PyTorch parity, gradient clipping | [07-optimizers.md](07-optimizers.md) |
 | Memory | ⭐⭐⭐⭐ (4/5) | Overflow protection + регрессионные | [08-memory.md](08-memory.md) |
-| Serialization | ⭐⭐⭐⭐⭐ (5/5) | Multi-size, corrupted data, roundtrip | [09-serialization.md](09-serialization.md) |
+| Serialization | ⭐⭐⭐ (3/5) | 🔴 **Тесты под feature flag** | [09-serialization.md](09-serialization.md) |
 | Error Handling | ⭐⭐⭐⭐⭐ (5/5) | Каждый error variant тестируется | [10-error-handling.md](10-error-handling.md) |
 | Loss Functions | ⭐⭐⭐⭐⭐ (5/5) | PyTorch parity (8 тестов) | [11-loss-functions.md](11-loss-functions.md) |
 | BakedModel | ⭐⭐⭐ (3/5) | Serialization roundtrip нет | [12-baked-model.md](12-baked-model.md) |
 | Config | ⭐⭐⭐⭐⭐ (5/5) | Builder API полное покрытие | [13-config.md](13-config.md) |
-| Examples | ⭐⭐⭐⭐ (4/5) | 6 примеров + 32 теста (12 integration + 20 unit) | [14-examples.md](14-examples.md) |
+| Examples | ⭐⭐⭐ (3/5) | 🔴 **Convergence не тестируется** | [14-examples.md](14-examples.md) |
 
-**Средняя оценка:** 4.5/5 ⭐⭐⭐⭐ (хорошо)
+**Средняя оценка:** 3.9/5 ⭐⭐⭐⭐ (после честного пересмотра)
 
 ---
 
@@ -47,16 +59,17 @@
 
 ---
 
-## 📋 Типы тестов
+## 📋 Типы тестов (ПЕРЕСМОТРЕННЫЕ)
 
-| Тип теста | Где применяется | Надежность |
-|-----------|-----------------|------------|
+| Тип теста | Где применяется | Реальная надежность |
+|-----------|-----------------|---------------------|
 | Эталонное сравнение (scipy) | B-Spline | ⭐⭐⭐⭐⭐ Очень высокая |
-| Numerical gradient check | Backward pass | ⭐⭐⭐⭐ Высокая (ограничена f32) |
-| Parity CPU↔GPU | GPU modules | ⭐⭐⭐⭐ Высокая |
+| Numerical gradient check | Backward pass | ⭐⭐⭐ Средняя (1e-2 допуск, 90% pass, 10 весов) |
+| Parity CPU↔GPU | GPU modules | ⭐⭐ **Низкая — тесты #[ignore]** |
 | Parity sequential↔parallel | Backward pass | ⭐⭐⭐⭐⭐ Очень высокая |
-| Convergence E2E | Training | ⭐⭐⭐ Средняя |
-| SIMD parity тесты | CPU Forward | ⭐⭐⭐⭐⭐ Очень высокая |
+| Convergence E2E | Training | ⭐⭐ **Низкая — не в CI** |
+| SIMD coverage | CPU Forward | ⭐⭐⭐ **Средняя — только is_finite()** |
+| Serde roundtrip | Serialization | ⭐⭐ **Низкая — под feature flag** |
 
 ---
 
@@ -84,6 +97,24 @@ docs/audit/
 
 ---
 
+## 🎯 Action Items (ПЕРЕСМОТРЕННЫЕ)
+
+### High Priority 🔴
+1. **Запустить GPU тесты в CI** — или явно отметить что они не бегают
+2. **Добавить SIMD vs scalar эталонные сравнения** — не только is_finite
+3. **Усилить gradient check** — строже допуски, больше выборок
+4. **Запустить serde тесты в CI** — `cargo test --features serde`
+
+### Medium Priority 🟡
+1. **Добавить convergence тесты в CI** — sinusoid/MNIST
+2. **Ужесточить gradient check** — 1e-3 допуск, 95% pass, 50 весов
+
+### Low Priority 🟢
+1. Model versioning — для backward compatibility
+2. BakedModel serialization roundtrip
+
+---
+
 ## 💡 Идеи для оптимизации
 
 | Область | Тип | Сложность | Описание |
@@ -103,21 +134,6 @@ docs/audit/
 | Panic → Result | 🧹 Clean | 🟡 Средняя | Заменить assert! на Result |
 
 **Типы:** 🚀 Perf — производительность | 🔧 Feature — функционал | 🧹 Clean — рефакторинг
-
----
-
-## 🎯 Action Items
-
-### High Priority 🔴
-1. ~~Gradient clipping в GpuAdam~~ — ✅ **ИСПРАВЛЕНО**
-2. ~~Hybrid Adam bug~~ — ✅ **ИСПРАВЛЕНО**
-
-### Medium Priority 🟡
-1. ~~Lock-free ReplayBuffer~~ — ✅ **ВЫПОЛНЕНО** (ShardedReplayBuffer с 16 shards)
-2. ~~LBFGS Rosenbrock test~~ — ✅ **ВЫПОЛНЕНО** (PyTorch parity + GD comparison)
-
-### Low Priority 🟢
-1. Model versioning — для backward compatibility
 
 ---
 
