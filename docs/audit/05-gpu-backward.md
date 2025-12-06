@@ -93,3 +93,14 @@
 | ~~Gradient accumulation~~ | ~~🟡~~ | ✅ Покрыто |
 | ~~Backward с разными batch~~ | ~~🟡~~ | ✅ 5 размеров |
 | ~~Numerical gradient check~~ | ~~🔴~~ | ✅ Central differences |
+
+---
+
+## 5.7 Место для оптимизации
+
+| Область | Тип | Сложность | Описание |
+|---------|-----|-----------|----------|
+| Fused backward kernel | 🚀 Perf | 🟡 Средняя | Объединить weight/bias/input grad в один kernel |
+| Async gradient sync | 🚀 Perf | 🟡 Средняя | Pipeline backward и optimizer step |
+| Gradient compression | 🚀 Perf | 🔴 Высокая | Сжатие градиентов для уменьшения GPU→CPU transfer |
+| Selective backward | 🔧 Feature | 🟢 Низкая | Пропуск backward для frozen layers |

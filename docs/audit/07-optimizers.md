@@ -139,3 +139,15 @@
 | ~~LBFGS line search~~ | ~~🔴~~ | ✅ **ИСПРАВЛЕНО v2.0** |
 | ~~Nesterov momentum~~ | ~~🟡~~ | ✅ **ИСПРАВЛЕНО v2.0** |
 | LBFGS Rosenbrock test | 🟡 Средний | TODO |
+
+---
+
+## 7.8 Место для оптимизации
+
+| Область | Тип | Сложность | Описание |
+|---------|-----|-----------|----------|
+| AdaGrad optimizer | 🔧 Feature | 🟢 Низкая | Альтернатива Adam для sparse gradients |
+| RMSprop optimizer | 🔧 Feature | 🟢 Низкая | Популярный оптимизатор для RNN |
+| LAMB optimizer | 🔧 Feature | 🟡 Средняя | Large batch optimizer для больших LR |
+| Gradient sparsification | 🚀 Perf | 🟡 Средняя | Top-K градиентов для экономии bandwidth |
+| Warmup + decay шедулеры | 🔧 Feature | 🟢 Низкая | Linear warmup, exponential decay |

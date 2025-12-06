@@ -67,3 +67,15 @@
 | Комбинации параметров | 🟡 Низкий | Не все комбинации |
 | grid_size + order compatibility | 🟡 Средний | grid_size < order+1 не проверяется |
 | Memory estimation | 🟡 Низкий | Нет метода оценить RAM |
+
+---
+
+## 13.5 Место для оптимизации
+
+| Область | Тип | Сложность | Описание |
+|---------|-----|-----------|----------|
+| Memory estimator | 🔧 Feature | 🟢 Низкая | `config.estimate_memory_bytes()` |
+| Auto-tuning | 🔧 Feature | 🟡 Средняя | Авто-подбор grid_size/order по задаче |
+| Presets library | 🔧 Feature | 🟢 Низкая | Готовые конфиги для типовых задач |
+| Config validation улучшение | 🧹 Clean | 🟢 Низкая | Проверка grid_size >= order+1 |
+| YAML/TOML config | 🔧 Feature | 🟢 Низкая | Загрузка конфига из файла |

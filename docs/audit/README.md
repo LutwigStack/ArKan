@@ -79,11 +79,30 @@ docs/audit/
 ├── 11-loss-functions.md   # Loss Functions
 ├── 12-baked-model.md      # BakedModel
 ├── 13-config.md           # KanConfig & ConfigBuilder
-├── 14-game2048.md         # Example: game2048 DQN
-├── 15-summary.md          # Test Coverage Summary
-├── 16-action-items.md     # Action Items & Improvements
-└── changelog.md           # История изменений
+└── 14-examples.md         # Examples (basic, training, GPU, sinusoid, MNIST, game2048)
 ```
+
+---
+
+## 💡 Идеи для оптимизации
+
+| Область | Тип | Сложность | Описание |
+|---------|-----|-----------|----------|
+| **Производительность** |
+| f16 compute | 🚀 Perf | 🟡 Средняя | Half precision для 2x throughput на GPU |
+| Tensor cores | 🚀 Perf | 🔴 Высокая | NVIDIA/AMD matrix multiply units |
+| AVX-512 SIMD | 🚀 Perf | 🟡 Средняя | 512-bit vectors для современных CPU |
+| Async training pipeline | 🚀 Perf | 🟡 Средняя | Перекрытие forward/backward |
+| **Новый функционал** |
+| RBF approximation | 🔧 Feature | 🔴 Высокая | Radial Basis Functions вместо B-splines |
+| ONNX export | 🔧 Feature | 🔴 Высокая | Экспорт для inference в других фреймворках |
+| Multi-GPU | 🔧 Feature | 🔴 Высокая | Data parallel на нескольких GPU |
+| Model versioning | 🔧 Feature | 🟡 Средняя | Backward compatibility для сериализации |
+| **Рефакторинг** |
+| Error context chain | 🧹 Clean | 🟢 Низкая | Улучшенная диагностика ошибок |
+| Panic → Result | 🧹 Clean | 🟡 Средняя | Заменить assert! на Result |
+
+**Типы:** 🚀 Perf — производительность | 🔧 Feature — функционал | 🧹 Clean — рефакторинг
 
 ---
 
@@ -100,15 +119,12 @@ docs/audit/
 ### Low Priority 🟢
 1. Model versioning — для backward compatibility
 
-См. полный список в [16-action-items.md](16-action-items.md)
-
 ---
 
 ## 📝 Последние изменения
 
+- **2025-12-06:** Добавлены секции "Место для оптимизации" во все модули
+- **2025-12-06:** Переименован 14-game2048 → 14-examples с анализом всех примеров
+- **2025-12-06:** Стандартизация нумерации секций (X.1, X.2, etc.)
 - **2025-12-07:** PyTorch parity для cross_entropy (8 тестов)
 - **2025-12-07:** Расширение serialization тестов (10 тестов)
-- **2025-12-06:** GPU Training тесты и исправления
-- **2025-12-06:** Memory Management тесты (19 тестов)
-
-См. полную историю в [changelog.md](changelog.md)

@@ -47,3 +47,15 @@
 | Разные архитектуры | 🟡 Средний | Только default config |
 | Performance vs KanNetwork | 🟡 Низкий | Не проверяется |
 | Memory footprint | 🟡 Низкий | Не проверяется |
+
+---
+
+## 12.5 Место для оптимизации
+
+| Область | Тип | Сложность | Описание |
+|---------|-----|-----------|----------|
+| GpuBakedModel | 🔧 Feature | 🟡 Средняя | GPU-only inference версия BakedModel |
+| Quantized weights | 🚀 Perf | 🟡 Средняя | INT8 quantization для меньшего размера |
+| Pruned splines | 🚀 Perf | 🟡 Средняя | Удаление нулевых spline coefficients |
+| WASM target | 🔧 Feature | 🟡 Средняя | BakedModel для WebAssembly |
+| Batch inference API | 🔧 Feature | 🟢 Низкая | forward_batch для BakedModel |

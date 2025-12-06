@@ -81,3 +81,15 @@
 | ~~Долгое обучение (1000+ steps)~~ | ~~🟡~~ | ✅ **ИСПРАВЛЕНО** |
 | ~~Hybrid Adam bug~~ | ~~🟡~~ | ✅ **ИСПРАВЛЕНО** — `unpad_weights` |
 | SGD parity tolerance | 🟡 Низкий | max_diff близко к tol |
+
+---
+
+## 6.6 Место для оптимизации
+
+| Область | Тип | Сложность | Описание |
+|---------|-----|-----------|----------|
+| Zero-copy weight sync | 🚀 Perf | 🟡 Средняя | Избежать копирования weights CPU↔GPU |
+| Async training pipeline | 🚀 Perf | 🟡 Средняя | Пипелайн: forward[n+1] || backward[n] |
+| Mixed precision training | 🔧 Feature | 🟡 Средняя | f16 forward, f32 accumulation |
+| Distributed training | 🔧 Feature | 🔴 Высокая | Data parallel на нескольких GPU |
+| Automatic batch size | 🔧 Feature | 🟢 Низкая | Авто-определение максимального batch по VRAM |
