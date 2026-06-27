@@ -5,7 +5,7 @@ All notable changes to ArKan will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2025-12-04
+## [0.3.0] - 2025-12-06
 
 ### Added
 
@@ -17,16 +17,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`GpuAdamConfig`**, **`GpuSgdConfig`** — Configuration structs for GPU optimizers
 - **`GpuLayer::allocate_gradient_buffers()`** — Pre-allocate gradient storage on GPU
 - **`GpuNetwork::prepare_native_training()`** — Initialize all layers for native training
+- **`VramLimit` enum** (`Bytes`, `Gigabytes`, `Percent`, `Unlimited`) with `with_max_vram()` / `with_max_vram_percent()` helpers
+- **`forward_batch_async()`** returning `GpuForwardHandle` for async GPU inference
+
+#### Optimizer Module v2.0 / v2.1
+- **`StandaloneLBFGS`** with two-loop recursion and Strong Wolfe / backtracking line search
+- **`SGD` Nesterov momentum**, **`ParamGroup`** structure, **`Workspace::zero_grad()`**
+- **`trait Optimizer`** — unified API; `Send + Sync` thread safety; `bump_version()`
+- **`SafetyConfig`** (`safety` field on `AdamConfig`/`SGDConfig`) — NaN handling, AMP placeholder
+
+#### Loss Functions
+- KAN-specific regularization: `l1_sparsity_loss`, `entropy_regularization`, `smoothness_penalty`, `kan_combined_loss`
+- Physics-informed losses: `pde_residual_loss`, `r_squared`
+
+#### Reinforcement Learning Utilities
+- **`ShardedReplayBuffer`** — 16-shard replay buffer for reduced lock contention (DQN use-case)
+
+#### CI / Integration Tests
+- GitHub Actions workflow: `build`, `examples`, `gpu-build`, `docs` jobs
+- `tests/examples_integration.rs` — 12 integration tests covering inference, training, config, workspace
+- `examples/game2048` DQN unit tests: Bellman equation, terminal state, selective update, shard fairness
 
 #### Performance
 - **2-5x faster training** vs hybrid GPU (no CPU↔GPU sync overhead)
 - Gradients stay on GPU between backward and optimizer steps
 - Adam moment vectors (m, v) stored entirely on VRAM
+- **`forward_batch_parallel()`** — multi-core CPU inference via Rayon
 
 ### Changed
 
 - `GpuNetwork::train_step()` now uses hybrid mode (backward GPU, optimizer CPU) by default
 - Native training requires explicit call to `prepare_native_training()` first
+
+### Fixed
+
+- **GPU input gradient bug** — `compute_input_grad` now true for all layers (was false for layer 0)
+- **Serialization knots bug** — custom `Deserialize` for `KanLayer` recomputes knots after load
 
 ### Performance
 
@@ -38,7 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.0] - 2025-12-04
+## [0.2.0] - 2025-12-05
 
 ### Added
 

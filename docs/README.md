@@ -6,7 +6,6 @@ Technical documentation for the ArKan KAN (Kolmogorov-Arnold Network) library.
 
 - [**ARCHITECTURE.md**](ARCHITECTURE.md) — System architecture, module structure, and design decisions
 - [**BENCHMARKS.md**](BENCHMARKS.md) — Performance benchmarks, CPU vs GPU comparisons
-- [**FUNCTIONALITY_AUDIT.md**](FUNCTIONALITY_AUDIT.md) — 🔍 Честный аудит: задумано vs реально работает
 
 ## Quick Links
 

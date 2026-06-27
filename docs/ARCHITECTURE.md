@@ -8,20 +8,22 @@ Kolmogorov-Arnold Network (KAN) library with CPU SIMD and GPU backends.
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Public API                               │
-│  KanNetwork, KanConfig, Workspace, TrainOptions, Adam          │
+│  KanNetwork, KanConfig, Workspace, TrainOptions,               │
+│  Adam/SGD/LBFGS + LR schedulers, GpuNetwork (gpu feature)     │
 └─────────────────────────────────────────────────────────────────┘
                               │
         ┌─────────────────────┴─────────────────────┐
         ▼                                           ▼
 ┌───────────────────┐                     ┌───────────────────┐
 │    CPU Backend    │                     │    GPU Backend    │
-│  (SIMD-optimized) │                     │  (wgpu + WGSL)    │
+│  (SIMD + rayon)   │                     │  (wgpu 23 + WGSL) │
 └───────────────────┘                     └───────────────────┘
         │                                           │
         ▼                                           ▼
 ┌───────────────────┐                     ┌───────────────────┐
-│   KanLayer        │                     │   GpuKanLayer     │
+│   KanLayer        │                     │   GpuLayer        │
 │   B-spline eval   │                     │   Compute shaders │
+│   orders 2–7      │                     │   orders 2–5      │
 └───────────────────┘                     └───────────────────┘
         │                                           │
         ▼                                           ▼
@@ -44,7 +46,7 @@ Kolmogorov-Arnold Network (KAN) library with CPU SIMD and GPU backends.
 Key methods:
 - `forward_single` - Single sample inference (lowest latency)
 - `forward_batch` - Batch inference (highest throughput)
-- `train_step` - Complete training iteration with SGD
+- `train_step` - Complete training iteration (SGD/Adam/LBFGS)
 - `try_*` variants - Result-returning versions for error handling
 
 ### 2. Layer (`src/layer.rs`)
@@ -78,7 +80,7 @@ B_{i,k}(x) = (x - t_i)/(t_{i+k} - t_i) * B_{i,k-1}(x)
            + (t_{i+k+1} - x)/(t_{i+k+1} - t_{i+1}) * B_{i+1,k-1}(x)
 ```
 
-SIMD-optimized for orders 2-7 (`MAX_SPLINE_ORDER`).
+SIMD-optimized for orders 2–7 (`MAX_SPLINE_ORDER`). GPU shaders support orders 2–5 (`MIN_GPU_SPLINE_ORDER`–`MAX_GPU_SPLINE_ORDER`).
 
 ### 4. Buffer Management (`src/buffer.rs`)
 
@@ -90,8 +92,8 @@ SIMD-optimized for orders 2-7 (`MAX_SPLINE_ORDER`).
 
 **Workspace:**
 - Preallocates all buffers for forward/backward passes
-- Enables zero-allocation inference
-- Thread-local usage pattern
+- Enables zero-allocation inference (reuse across calls)
+- Thread-local usage pattern (one `Workspace` per thread)
 
 **WorkspaceGuard (RAII):**
 ```rust
@@ -117,16 +119,16 @@ Unified error type `ArkanError` with variants:
 
 ```
 src/gpu/
-├── mod.rs          # Public exports
-├── backend.rs      # wgpu device/queue initialization
-├── layer.rs        # GpuKanLayer (GPU layer wrapper)
-├── network.rs      # GpuKanNetwork (GPU network)
-├── pipeline.rs     # Compute pipeline management
-├── shaders.rs      # WGSL shader sources
-├── tensor.rs       # GpuTensor (GPU buffer wrapper)
-├── uniforms.rs     # Shader uniform structs
-├── workspace.rs    # GpuWorkspace
-└── optimizer.rs    # GpuAdam, GpuSgd
+├── mod.rs          # Public exports + utility fns (align_to, pad_to_vec4, etc.)
+├── backend.rs      # WgpuBackend — device/queue/adapter init, VramLimit
+├── layer.rs        # GpuLayer — bind groups, weight upload, per-layer pipelines
+├── network.rs      # GpuNetwork — full GPU forward/backward/training + GpuForwardHandle
+├── pipeline.rs     # PipelineCache — compiled compute pipelines, workgroup_count
+├── shaders.rs      # WGSL shader sources + dynamic shader generation
+├── tensor.rs       # GpuTensor / GpuTensorView — GPU buffer upload/download
+├── uniforms.rs     # LayerUniforms (std140) — shader uniform structs
+├── workspace.rs    # GpuWorkspace — resizable workspace buffers
+└── optimizer.rs    # GpuAdam / GpuSgd — on-device optimizer steps
 ```
 
 ### Shader Architecture
@@ -153,27 +155,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) { ... }
 
 | Shader | Purpose | Workgroup |
 |--------|---------|-----------|
-| `FORWARD_SHADER` | B-spline forward pass | 64×1×1 |
-| `FORWARD_SIMPLE_SHADER` | Simple forward (no splines) | 64×1×1 |
-| `FORWARD_TRAINING_SHADER` | Forward with history capture | 64×1×1 |
-| `BACKWARD_WEIGHTS_SHADER` | Weight gradient accumulation | 64×1×1 |
-| `BACKWARD_INPUT_SHADER` | Input gradient computation | 64×1×1 |
-| `BACKWARD_BIAS_SHADER` | Bias gradient accumulation | 64×1×1 |
-| `SOFTMAX_SHADER` | Softmax activation | 64×1×1 |
-| `ADD_SHADER` | Element-wise addition | 64×1×1 |
-| `ADAM_SHADER` | Adam optimizer step | 64×1×1 |
-| `SGD_SHADER` | SGD with momentum step | 64×1×1 |
+| `generate_forward_shader(order)` | B-spline forward pass (order 2–5) | 64×1×1 |
+| `generate_forward_training_shader(order)` | Forward with history capture | 64×1×1 |
+| `generate_backward_weights_shader(order)` | Weight gradient accumulation | 64×1×1 |
+| `generate_backward_input_shader(order)` | Input gradient computation | 64×1×1 |
+| `ADAM_SHADER` | On-device Adam optimizer step | 64×1×1 |
+| `SGD_SHADER` | On-device SGD with momentum step | 64×1×1 |
 | `GRAD_CLIP_SHADER` | Global gradient clipping | 64×1×1 |
 
 ### Dynamic Shader Generation
 
-For spline orders 2-5, shaders are generated at runtime:
+All primary compute shaders are generated at runtime for each spline order (2–5):
 ```rust
-let shader = generate_forward_shader(spline_order)?;
+let fwd = generate_forward_shader(spline_order)?;
+let fwd_train = generate_forward_training_shader(spline_order)?;
+let bwd_w = generate_backward_weights_shader(spline_order)?;
+let bwd_i = generate_backward_input_shader(spline_order)?;
 ```
 
 This inlines the B-spline basis computation for each order,
 avoiding runtime branching and enabling compiler optimizations.
+Compiled pipelines are cached in `PipelineCache`.
 
 ## Memory Layout
 
@@ -203,7 +205,7 @@ Weights are packed into `vec4` for coalesced memory access:
 1. forward_batch_training()
    └── Captures layer inputs and grid indices for backward
 
-2. compute_masked_mse_loss_into()
+2. Loss computation (masked MSE/BCE/cross-entropy/etc.)
    └── Computes loss and output gradients
 
 3. backward() for each layer (reverse order)
@@ -214,24 +216,38 @@ Weights are packed into `vec4` for coalesced memory access:
 4. Gradient clipping (optional)
    └── Global norm clipping across all parameters
 
-5. Parameter update
-   ├── Weight decay (decoupled)
-   └── SGD step: w -= lr * grad
+5. Parameter update via Optimizer trait
+   ├── SGD: w -= lr * (μ*v + g)  [optional Nesterov, momentum, weight decay]
+   ├── Adam: bias-corrected moment estimates + decoupled weight decay (AdamW)
+   └── LBFGS: two-loop recursion + Strong-Wolfe line search
+
+6. Safety layer (per AdamConfig/SGDConfig/LBFGSConfig.safety: SafetyConfig)
+   ├── NaN detection (fail_on_nan / skip_step_on_nan)
+   └── AMP gradient scaling (grad_scaling_factor)
 ```
+
+### LR Schedulers
+
+- `StepLR` — decay by factor every N epochs
+- `CosineAnnealingLR` — cosine schedule between `lr_max` and `lr_min`
 
 ## Performance Optimizations
 
 ### CPU
-- 64-byte aligned buffers for AVX-512
-- SIMD-vectorized B-spline evaluation
-- Zero-allocation inference with Workspace
+- 64-byte aligned buffers for AVX-512 (`AlignedBuffer`)
+- SIMD-vectorized B-spline evaluation (`wide` crate, `simd` feature)
+- Rayon parallelism over batch samples (`parallel` feature)
+- Zero-allocation inference with `Workspace` (reuse across calls)
 - Cache-friendly memory layout
 
 ### GPU
-- `vec4` weight packing for coalesced access
-- Persistent compute pipelines
+- `vec4` weight packing for coalesced access (`pad_to_vec4`)
+- Persistent compute pipelines via `PipelineCache`
 - Workgroup size 64 (GPU wavefront friendly)
 - Bounds checking with `arrayLength()` (no OOB crashes)
+- On-device `GpuAdam` / `GpuSgd` — optimizer step runs entirely on GPU, no CPU round-trip
+- Split bind-group strategy: Group 0 (layer weights/bias/uniforms, static) + Group 1 (workspace IO, dynamic)
+- `GpuForwardHandle` for async dispatch without blocking the CPU
 
 ## Serialization
 
@@ -245,21 +261,41 @@ Binary format with versioning:
 
 Version 1 is the initial versioned format (ArKan 0.3.0+).
 
+## Feature Flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `default` | No extra features | On |
+| `simd` | Explicit SIMD via `wide` crate | Off |
+| `parallel` | Rayon batch parallelism | Off |
+| `serde` | Serialization via `serde` + `bincode` | Off |
+| `quantization` | Half-precision (f16) support | Off |
+| `nightly` | Nightly-only optimizations | Off |
+| `gpu` | GPU backend via wgpu 23 (Vulkan/DX12/Metal) | Off |
+
 ## Constants
 
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `MAX_SPLINE_ORDER` | 7 | Maximum B-spline order (CPU) |
-| `MAX_GPU_SPLINE_ORDER` | 5 | Maximum B-spline order (GPU) |
-| `MIN_GPU_SPLINE_ORDER` | 2 | Minimum B-spline order (GPU) |
-| `CACHE_LINE` | 64 | Buffer alignment in bytes |
+| `MAX_GPU_SPLINE_ORDER` | 5 | Maximum B-spline order (GPU dynamic shaders) |
+| `MIN_GPU_SPLINE_ORDER` | 2 | Minimum B-spline order (GPU dynamic shaders) |
+| `CACHE_LINE` | 64 | Buffer alignment in bytes (AVX-512) |
 | `MAX_BUFFER_ELEMENTS` | 2^30 | Maximum buffer size (overflow protection) |
+| `WORKGROUP_SIZE` | 64 | GPU compute workgroup size |
+| `GPU_BUFFER_ALIGNMENT` | 256 | GPU buffer alignment (uniform offsets) |
+| `MAX_VRAM_ALLOC` | 2 GB | Default per-buffer VRAM limit |
+
+## Deprecated / Stub Modules
+
+- `src/baked.rs` — `BakedModel` is deprecated since v0.2.0 and fully unimplemented (`forward()` always panics). Full quantization planned for v0.4.0. Do not use.
 
 ## Thread Safety
 
 - `KanNetwork` is `Send + Sync` (immutable forward pass)
-- `Workspace` should be thread-local (one per thread)
-- GPU operations are single-threaded (wgpu limitation)
+- `Workspace` should be thread-local (one per thread); CPU training uses rayon internally
+- `Adam`, `SGD`, `LBFGS` are `Send + Sync` (manual impls; use `AlignedBuffer` internally)
+- `GpuNetwork` / `WgpuBackend` — GPU dispatch uses a single wgpu queue; do not share across threads without external synchronization
 
 ## Error Handling Strategy
 

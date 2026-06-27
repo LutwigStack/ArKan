@@ -47,7 +47,7 @@ x[l+1, j] = Σᵢ φ[l,j,i](x[l, i])      где i = 1..N_in
 * **SIMD-Optimized B-Splines:** Вычисление базисных функций B-сплайнов векторизовано (AVX2/AVX-512 через крейт `wide`).  
 * **Cache-Friendly Layout:** Веса хранятся в формате `[Output][Input][Basis]` для последовательного доступа к памяти и минимизации промахов кэша.  
 * **Standalone:** Минимальные зависимости (`rayon`, `wide`). Не тянет за собой `torch` или `burn`, идеально для встраивания.  
-* **Quantization Ready:** Архитектура подготовлена для работы с квантованными весами (baked models) для дальнейшего ускорения.
+* **Quantization (запланировано):** `BakedModel` — deprecated заглушка (forward() паникует); полная реализация запланирована на v0.4.0. Используйте `KanNetwork` напрямую.
 * **GPU-ускорение (wgpu):** Опциональный GPU бэкенд с WGSL compute шейдерами для параллельного forward/backward.
 
 ## **GPU Backend (Опционально)**
@@ -116,6 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### **Ограничения GPU (wgpu 0.23)**
 
+- **Порядок сплайна:** GPU шейдеры поддерживают только порядки 2–5 (`MIN_GPU_SPLINE_ORDER=2`, `MAX_GPU_SPLINE_ORDER=5`). CPU поддерживает 2–7.
 - **Нет пробрасывания DeviceLost:** wgpu 0.23 не предоставляет ошибки `DeviceLost`. Падение GPU может выглядеть как зависание вместо корректной ошибки.
 - **Лимит памяти:** По умолчанию `MAX_VRAM_ALLOC = 2GB` на буфер. Настраивается через `WgpuOptions`. Для больших тензоров рекомендуется ~30% от реального VRAM (например, 3GB для RTX 4070 SUPER с 12GB).
 - **Vec4 выравнивание:** Веса дополняются до границы vec4 (4 элемента) для эффективности шейдеров.
@@ -272,7 +273,7 @@ Equation for a specific weight in ArKan:
 * **SIMD-Optimized B-Splines:** B-spline basis evaluation is vectorized (AVX2/AVX-512 via `wide` crate).  
 * **Cache-Friendly Layout:** Weights are stored in `[Output][Input][Basis]` format for sequential memory access and minimal cache misses.  
 * **Standalone:** Minimal dependencies (`rayon`, `wide`). No `torch` or `burn` bloat, ideal for embedding.  
-* **Quantization Ready:** Architecture is ready for quantized weights (baked models) for further acceleration.
+* **Quantization (planned):** `BakedModel` is a deprecated stub (`forward()` panics); full implementation planned for v0.4.0. Use `KanNetwork` directly in the meantime.
 * **GPU Acceleration (wgpu):** Optional GPU backend with WGSL compute shaders for parallel forward/backward passes.
 
 ## **GPU Backend (Optional)**
@@ -368,6 +369,7 @@ let loss = gpu_network.train_step_with_options(
 
 ### **GPU Limitations (wgpu 0.23)**
 
+- **Spline order:** GPU shaders support orders 2–5 only (`MIN_GPU_SPLINE_ORDER=2`, `MAX_GPU_SPLINE_ORDER=5`). CPU supports 2–7.
 - **No DeviceLost propagation:** wgpu 0.23 does not expose `DeviceLost` errors. GPU crashes may appear as hangs instead of proper errors.
 - **Memory limits:** Default `MAX_VRAM_ALLOC = 2GB` per buffer. Configurable via `WgpuOptions`. For large tensors, use ~30% of your actual VRAM (e.g., 3GB for RTX 4070 SUPER with 12GB).
 - **Vec4 alignment:** Weights are padded to vec4 (4-element) boundaries for shader efficiency.
