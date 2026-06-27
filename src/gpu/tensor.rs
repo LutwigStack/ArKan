@@ -462,18 +462,6 @@ impl GpuTensor {
         (self.num_elements() * std::mem::size_of::<f32>()) as u64
     }
 
-    /// Returns the number of dimensions.
-    pub fn ndim(&self) -> usize {
-        self.shape.len()
-    }
-
-    /// Validates that the tensor has the expected shape.
-    pub fn validate_shape(&self, expected: &[usize]) -> ArkanResult<()> {
-        if self.shape != expected {
-            return Err(ArkanError::shape_mismatch(expected, &self.shape));
-        }
-        Ok(())
-    }
 }
 
 impl std::fmt::Debug for GpuTensor {

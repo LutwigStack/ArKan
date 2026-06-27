@@ -81,8 +81,6 @@ pub struct GpuWorkspace {
     /// Configurable via `WgpuBackend::max_vram_alloc()`.
     max_vram_alloc: u64,
 
-    /// Bind group layout for dynamic resources (Group 1).
-    pub bind_group_layout: Option<wgpu::BindGroupLayout>,
     /// Cached bind group for single-layer (input -> output).
     cached_bind_group: Option<wgpu::BindGroup>,
     /// Cached bind groups for multi-layer, indexed by (in_buffer_type, out_buffer_type).
@@ -93,8 +91,6 @@ pub struct GpuWorkspace {
     /// Cached bind groups for backward pass.
     cached_backward_bind_groups: Vec<Option<wgpu::BindGroup>>,
 
-    /// Generation counter for cache invalidation.
-    generation: u64,
 }
 
 impl GpuWorkspace {
@@ -185,12 +181,10 @@ impl GpuWorkspace {
             out_dim,
             max_batch,
             max_vram_alloc,
-            bind_group_layout: None,
             cached_bind_group: None,
             cached_layer_bind_groups: Vec::new(),
             cached_training_bind_groups: Vec::new(),
             cached_backward_bind_groups: Vec::new(),
-            generation: 0,
         })
     }
 
@@ -218,12 +212,10 @@ impl GpuWorkspace {
             out_dim,
             max_batch: 0,
             max_vram_alloc,
-            bind_group_layout: None,
             cached_bind_group: None,
             cached_layer_bind_groups: Vec::new(),
             cached_training_bind_groups: Vec::new(),
             cached_backward_bind_groups: Vec::new(),
-            generation: 0,
         }
     }
 
@@ -325,12 +317,6 @@ impl GpuWorkspace {
         self.cached_layer_bind_groups.clear();
         self.cached_training_bind_groups.clear();
         self.cached_backward_bind_groups.clear();
-        self.generation += 1;
-    }
-
-    /// Returns the current generation (for cache validation).
-    pub fn generation(&self) -> u64 {
-        self.generation
     }
 
     /// Prepares training buffers for backward pass.
@@ -951,26 +937,6 @@ impl GpuWorkspace {
         Ok(())
     }
 
-    /// Downloads all gradients (weights and biases) from GPU.
-    ///
-    /// Returns Vec of (weight_grads, bias_grads) for each layer.
-    /// Useful for gradient clipping verification and debugging.
-    pub fn download_all_gradients(
-        &self,
-        device: &std::sync::Arc<wgpu::Device>,
-        queue: &std::sync::Arc<wgpu::Queue>,
-    ) -> ArkanResult<Vec<(Vec<f32>, Vec<f32>)>> {
-        let mut result = Vec::with_capacity(self.grad_weights.len());
-
-        for (gw, gb) in self.grad_weights.iter().zip(self.grad_bias.iter()) {
-            let weights = gw.download(device, queue)?;
-            let biases = gb.download(device, queue)?;
-            result.push((weights, biases));
-        }
-
-        Ok(result)
-    }
-
     /// Downloads output data from the GPU.
     pub fn download_output(
         &self,
@@ -1006,7 +972,6 @@ impl std::fmt::Debug for GpuWorkspace {
             .field("in_dim", &self.in_dim)
             .field("out_dim", &self.out_dim)
             .field("max_batch", &self.max_batch)
-            .field("generation", &self.generation)
             .field("has_input", &self.input.is_some())
             .field("has_output", &self.output.is_some())
             .field("num_intermediates", &self.intermediates.len())

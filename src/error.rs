@@ -20,8 +20,6 @@
 //! }
 //! ```
 
-use std::borrow::Cow;
-
 use thiserror::Error;
 
 use crate::config::ConfigError;
@@ -207,12 +205,6 @@ pub enum ArkanError {
         expected_version: u64,
     },
 
-    /// Optimizer closure returned an error.
-    ///
-    /// Used by L-BFGS when the loss closure fails.
-    #[error("Closure error: {0}")]
-    ClosureError(String),
-
     /// General optimizer error.
     #[error("Optimizer error: {0}")]
     Optimizer(String),
@@ -243,13 +235,6 @@ impl ArkanError {
     /// Creates a configuration error from a ConfigError.
     pub fn config(err: ConfigError) -> Self {
         ArkanError::Config(err)
-    }
-
-    /// Creates a configuration error with a message.
-    pub fn config_msg<S: AsRef<str>>(msg: S) -> Self {
-        ArkanError::Config(ConfigError::InvalidDimension(Cow::Owned(
-            msg.as_ref().to_string(),
-        )))
     }
 
     /// Creates an overflow error.
@@ -310,11 +295,6 @@ impl ArkanError {
         }
     }
 
-    /// Creates a closure error.
-    pub fn closure_error<S: Into<String>>(msg: S) -> Self {
-        ArkanError::ClosureError(msg.into())
-    }
-
     /// Creates a general optimizer error.
     pub fn optimizer<S: Into<String>>(msg: S) -> Self {
         ArkanError::Optimizer(msg.into())
@@ -360,6 +340,7 @@ impl ArkanError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
 
     #[test]
     fn test_cpu_error() {

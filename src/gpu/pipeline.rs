@@ -264,11 +264,6 @@ impl PipelineCache {
         Ok(())
     }
 
-    /// Returns the forward pipeline layout.
-    pub fn forward_layout(&self) -> Option<&wgpu::PipelineLayout> {
-        self.forward_layout.as_ref()
-    }
-
     /// Returns an immutable reference to the training workspace layout.
     ///
     /// Panics if the layout has not been initialized yet via `get_training_workspace_layout`.

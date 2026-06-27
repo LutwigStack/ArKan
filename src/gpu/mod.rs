@@ -84,31 +84,12 @@ pub use workspace::GpuWorkspace;
 /// For RTX 4070 SUPER (12GB), you can safely use 8GB or more.
 pub const MAX_VRAM_ALLOC: u64 = backend::DEFAULT_MAX_VRAM_ALLOC;
 
-/// Default alignment for GPU buffers (256 bytes).
-///
-/// This alignment ensures compatibility with most GPU architectures and
-/// meets the requirements for uniform buffer offsets.
-pub const GPU_BUFFER_ALIGNMENT: u64 = 256;
-
 /// Checks if a size in bytes exceeds the default VRAM allocation limit.
 ///
-/// **Note:** For configurable limits, use `WgpuBackend::exceeds_vram_limit()`
-/// or `exceeds_vram_limit_with()`.
+/// **Note:** For configurable limits, use `WgpuBackend::exceeds_vram_limit()`.
 #[inline]
 pub fn exceeds_vram_limit(size_bytes: u64) -> bool {
     size_bytes > MAX_VRAM_ALLOC
-}
-
-/// Checks if a size in bytes exceeds a custom VRAM allocation limit.
-#[inline]
-pub fn exceeds_vram_limit_with(size_bytes: u64, max_alloc: u64) -> bool {
-    size_bytes > max_alloc
-}
-
-/// Aligns a size to the specified alignment.
-#[inline]
-pub const fn align_to(size: u64, alignment: u64) -> u64 {
-    (size + alignment - 1) & !(alignment - 1)
 }
 
 /// Pads a dimension to be a multiple of 4 (for vec4 access in shaders).
@@ -126,14 +107,6 @@ mod tests {
         assert!(!exceeds_vram_limit(1024));
         assert!(!exceeds_vram_limit(MAX_VRAM_ALLOC));
         assert!(exceeds_vram_limit(MAX_VRAM_ALLOC + 1));
-    }
-
-    #[test]
-    fn test_align_to() {
-        assert_eq!(align_to(0, 256), 0);
-        assert_eq!(align_to(1, 256), 256);
-        assert_eq!(align_to(256, 256), 256);
-        assert_eq!(align_to(257, 256), 512);
     }
 
     #[test]

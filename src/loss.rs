@@ -511,14 +511,8 @@ pub fn masked_mae(predictions: &[f32], targets: &[f32], mask: Option<&[f32]>) ->
         if m > 0.0 {
             let diff = predictions[i] - targets[i];
             loss += m * diff.abs();
-            // Subgradient: sign(diff), use 0 for diff=0
-            grad[i] = m * if diff > 0.0 {
-                1.0
-            } else if diff < 0.0 {
-                -1.0
-            } else {
-                0.0
-            };
+            // Subgradient: sign(diff), 0 when diff=0
+            grad[i] = m * if diff != 0.0 { diff.signum() } else { 0.0 };
             count += m;
         }
     }

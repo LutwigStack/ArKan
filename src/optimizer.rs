@@ -587,11 +587,6 @@ impl Adam {
         }
     }
 
-    /// Creates optimizer with default config.
-    pub fn default_for(network: &KanNetwork) -> Self {
-        Self::new(network, AdamConfig::default())
-    }
-
     /// Resets all optimizer state (but preserves version).
     pub fn reset(&mut self) {
         for state in &mut self.layer_states {
@@ -721,97 +716,6 @@ impl Adam {
         }
     }
 
-    /// Performs one optimization step on a single layer.
-    pub fn step_layer(
-        &mut self,
-        layer_idx: usize,
-        layer: &mut KanLayer,
-        weight_grads: &[f32],
-        bias_grads: &[f32],
-        max_grad_norm: Option<f32>,
-    ) {
-        let state = &mut self.layer_states[layer_idx];
-
-        let (wg_scaled, bg_scaled) = if let Some(max_norm) = max_grad_norm {
-            let mut sq: f32 = weight_grads.iter().map(|g| g * g).sum();
-            sq += bias_grads.iter().map(|g| g * g).sum::<f32>();
-            let norm = sq.sqrt();
-            if norm > max_norm && norm > 0.0 {
-                let scale = max_norm / norm;
-                let mut wg = weight_grads.to_vec();
-                let mut bg = bias_grads.to_vec();
-                for g in &mut wg {
-                    *g *= scale;
-                }
-                for g in &mut bg {
-                    *g *= scale;
-                }
-                (wg, bg)
-            } else {
-                (weight_grads.to_vec(), bias_grads.to_vec())
-            }
-        } else {
-            (weight_grads.to_vec(), bias_grads.to_vec())
-        };
-
-        Self::update_params(
-            layer.weights.as_mut_slice(),
-            &wg_scaled,
-            &mut state.weights,
-            &self.config,
-        );
-
-        Self::update_params(
-            layer.bias.as_mut_slice(),
-            &bg_scaled,
-            &mut state.bias,
-            &self.config,
-        );
-    }
-
-    /// Performs one optimization step on the entire network (legacy API).
-    ///
-    /// # Arguments
-    ///
-    /// * `network` - Network to update
-    /// * `all_weight_grads` - Weight gradients per layer
-    /// * `all_bias_grads` - Bias gradients per layer
-    /// * `max_grad_norm` - Optional gradient clipping threshold
-    ///
-    /// # Note
-    ///
-    /// This is the legacy API. Use the `Optimizer` trait method for new code.
-    pub fn step_legacy(
-        &mut self,
-        network: &mut KanNetwork,
-        all_weight_grads: &[Vec<f32>],
-        all_bias_grads: &[Vec<f32>],
-        max_grad_norm: Option<f32>,
-    ) {
-        debug_assert_eq!(all_weight_grads.len(), network.layers.len());
-        debug_assert_eq!(all_bias_grads.len(), network.layers.len());
-
-        for (i, layer) in network.layers.iter_mut().enumerate() {
-            self.step_layer(
-                i,
-                layer,
-                &all_weight_grads[i],
-                &all_bias_grads[i],
-                max_grad_norm,
-            );
-        }
-    }
-
-    /// Backward-compatible step without gradient clipping.
-    #[deprecated(since = "0.2.0", note = "use Optimizer::step() instead")]
-    pub fn step_unclipped(
-        &mut self,
-        network: &mut KanNetwork,
-        all_weight_grads: &[Vec<f32>],
-        all_bias_grads: &[Vec<f32>],
-    ) {
-        self.step_legacy(network, all_weight_grads, all_bias_grads, None);
-    }
 }
 
 impl Clone for Adam {
@@ -1083,17 +987,6 @@ impl SGD {
         }
     }
 
-    /// Creates a new SGD optimizer (legacy API).
-    #[deprecated(since = "0.3.0", note = "use SGD::new() with SGDConfig instead")]
-    pub fn new_legacy(network: &KanNetwork, lr: f32, momentum: f32, weight_decay: f32) -> Self {
-        Self::new(network, SGDConfig::full(lr, momentum, weight_decay))
-    }
-
-    /// Creates SGD without momentum.
-    pub fn vanilla(network: &KanNetwork, lr: f32) -> Self {
-        Self::new(network, SGDConfig::with_lr(lr))
-    }
-
     /// Reinitializes velocities for a new network topology.
     pub fn reinitialize(&mut self, network: &KanNetwork) {
         self.velocities = network
@@ -1119,59 +1012,6 @@ impl SGD {
     #[inline]
     pub fn momentum(&self) -> f32 {
         self.config.momentum
-    }
-
-    /// Legacy weight decay getter.
-    #[inline]
-    pub fn weight_decay(&self) -> f32 {
-        self.config.weight_decay
-    }
-
-    /// Performs one optimization step (legacy API).
-    pub fn step_legacy(
-        &mut self,
-        network: &mut KanNetwork,
-        all_weight_grads: &[Vec<f32>],
-        all_bias_grads: &[Vec<f32>],
-        max_grad_norm: Option<f32>,
-    ) {
-        for (i, layer) in network.layers.iter_mut().enumerate() {
-            let (ref mut vw, ref mut vb) = self.velocities[i];
-
-            let weights = layer.weights.as_mut_slice();
-            let weight_grads = &all_weight_grads[i];
-            let vw_slice = vw.as_mut_slice();
-            let bias_grads = &all_bias_grads[i];
-
-            let (wg_view, bg_view) = clip_gradients(weight_grads, bias_grads, max_grad_norm);
-
-            for j in 0..weights.len() {
-                vw_slice[j] = self.config.momentum * vw_slice[j] + wg_view[j];
-                if self.config.weight_decay > 0.0 {
-                    weights[j] *= 1.0 - self.config.lr * self.config.weight_decay;
-                }
-                weights[j] -= self.config.lr * vw_slice[j];
-            }
-
-            let bias = layer.bias.as_mut_slice();
-            let vb_slice = vb.as_mut_slice();
-
-            for j in 0..bias.len() {
-                vb_slice[j] = self.config.momentum * vb_slice[j] + bg_view[j];
-                bias[j] -= self.config.lr * vb_slice[j];
-            }
-        }
-    }
-
-    /// Backward-compatible step without gradient clipping.
-    #[deprecated(since = "0.2.0", note = "use Optimizer::step() instead")]
-    pub fn step_unclipped(
-        &mut self,
-        network: &mut KanNetwork,
-        all_weight_grads: &[Vec<f32>],
-        all_bias_grads: &[Vec<f32>],
-    ) {
-        self.step_legacy(network, all_weight_grads, all_bias_grads, None);
     }
 
     /// Resets all velocity buffers to zero.

@@ -2031,27 +2031,6 @@ impl GpuNetwork {
         Ok(loss)
     }
 
-    /// Applies gradient clipping to gradients in workspace (public API for testing).
-    ///
-    /// Computes L2 norm of all gradients and scales them down if norm > max_norm.
-    /// This requires downloading gradients to CPU for norm calculation.
-    ///
-    /// # Arguments
-    ///
-    /// * `workspace` - GPU workspace containing gradient buffers
-    /// * `max_norm` - Maximum allowed L2 norm of gradients
-    ///
-    /// # Returns
-    ///
-    /// Ok(()) if clipping was successful.
-    pub fn apply_gradient_clipping_public(
-        &self,
-        workspace: &mut GpuWorkspace,
-        max_norm: f32,
-    ) -> ArkanResult<()> {
-        self.apply_gradient_clipping(workspace, max_norm)
-    }
-
     /// Internal gradient clipping implementation.
     fn apply_gradient_clipping(
         &self,

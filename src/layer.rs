@@ -45,7 +45,7 @@
 //! - 4-wide SSE4 for smaller batches
 //! - Scalar fallback for non-aligned cases
 
-use crate::buffer::Workspace;
+use crate::buffer::{Workspace, MAX_BUFFER_ELEMENTS};
 use crate::config::{KanConfig, EPSILON};
 use crate::spline::{compute_basis, compute_basis_and_deriv, compute_knots, find_span};
 use rand::rngs::SmallRng;
@@ -240,11 +240,10 @@ impl KanLayer {
             })?;
 
         // Check against practical limits (avoid OOM)
-        const MAX_WEIGHTS: usize = 1 << 30; // ~1 billion weights, ~4GB
-        if total_weights > MAX_WEIGHTS {
+        if total_weights > MAX_BUFFER_ELEMENTS {
             return Err(ArkanError::Overflow(format!(
                 "weight count {} exceeds maximum {}",
-                total_weights, MAX_WEIGHTS
+                total_weights, MAX_BUFFER_ELEMENTS
             )));
         }
 
@@ -361,10 +360,8 @@ impl KanLayer {
     pub fn set_normalization(&mut self, mean: &[f32], std: &[f32]) {
         assert_eq!(mean.len(), self.in_dim);
         assert_eq!(std.len(), self.in_dim);
-        self.mean.clear();
-        self.mean.extend_from_slice(mean);
-        self.std.clear();
-        self.std.extend(std.iter().map(|s| s.max(EPSILON)));
+        self.mean = mean.to_vec();
+        self.std = std.iter().map(|s| s.max(EPSILON)).collect();
     }
 
     /// Forward pass for a single input sample.
