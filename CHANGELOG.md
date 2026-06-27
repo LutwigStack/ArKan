@@ -5,6 +5,52 @@ All notable changes to ArKan will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+#### BakedModel — working int8 quantized inference path
+
+- **`BakedModel`** is now a fully functional quantized inference path (was a
+  non-functional stub that panicked on `forward()`).
+- **Per-channel int8 weights** — each output neuron has its own scale
+  `s_w[j] = 127 / max|w[j,*,*]|`, maximizing range utilization per channel.
+- **int16 basis** — B-spline bases stored in Q0.15 (`u16`); accumulator `i64`.
+- **i32 inter-layer activations** — 28-bit target range (`2^28`) reduces
+  inter-layer error amplification vs the old i16 scheme.
+- **Percentile calibration** — `BakedModel::from_network(net, Some(&calib))`
+  uses the 99.9th-percentile of activation magnitudes to set requantization
+  scales; outliers saturate instead of wasting dynamic range.
+- **Magic + versioned serialization** (`serde` feature) — `to_bytes()` prepends
+  `MAGIC_BAKED` (`b"KAN_BAKED_v1"`) and a `u32` format version before the
+  bincode body. `from_bytes()` validates both before deserializing and returns a
+  descriptive `Err` (not a panic) on mismatch or truncation.
+- **`examples/baked_inference.rs`** — runnable end-to-end example: build,
+  train briefly, calibrate, bake, compare outputs, print size ratio.
+
+#### Accuracy (post per-channel quantization)
+
+NRMSE vs f32 on randomly-initialized networks:
+
+| Architecture | NRMSE |
+|---|---|
+| Single-layer (4→2) | ~0.60% |
+| 1-hidden (4→8→2) | ~0.64% |
+| 2-hidden (8→16→8→4) | ~1.29% |
+
+Suitable for ranking / argmax workloads. Deep networks (3+ layers) can show
+higher per-output tail error due to inter-layer requant noise; use int16 weights
+or per-channel activation scales for per-output precision requirements.
+
+### Changed
+
+- `BakedModel` re-export in `lib.rs` is now a clean `pub use` (no longer
+  wrapped in `#[allow(deprecated)]`).
+- `MAGIC_SPLINE` constant removed from `lib.rs` — no spline file format exists
+  in this library; the constant was dead code.
+
+---
+
 ## [0.3.0] - 2025-12-06
 
 ### Added

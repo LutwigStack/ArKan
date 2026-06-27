@@ -105,7 +105,7 @@
 //! - [`spline`] — SIMD-optimized B-spline basis functions
 //! - [`optimizer`] — [`Adam`] and [`SGD`] optimizers
 //! - [`loss`] — Loss functions with masking support
-//! - [`baked`] — Quantized models for deployment (WIP)
+//! - [`baked`] — [`BakedModel`]: int8 quantized inference path (per-channel weights, int16 basis)
 //!
 //! ## Performance Tips
 //!
@@ -143,7 +143,6 @@ pub mod spline;
 pub mod gpu;
 
 // Re-exports for convenience
-#[allow(deprecated)]
 pub use baked::BakedModel;
 pub use buffer::{
     checked_buffer_size, checked_buffer_size3, AlignedBuffer, Tensor, TensorView, Workspace,
@@ -181,14 +180,10 @@ pub use gpu::{
 /// Library version from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Magic bytes for serialized spline models.
-///
-/// Used to identify ArKan model files during deserialization.
-pub const MAGIC_SPLINE: &[u8; 12] = b"KAN_SPLINE_1";
-
 /// Magic bytes for baked/quantized models.
 ///
-/// Used to identify quantized ArKan model files.
+/// Prepended by [`baked::BakedModel::to_bytes`] to identify the file type.
+/// Checked by [`baked::BakedModel::from_bytes`] before any deserialization.
 pub const MAGIC_BAKED: &[u8; 12] = b"KAN_BAKED_v1";
 
 #[cfg(test)]

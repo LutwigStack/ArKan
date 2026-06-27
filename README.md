@@ -47,8 +47,70 @@ x[l+1, j] = Σᵢ φ[l,j,i](x[l, i])      где i = 1..N_in
 * **SIMD-Optimized B-Splines:** Вычисление базисных функций B-сплайнов векторизовано (AVX2/AVX-512 через крейт `wide`).  
 * **Cache-Friendly Layout:** Веса хранятся в формате `[Output][Input][Basis]` для последовательного доступа к памяти и минимизации промахов кэша.  
 * **Standalone:** Минимальные зависимости (`rayon`, `wide`). Не тянет за собой `torch` или `burn`, идеально для встраивания.  
-* **Quantization (запланировано):** `BakedModel` — deprecated заглушка (forward() паникует); полная реализация запланирована на v0.4.0. Используйте `KanNetwork` напрямую.
+* **Baked (int8) Inference:** `BakedModel` — рабочий путь квантизованного инференса (per-channel int8 веса + int16 базис). 2.5–3.2× меньше памяти, NRMSE ~1%, подходит для ранжирования/argmax. Подробности — в разделе ниже.
 * **GPU-ускорение (wgpu):** Опциональный GPU бэкенд с WGSL compute шейдерами для параллельного forward/backward.
+
+## **Baked (int8) Inference**
+
+`BakedModel` is a quantized, fixed-point inference-only representation of a trained
+`KanNetwork`. It uses **per-channel int8 weights**, **int16 B-spline basis** (Q0.15),
+and **i32 inter-layer activations** — no f32 in the hot path.
+
+### Usage
+
+```rust
+use arkan::{BakedModel, KanNetwork, KanConfig};
+
+// 1. Train a KanNetwork as usual.
+let config = KanConfig::preset();
+let network = KanNetwork::new(config.clone());
+// ... train ...
+
+// 2. Collect a calibration set (flat: n_samples * input_dim f32 values).
+//    More samples = better quantization range. 256–1024 samples is typical.
+let calibration: Vec<f32> = vec![/* your representative inputs */];
+
+// 3. Bake.
+let baked = BakedModel::from_network(&network, Some(&calibration));
+
+// 4. Run fixed-point inference.
+let input = vec![0.5f32; config.input_dim];
+let mut output = vec![0.0f32; config.output_dim];
+baked.forward(&input, &mut output);
+
+// 5. Check size.
+println!("Baked model: {} bytes", baked.size_bytes());
+```
+
+### Serialization (requires `serde` feature)
+
+```rust
+// Serialize — prepends 12-byte magic + 4-byte version, then bincode body.
+let bytes: Vec<u8> = baked.to_bytes()?;
+
+// Deserialize — validates magic and version before parsing; returns Err on mismatch.
+let baked2 = BakedModel::from_bytes(&bytes)?;
+```
+
+### Tradeoffs (honest)
+
+| Property | Value |
+|---|---|
+| Weight compression | 2.5–3.2× vs f32 parameters |
+| NRMSE vs f32 (single-layer) | ~0.6% |
+| NRMSE vs f32 (1-hidden layer) | ~0.65% |
+| NRMSE vs f32 (2-hidden layers) | ~1.3% |
+| Suitable for | Ranking, argmax, classification |
+| Not yet suitable for | Per-output absolute precision in deep nets (3+ layers) |
+| Latency vs f32 at batch=1 | Currently **slower** (no SIMD int8 kernels yet) |
+
+The latency disadvantage at batch=1 is a known future-work item (SIMD int8 kernels).
+Calibration is strongly recommended — without it the activation scale falls back to a
+coarse heuristic and accuracy degrades significantly.
+
+See `examples/baked_inference.rs` for a complete runnable demonstration.
+
+---
 
 ## **GPU Backend (Опционально)**
 

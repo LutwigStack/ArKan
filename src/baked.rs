@@ -768,19 +768,78 @@ impl BakedModel {
             .sum()
     }
 
-    /// Serializes baked model to bytes (requires `serde` feature).
+    /// Current binary format version written by [`BakedModel::to_bytes`].
+    ///
+    /// Bump this whenever the bincode layout changes in a breaking way.
+    #[cfg(feature = "serde")]
+    const FORMAT_VERSION: u32 = 1;
+
+    /// Serializes the baked model to a self-describing byte vector.
+    ///
+    /// Layout:
+    /// ```text
+    /// [0..12]  magic   — MAGIC_BAKED (b"KAN_BAKED_v1")
+    /// [12..16] version — u32 little-endian format version (currently 1)
+    /// [16..]   body    — bincode-encoded BakedModel
+    /// ```
+    ///
+    /// Requires the `serde` feature.
     #[cfg(feature = "serde")]
     pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
-        bincode::serialize(self)
+        use crate::MAGIC_BAKED;
+
+        let body = bincode::serialize(self)?;
+        let mut out = Vec::with_capacity(MAGIC_BAKED.len() + 4 + body.len());
+        out.extend_from_slice(MAGIC_BAKED);
+        out.extend_from_slice(&Self::FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&body);
+        Ok(out)
     }
 
-    /// Deserializes baked model from bytes (requires `serde` feature).
+    /// Deserializes a baked model from bytes produced by [`BakedModel::to_bytes`].
     ///
-    /// Note: Format is not yet stabilized. This may fail on models baked
-    /// with a different version of the library.
+    /// Returns a clear `Err` — never panics — for:
+    /// - Input shorter than the 16-byte header.
+    /// - Wrong magic bytes (not an ArKan baked-model file).
+    /// - Wrong format version (produced by a different library version).
+    /// - Corrupt bincode body.
+    ///
+    /// Requires the `serde` feature.
     #[cfg(feature = "serde")]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(bytes)
+        use crate::MAGIC_BAKED;
+
+        let header_len = MAGIC_BAKED.len() + 4; // 12 + 4 = 16
+
+        if bytes.len() < header_len {
+            return Err(Box::new(bincode::ErrorKind::Custom(format!(
+                "BakedModel::from_bytes: input too short ({} bytes, need at least {})",
+                bytes.len(),
+                header_len
+            ))));
+        }
+
+        let (magic_bytes, rest) = bytes.split_at(MAGIC_BAKED.len());
+        if magic_bytes != MAGIC_BAKED.as_ref() {
+            return Err(Box::new(bincode::ErrorKind::Custom(format!(
+                "BakedModel::from_bytes: wrong magic bytes (got {:?}, expected {:?}). \
+                 Is this an ArKan baked-model file?",
+                magic_bytes,
+                MAGIC_BAKED
+            ))));
+        }
+
+        let version = u32::from_le_bytes(rest[..4].try_into().unwrap());
+        if version != Self::FORMAT_VERSION {
+            return Err(Box::new(bincode::ErrorKind::Custom(format!(
+                "BakedModel::from_bytes: format version mismatch (got {}, expected {}). \
+                 Re-bake the model with the current library version.",
+                version,
+                Self::FORMAT_VERSION
+            ))));
+        }
+
+        bincode::deserialize(&rest[4..])
     }
 }
 
@@ -1024,9 +1083,15 @@ mod tests {
         let baked = BakedModel::from_network(&network, Some(&cal));
 
         let bytes = baked.to_bytes().expect("serialization failed");
+
+        // Verify header is present: magic (12) + version (4)
+        assert!(bytes.len() >= 16, "serialized output too short");
+        assert_eq!(&bytes[..12], b"KAN_BAKED_v1", "magic bytes wrong");
+        assert_eq!(&bytes[12..16], &1u32.to_le_bytes(), "version bytes wrong");
+
         let baked2 = BakedModel::from_bytes(&bytes).expect("deserialization failed");
 
-        // Both should produce same output
+        // Round-trip must produce byte-identical inference results.
         let inp = random_inputs(1, 4, 999);
         let mut out1 = vec![0.0f32; 2];
         let mut out2 = vec![0.0f32; 2];
@@ -1034,14 +1099,83 @@ mod tests {
         baked2.forward(&inp, &mut out2);
 
         for j in 0..2 {
-            assert!(
-                (out1[j] - out2[j]).abs() < 1e-6,
-                "Round-trip mismatch at j={}: {} vs {}",
+            assert_eq!(
+                out1[j].to_bits(),
+                out2[j].to_bits(),
+                "Round-trip produced non-identical inference at j={}: {} vs {}",
                 j,
                 out1[j],
                 out2[j]
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn test_baked_from_bytes_rejects_wrong_magic() {
+        let network = make_network(3, vec![], 1, 4, 3, 1);
+        let baked = BakedModel::from_network(&network, None);
+        let mut bytes = baked.to_bytes().expect("serialization failed");
+
+        // Corrupt magic bytes
+        bytes[0] = b'X';
+        bytes[1] = b'X';
+        bytes[2] = b'X';
+
+        let result = BakedModel::from_bytes(&bytes);
+        assert!(result.is_err(), "should reject wrong magic");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("magic") || err_msg.contains("ArKan"),
+            "error message should mention magic/ArKan: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn test_baked_from_bytes_rejects_wrong_version() {
+        let network = make_network(3, vec![], 1, 4, 3, 2);
+        let baked = BakedModel::from_network(&network, None);
+        let mut bytes = baked.to_bytes().expect("serialization failed");
+
+        // Overwrite the version field (bytes 12..16) with an unknown version
+        let bad_version: u32 = 999;
+        bytes[12..16].copy_from_slice(&bad_version.to_le_bytes());
+
+        let result = BakedModel::from_bytes(&bytes);
+        assert!(result.is_err(), "should reject wrong version");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("version") || err_msg.contains("999"),
+            "error message should mention version: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn test_baked_from_bytes_rejects_truncated_input() {
+        // Too short to even contain a header
+        let short = b"KAN_BA";
+        let result = BakedModel::from_bytes(short);
+        assert!(result.is_err(), "should reject truncated input");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("short") || err_msg.contains("bytes"),
+            "error message should mention shortness: {err_msg}"
+        );
+
+        // Empty input
+        let result2 = BakedModel::from_bytes(&[]);
+        assert!(result2.is_err(), "should reject empty input");
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn test_baked_from_bytes_rejects_foreign_bytes() {
+        // Completely foreign data (e.g. JSON)
+        let foreign = b"{\"model\": \"not a baked model\"}";
+        let result = BakedModel::from_bytes(foreign);
+        assert!(result.is_err(), "should reject foreign bytes");
     }
 
     #[test]
