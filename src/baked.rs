@@ -74,9 +74,9 @@ impl BakedModel {
             };
             scales.push(scale);
 
-            // Quantize weights to i8
+            // Quantize weights to i8, clamped to avoid silent overflow on cast.
             for &w in &layer.weights {
-                let q = (w * scale).round() as i8;
+                let q = (w * scale).round().clamp(-127.0, 127.0) as i8;
                 weights_data.push(q as u8);
             }
 
@@ -122,9 +122,23 @@ impl BakedModel {
     }
 
     /// Loads baked model from bytes.
+    ///
+    /// # Errors
+    ///
+    /// Always returns an error because `BakedModel` deserialization is not
+    /// implemented in this stub version (planned for v0.4.0). Deserializing
+    /// arbitrary bytes without a magic/version guard could produce an
+    /// internally inconsistent model, so this is explicitly unsupported until
+    /// the format is stabilized.
+    ///
+    /// Use [`KanNetwork`](crate::KanNetwork) for inference instead.
     #[cfg(feature = "serde")]
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(bytes)
+    pub fn from_bytes(_bytes: &[u8]) -> Result<Self, bincode::Error> {
+        Err(Box::new(bincode::ErrorKind::Custom(
+            "BakedModel deserialization is not implemented (stub, planned for v0.4.0). \
+             Use KanNetwork for inference."
+                .to_string(),
+        )))
     }
 }
 

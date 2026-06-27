@@ -9,7 +9,7 @@
 #![allow(unused_imports)]
 
 use arkan::gpu::{GpuNetwork, WgpuBackend, WgpuOptions};
-use arkan::optimizer::{Adam, AdamConfig, SGD};
+use arkan::optimizer::{Adam, AdamConfig, SGDConfig, SGD};
 use arkan::{KanConfig, KanNetwork, TrainOptions};
 
 /// Tolerance for floating-point comparison.
@@ -789,7 +789,15 @@ fn test_train_step_sgd() {
     let mut gpu_workspace = gpu_network
         .create_workspace(4)
         .expect("Failed to create workspace");
-    let mut optimizer = SGD::new(&cpu_network, 0.01, 0.9, 0.0);
+    let mut optimizer = SGD::new(
+        &cpu_network,
+        SGDConfig {
+            lr: 0.01,
+            momentum: 0.9,
+            weight_decay: 0.0,
+            ..Default::default()
+        },
+    );
 
     let batch_size = 4;
     let input: Vec<f32> = (0..batch_size * config.input_dim)
@@ -1599,8 +1607,12 @@ fn test_multiple_spline_orders() {
         let tolerance = match order {
             2 => 1e-4,
             3 => 1e-4,
-            4 => 0.2, // Quartic has more precision differences due to basis function complexity
-            5 => 0.3, // Quintic even more
+            // After fixing the WGSL coefficients (partition-of-unity restored),
+            // orders 4 and 5 match CPU at 1e-4. Measured max_err < 1e-4 on the
+            // two-hidden-layer [4->8->2] network with batch=4. Previously these
+            // required 0.2 / 0.3 due to the wrong constant terms in the basis.
+            4 => 1e-4,
+            5 => 1e-4,
             _ => 0.5,
         };
 

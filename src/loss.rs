@@ -174,9 +174,8 @@ pub fn masked_cross_entropy(
             // Binary cross-entropy: -t*log(p) - (1-t)*log(1-p)
             loss += m * (-t * p.ln() - (1.0 - t) * (1.0 - p).ln());
 
-            // Gradient: (p - t) / (p * (1 - p))
-            // Simplified for stability: just (p - t) works with softmax
-            grad[i] = m * (p - t);
+            // Gradient of BCE w.r.t. (already-sigmoided, clamped) probability p
+            grad[i] = m * (p - t) / (p * (1.0 - p));
             count += m;
         }
     }
@@ -238,8 +237,8 @@ pub fn poker_combined_loss(
                 let p = predictions[base + action].clamp(EPSILON, 1.0 - EPSILON);
                 let t = targets[base + action];
 
-                // KL-divergence style: t * log(t/p), but simplified to cross-entropy
-                prob_loss += m * (-t * p.ln() - (1.0 - t) * (1.0 - p).ln()).max(0.0);
+                // BCE: inputs must be probabilities in (EPSILON, 1-EPSILON)
+                prob_loss += m * (-t * p.ln() - (1.0 - t) * (1.0 - p).ln());
                 grad[base + action] = m * (p - t);
                 prob_count += m;
 
@@ -378,9 +377,9 @@ pub fn softmax(x: &mut [f32], dim_size: usize) {
             sum += *v;
         }
 
-        // Normalize
+        // Normalize — sum >= 1.0 (max-subtraction guarantees exp(0)=1), so division is safe
         for v in slice.iter_mut() {
-            *v /= sum + EPSILON;
+            *v /= sum;
         }
     }
 }
@@ -424,9 +423,9 @@ pub fn masked_softmax(x: &mut [f32], mask: &[f32], dim_size: usize) {
                 }
             }
 
-            // Normalize
+            // Normalize — sum >= 1.0 (max-subtraction guarantees exp(0)=1), so division is safe
             for v in x_slice.iter_mut() {
-                *v /= sum + EPSILON;
+                *v /= sum;
             }
         } else {
             // All masked: set to zero
@@ -1759,8 +1758,8 @@ mod tests {
         
         let (_, grad) = masked_cross_entropy(&predictions, &targets, None);
         
-        // grad = (p - t) / (p * (1-p)) but we use simplified (p - t)
-        // For p=0.3, t=0.6: gradient should be negative (0.3 - 0.6 = -0.3)
+        // grad = (p - t) / (p * (1-p))
+        // For p=0.3, t=0.6: gradient should be negative
         assert!(grad[0] < 0.0, "Gradient should be negative when pred < target");
         // For p=0.7, t=0.4: gradient should be positive (0.7 - 0.4 = 0.3)
         assert!(grad[1] > 0.0, "Gradient should be positive when pred > target");
@@ -1794,14 +1793,59 @@ mod tests {
         // Test edge cases near 0 and 1 (should not produce NaN/Inf)
         let predictions = vec![0.0001f32, 0.9999, 0.5]; // Very close to boundaries
         let targets = vec![0.0f32, 1.0, 0.5];
-        
+
         let (loss, grad) = masked_cross_entropy(&predictions, &targets, None);
-        
+
         assert!(loss.is_finite(), "Loss should be finite, got {}", loss);
         assert!(grad.iter().all(|g| g.is_finite()), "All gradients should be finite");
-        
+
         // Loss should be reasonable (not exploding)
         // Note: p=0.5, t=0.5 gives -0.5*ln(0.5) - 0.5*ln(0.5) = ln(2) ≈ 0.693
         assert!(loss < 1.0, "Loss should not explode, got {}", loss);
+    }
+
+    // =========================================================================
+    // Finite-Difference Gradient Check for masked_cross_entropy
+    // =========================================================================
+
+    /// Verifies that the analytic BCE gradient (p-t)/(p*(1-p)) agrees with a
+    /// numerical central-difference estimate at several (p, t) test points.
+    #[test]
+    fn test_cross_entropy_finite_difference_gradient() {
+        // Points chosen to be safely away from 0 and 1
+        let test_points: &[(f32, f32)] = &[
+            (0.3, 0.0),
+            (0.3, 1.0),
+            (0.7, 0.0),
+            (0.7, 1.0),
+            (0.5, 0.5),
+            (0.2, 0.8),
+            (0.8, 0.2),
+        ];
+
+        let fd_eps = 1e-4f32; // central-difference step
+        let tolerance = 1e-3f32;
+
+        for &(p, t) in test_points {
+            // Analytic gradient from masked_cross_entropy
+            let (_, grad) = masked_cross_entropy(&[p], &[t], None);
+            // grad is already divided by count (=1), so it equals the per-element gradient
+            let analytic = grad[0];
+
+            // Numerical estimate via central differences on the per-element BCE loss
+            // L(p) = -t*ln(p) - (1-t)*ln(1-p)  (no averaging since n=1)
+            let bce = |prob: f32| -> f32 {
+                let pc = prob.clamp(EPSILON, 1.0 - EPSILON);
+                -t * pc.ln() - (1.0 - t) * (1.0 - pc).ln()
+            };
+            let numerical = (bce(p + fd_eps) - bce(p - fd_eps)) / (2.0 * fd_eps);
+
+            let abs_err = (analytic - numerical).abs();
+            assert!(
+                abs_err < tolerance,
+                "Finite-diff gradient check failed at (p={}, t={}): analytic={:.6}, numerical={:.6}, err={:.6}",
+                p, t, analytic, numerical, abs_err
+            );
+        }
     }
 }

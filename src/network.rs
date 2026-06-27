@@ -54,6 +54,7 @@ use crate::buffer::{checked_buffer_size, Workspace};
 use crate::config::KanConfig;
 use crate::error::{ArkanError, ArkanResult};
 use crate::layer::KanLayer;
+use crate::optimizer::Optimizer;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -963,6 +964,128 @@ impl KanNetwork {
         workspace: &mut Workspace,
         opts: &TrainOptions,
     ) -> ArkanResult<f32> {
+        let loss = self.try_forward_backward_mse(input, target, mask, workspace, opts)?;
+
+        // =====================================================================
+        // Parameter update: decoupled weight decay + SGD
+        //
+        // Order:
+        // 1. Weight decay: w *= (1 - lr * decay)  [applied first, only to weights]
+        // 2. Gradient step: w -= lr * grad
+        //
+        // This is "decoupled" weight decay (like AdamW), not L2 regularization.
+        // Biases are NOT decayed, following standard practice.
+        // =====================================================================
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if opts.weight_decay > 0.0 {
+                let decay = opts.weight_decay;
+                for w in layer.weights.iter_mut() {
+                    *w *= 1.0 - learning_rate * decay;
+                }
+            }
+
+            for (w, g) in layer
+                .weights
+                .iter_mut()
+                .zip(workspace.weight_grads[i].iter())
+            {
+                *w -= learning_rate * g;
+            }
+            for (b, g) in layer.bias.iter_mut().zip(workspace.bias_grads[i].iter()) {
+                *b -= learning_rate * g;
+            }
+        }
+
+        Ok(loss)
+    }
+
+    /// One-call training step with a standalone [`Optimizer`] (e.g. Adam, SGD).
+    ///
+    /// Runs forward(training) → MSE backward → optional gradient clipping → `optimizer.step`.
+    /// This lets you use any optimizer that implements the [`Optimizer`] trait without
+    /// manually writing the forward/backward loop.
+    ///
+    /// # Loss
+    ///
+    /// MSE loss only. For binary-cross-entropy loss use the manual path
+    /// (forward + backward + `optimizer.step`) or the GPU
+    /// [`GpuNetwork::train_step_cross_entropy`].
+    ///
+    /// # Weight decay
+    ///
+    /// `opts.weight_decay` is NOT applied here; pass it to your optimizer's own
+    /// config (e.g. `AdamConfig::weight_decay`) to avoid double-counting.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data `[batch_size * input_dim]`
+    /// * `target` - Target values `[batch_size * output_dim]`
+    /// * `mask` - Optional mask `[batch_size * output_dim]` (1.0 = active, 0.0 = ignore)
+    /// * `workspace` - Pre-allocated workspace (must cover the batch size)
+    /// * `optimizer` - Any mutable optimizer implementing [`Optimizer`]
+    /// * `opts` - Training options; only `max_grad_norm` is used (see weight_decay note above)
+    ///
+    /// # Returns
+    ///
+    /// MSE loss for this batch, or an error if shapes are mismatched.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ArkanError::ShapeMismatch` if input/target/mask lengths don't match.
+    /// Returns `ArkanError::Overflow` if buffer size calculations overflow.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork, TrainOptions, Adam, AdamConfig};
+    ///
+    /// let config = KanConfig::preset();
+    /// let mut network = KanNetwork::new(config.clone());
+    /// let mut workspace = network.create_workspace(64);
+    /// let mut adam = Adam::new(&network, AdamConfig::default());
+    ///
+    /// let inputs = vec![0.5f32; 64 * config.input_dim];
+    /// let targets = vec![0.1f32; 64 * config.output_dim];
+    ///
+    /// let loss = network.train_step_with_optimizer(
+    ///     &inputs, &targets, None, &mut workspace, &mut adam, &TrainOptions::default(),
+    /// )?;
+    /// # Ok::<(), arkan::ArkanError>(())
+    /// ```
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn train_step_with_optimizer(
+        &mut self,
+        input: &[f32],
+        target: &[f32],
+        mask: Option<&[f32]>,
+        workspace: &mut Workspace,
+        optimizer: &mut impl Optimizer,
+        opts: &TrainOptions,
+    ) -> ArkanResult<f32> {
+        let loss = self.try_forward_backward_mse(input, target, mask, workspace, opts)?;
+        // Clipping was already applied in-place by the helper; pass None to avoid double-clip.
+        optimizer.step(
+            self,
+            &workspace.weight_grads,
+            &workspace.bias_grads,
+            None,
+        )?;
+        Ok(loss)
+    }
+
+    /// Private helper: forward pass + MSE backward pass + optional gradient clipping.
+    ///
+    /// Fills `workspace.weight_grads` and `workspace.bias_grads` with per-layer gradients,
+    /// applies global gradient clipping if `opts.max_grad_norm` is `Some`, and returns
+    /// the MSE loss. Does NOT apply weight decay or update network parameters.
+    fn try_forward_backward_mse(
+        &mut self,
+        input: &[f32],
+        target: &[f32],
+        mask: Option<&[f32]>,
+        workspace: &mut Workspace,
+        opts: &TrainOptions,
+    ) -> ArkanResult<f32> {
         let batch_size = input.len() / self.config.input_dim;
         let output_dim = self.config.output_dim;
 
@@ -1172,36 +1295,6 @@ impl KanNetwork {
             }
         }
 
-        // =====================================================================
-        // Parameter update: decoupled weight decay + SGD
-        //
-        // Order:
-        // 1. Weight decay: w *= (1 - lr * decay)  [applied first, only to weights]
-        // 2. Gradient step: w -= lr * grad
-        //
-        // This is "decoupled" weight decay (like AdamW), not L2 regularization.
-        // Biases are NOT decayed, following standard practice.
-        // =====================================================================
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            if opts.weight_decay > 0.0 {
-                let decay = opts.weight_decay;
-                for w in layer.weights.iter_mut() {
-                    *w *= 1.0 - learning_rate * decay;
-                }
-            }
-
-            for (w, g) in layer
-                .weights
-                .iter_mut()
-                .zip(workspace.weight_grads[i].iter())
-            {
-                *w -= learning_rate * g;
-            }
-            for (b, g) in layer.bias.iter_mut().zip(workspace.bias_grads[i].iter()) {
-                *b -= learning_rate * g;
-            }
-        }
-
         Ok(loss)
     }
 
@@ -1392,44 +1485,6 @@ impl Clone for KanNetwork {
     }
 }
 
-/// Computes masked MSE loss and gradient.
-#[allow(dead_code)]
-fn compute_masked_mse_loss(
-    predictions: &[f32],
-    targets: &[f32],
-    mask: Option<&[f32]>,
-    batch_size: usize,
-    output_dim: usize,
-) -> (f32, Vec<f32>) {
-    let mut loss = 0.0f32;
-    let mut grad = vec![0.0f32; batch_size * output_dim];
-    let mut count = 0.0f32;
-
-    for b in 0..batch_size {
-        for o in 0..output_dim {
-            let idx = b * output_dim + o;
-            let m = mask.map(|m| m[idx]).unwrap_or(1.0);
-
-            if m > 0.0 {
-                let diff = predictions[idx] - targets[idx];
-                loss += m * diff * diff;
-                grad[idx] = 2.0 * m * diff;
-                count += m;
-            }
-        }
-    }
-
-    if count > 0.0 {
-        let inv = 1.0 / count;
-        loss *= inv;
-        for g in grad.iter_mut() {
-            *g *= inv;
-        }
-    }
-
-    (loss, grad)
-}
-
 /// Computes masked MSE loss and writes gradient into provided buffer (zero-allocation).
 fn compute_masked_mse_loss_into(
     predictions: &[f32],
@@ -1534,6 +1589,36 @@ mod tests {
         assert!(
             loss2 < loss1,
             "Loss should decrease: {} -> {}",
+            loss1,
+            loss2
+        );
+    }
+
+    #[test]
+    fn test_train_step_with_optimizer_adam() {
+        use crate::optimizer::{Adam, AdamConfig};
+
+        let config = KanConfig::preset();
+        let mut network = KanNetwork::new(config.clone());
+        let mut workspace = network.create_workspace(16);
+        let mut adam = Adam::new(&network, AdamConfig::default());
+
+        let batch_size = 8;
+        let input: Vec<f32> = vec![0.5; batch_size * 21];
+        let target: Vec<f32> = vec![0.1; batch_size * 24];
+        let opts = TrainOptions::default();
+
+        let loss1 = network
+            .train_step_with_optimizer(&input, &target, None, &mut workspace, &mut adam, &opts)
+            .expect("train_step_with_optimizer failed");
+        let loss2 = network
+            .train_step_with_optimizer(&input, &target, None, &mut workspace, &mut adam, &opts)
+            .expect("train_step_with_optimizer failed");
+
+        // Loss should decrease with Adam
+        assert!(
+            loss2 < loss1,
+            "Loss should decrease with Adam: {} -> {}",
             loss1,
             loss2
         );

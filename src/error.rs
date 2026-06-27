@@ -24,9 +24,6 @@ use std::borrow::Cow;
 
 use thiserror::Error;
 
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
 use crate::config::ConfigError;
 
 /// Unified error type for ArKan operations.

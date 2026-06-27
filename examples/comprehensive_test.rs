@@ -191,7 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut network = KanNetwork::new(cfg.clone());
     let mut workspace = network.create_workspace(10);
 
-    let test_inputs: Vec<f32> = (0..20).map(|i| (i as f32 * 0.1 - 1.0)).collect();
+    let test_inputs: Vec<f32> = (0..20).map(|i| i as f32 * 0.1 - 1.0).collect();
     let test_targets: Vec<f32> = (0..10).map(|i| (i as f32 * 0.1).sin()).collect();
 
     // Get initial loss

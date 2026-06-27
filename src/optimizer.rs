@@ -11,7 +11,7 @@
 //!
 //! - **Thread Safety**: All optimizers implement `Send + Sync`
 //! - **Versioning**: Support for dynamic topology (Grid Extension) via `bump_version()`
-//! - **NaN Handling**: Configurable behavior for numerical instability
+//! - **NaN/Inf Handling**: Configurable behavior for numerical instability (NaN and ±inf)
 //! - **AMP Support**: Gradient scaling placeholders for mixed precision training
 //!
 //! # Example
@@ -309,11 +309,11 @@ impl SafetyConfig {
 // HELPER FUNCTIONS
 // =============================================================================
 
-/// Checks for NaN values in gradients.
+/// Checks for non-finite values in gradients (NaN or ±inf).
 ///
-/// Returns the index of the first NaN found, or None if all values are finite.
+/// Returns the index of the first non-finite value found, or None if all values are finite.
 fn find_nan_in_grads(grads: &[f32]) -> Option<usize> {
-    grads.iter().position(|&g| g.is_nan())
+    grads.iter().position(|&g| !g.is_finite())
 }
 
 /// Applies gradient scaling for AMP.
@@ -618,10 +618,10 @@ impl Adam {
         self.config.lr = lr;
     }
 
-    /// Checks gradients for NaN values.
+    /// Checks gradients for non-finite values (NaN or ±inf).
     ///
-    /// Returns Ok(()) if all gradients are finite, or an error describing
-    /// where NaN was found.
+    /// Returns Ok(false) if all gradients are finite, Ok(true) to signal
+    /// the step should be skipped, or Err if fail_on_nan is set.
     fn check_nan_in_layer(
         weight_grads: &[f32],
         bias_grads: &[f32],
@@ -661,7 +661,13 @@ impl Adam {
     ///
     /// 1. **Moment update**: $m_t$, $v_t$ computed from gradients
     /// 2. **Weight decay**: `param *= 1 - lr * decay` (applied BEFORE gradient step)
-    /// 3. **Gradient step**: `param -= alpha * m / (sqrt(v) + eps)`
+    /// 3. **Gradient step**: `param -= lr * m_hat / (sqrt(v_hat) + eps)`
+    ///
+    /// where `m_hat = m / (1 - beta1^t)` and `v_hat = v / (1 - beta2^t)`.
+    ///
+    /// Epsilon is added to `sqrt(v_hat)` (the bias-corrected second moment),
+    /// matching the PyTorch / original Adam paper convention:
+    ///   `theta -= lr * m_hat / (sqrt(v_hat) + eps)`
     ///
     /// This is "decoupled" weight decay (AdamW), not L2 regularization.
     /// The decay is proportional to `lr`, so it scales with learning rate.
@@ -675,7 +681,6 @@ impl Adam {
         debug_assert_eq!(params.len(), state.m.len());
 
         state.t += 1;
-        let _t = state.t as f32;
 
         let beta1 = config.beta1;
         let beta2 = config.beta2;
@@ -686,7 +691,6 @@ impl Adam {
         // Bias correction factors
         let bc1 = 1.0 - beta1.powi(state.t as i32);
         let bc2 = 1.0 - beta2.powi(state.t as i32);
-        let alpha = lr * (bc2.sqrt()) / bc1;
 
         let m = state.m.as_mut_slice();
         let v = state.v.as_mut_slice();
@@ -698,8 +702,13 @@ impl Adam {
             m[i] = beta1 * m[i] + (1.0 - beta1) * g;
             v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
 
-            // Compute update
-            let update = alpha * m[i] / (v[i].sqrt() + eps);
+            // Bias-corrected estimates (PyTorch / paper convention)
+            let m_hat = m[i] / bc1;
+            let v_hat = v[i] / bc2;
+
+            // Compute update: lr * m_hat / (sqrt(v_hat) + eps)
+            // Epsilon is applied to bias-corrected sqrt(v_hat), matching PyTorch.
+            let update = lr * m_hat / (v_hat.sqrt() + eps);
 
             // Apply weight decay (decoupled, AdamW-style)
             // Applied BEFORE gradient update for proper decoupling
@@ -2327,6 +2336,122 @@ mod tests {
         // Step should fail
         let result = optimizer.step(&mut network, &weight_grads, &bias_grads, None);
         assert!(result.is_err());
+    }
+
+    /// Regression test: inf gradients must be caught by SafetyConfig just like NaN.
+    ///
+    /// Before the fix, `find_nan_in_grads` used `g.is_nan()` which let ±inf through,
+    /// causing Adam to silently corrupt parameters to ±inf even under strict().
+    #[test]
+    fn test_inf_gradient_strict_fails() {
+        let config = KanConfig {
+            input_dim: 2,
+            output_dim: 1,
+            hidden_dims: vec![],
+            grid_size: 3,
+            spline_order: 3,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 2],
+            input_std: vec![1.0; 2],
+            init_seed: Some(42),
+            ..Default::default()
+        };
+
+        let mut network = KanNetwork::new(config.clone());
+
+        // SafetyConfig::strict() sets fail_on_nan=true, skip_step_on_nan=false.
+        // It must also reject inf gradients.
+        let mut optimizer_strict = Adam::new(
+            &network,
+            AdamConfig::with_lr(0.1).with_safety(SafetyConfig::strict()),
+        );
+
+        let inf_weight_grads = vec![vec![f32::INFINITY; network.layers[0].weights.len()]];
+        let normal_bias_grads = vec![vec![0.5f32; network.layers[0].bias.len()]];
+
+        let result = optimizer_strict.step(
+            &mut network,
+            &inf_weight_grads,
+            &normal_bias_grads,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "SafetyConfig::strict() must return Err for inf gradient"
+        );
+
+        // Also test negative infinity
+        let neg_inf_grads = vec![vec![f32::NEG_INFINITY; network.layers[0].weights.len()]];
+        let mut network2 = KanNetwork::new(config.clone());
+        let mut optimizer_strict2 = Adam::new(
+            &network2,
+            AdamConfig::with_lr(0.1).with_safety(SafetyConfig::strict()),
+        );
+        let result2 = optimizer_strict2.step(
+            &mut network2,
+            &neg_inf_grads,
+            &normal_bias_grads,
+            None,
+        );
+        assert!(
+            result2.is_err(),
+            "SafetyConfig::strict() must return Err for -inf gradient"
+        );
+    }
+
+    /// Regression test: skip_step_on_nan must skip the step for inf gradients,
+    /// leaving parameters unchanged.
+    #[test]
+    fn test_inf_gradient_skip_leaves_params_unchanged() {
+        let config = KanConfig {
+            input_dim: 2,
+            output_dim: 1,
+            hidden_dims: vec![],
+            grid_size: 3,
+            spline_order: 3,
+            grid_range: (-1.0, 1.0),
+            input_mean: vec![0.0; 2],
+            input_std: vec![1.0; 2],
+            init_seed: Some(42),
+            ..Default::default()
+        };
+
+        let mut network = KanNetwork::new(config);
+        let initial_weights = network.layers[0].weights.clone();
+        let initial_bias = network.layers[0].bias.clone();
+
+        // Default config has skip_step_on_nan=true, fail_on_nan=false
+        let mut optimizer = Adam::new(
+            &network,
+            AdamConfig::with_lr(0.1).with_safety(SafetyConfig::default()),
+        );
+
+        let inf_weight_grads = vec![vec![f32::INFINITY; network.layers[0].weights.len()]];
+        let normal_bias_grads = vec![vec![0.5f32; network.layers[0].bias.len()]];
+
+        // Step should succeed (Ok) but skip the update
+        let result = optimizer.step(
+            &mut network,
+            &inf_weight_grads,
+            &normal_bias_grads,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "skip_step_on_nan should return Ok, not Err"
+        );
+
+        // Parameters must be completely unchanged
+        assert_eq!(
+            network.layers[0].weights.as_slice(),
+            initial_weights.as_slice(),
+            "Weights must be unchanged when step is skipped due to inf gradient"
+        );
+        assert_eq!(
+            network.layers[0].bias.as_slice(),
+            initial_bias.as_slice(),
+            "Bias must be unchanged when step is skipped due to inf gradient"
+        );
     }
 
     #[test]

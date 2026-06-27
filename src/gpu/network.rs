@@ -10,7 +10,7 @@ use crate::gpu::layer::GpuLayer;
 use crate::gpu::optimizer::{GpuAdam, GpuSgd};
 use crate::gpu::pipeline::{workgroup_count, PipelineCache, WORKGROUP_SIZE};
 use crate::gpu::workspace::GpuWorkspace;
-use crate::loss::{masked_cross_entropy, masked_mse};
+use crate::loss::{masked_bce_with_logits, masked_mse};
 use crate::network::{KanNetwork, TrainOptions};
 use crate::optimizer::{Adam, Optimizer, SGD};
 use std::sync::mpsc::{self, Receiver};
@@ -1006,14 +1006,11 @@ impl GpuNetwork {
             return Ok(());
         }
 
-        // Get training workspace layout
-        let training_layout = self.pipeline_cache.get_training_workspace_layout();
-        // SAFETY: We need to extend the lifetime of training_layout to use it after
-        // mutable borrows of self. This is safe because:
-        // 1. training_layout is stored in pipeline_cache and never deallocated
-        // 2. The underlying wgpu::BindGroupLayout is immutable once created
-        // 3. We only use training_layout_ref for creating bind groups, not modifying pipeline_cache
-        let training_layout_ref = unsafe { &*(training_layout as *const _) };
+        // Ensure training workspace layout is populated (takes &mut self).
+        self.pipeline_cache.get_training_workspace_layout();
+        // Clone the Arc handle (O(1) refcount bump). The owned Arc releases the immutable
+        // borrow on self.pipeline_cache so subsequent &mut self calls are borrow-checker clean.
+        let training_layout = self.pipeline_cache.clone_training_workspace_layout();
 
         // For single layer network
         if self.layers.len() == 1 {
@@ -1021,7 +1018,7 @@ impl GpuNetwork {
                 0,
                 batch_size,
                 workspace,
-                training_layout_ref,
+                &training_layout,
             );
         }
 
@@ -1036,7 +1033,7 @@ impl GpuNetwork {
                 num_layers,
                 batch_size,
                 workspace,
-                training_layout_ref,
+                &training_layout,
             )?;
         }
 
@@ -1330,17 +1327,14 @@ impl GpuNetwork {
         );
 
         // Create backward workspace bind group (Group 1)
-        // SAFETY: We need to extend the lifetime of backward_workspace_layout to use it
-        // after mutable borrows of self. This is safe because:
-        // 1. backward_workspace_layout is stored in pipeline_cache and never deallocated
-        // 2. The underlying wgpu::BindGroupLayout is immutable once created
-        // 3. We only use it for creating bind groups, not modifying pipeline_cache
-        let backward_workspace_layout = self.pipeline_cache.get_backward_workspace_layout();
-        let backward_workspace_layout_ptr = backward_workspace_layout as *const _;
-        let backward_workspace_bind_group =
-            self.create_backward_workspace_bind_group(workspace, layer_idx, unsafe {
-                &*backward_workspace_layout_ptr
-            })?;
+        // Ensure the backward workspace layout is populated (takes &mut self).
+        self.pipeline_cache.get_backward_workspace_layout();
+        // The mutable borrow ends here. Take a plain immutable borrow via the &self accessor.
+        let backward_workspace_bind_group = self.create_backward_workspace_bind_group(
+            workspace,
+            layer_idx,
+            self.pipeline_cache.backward_workspace_layout_ref(),
+        )?;
 
         // Get pipelines
         let weights_pipeline = self
@@ -1527,7 +1521,10 @@ impl GpuNetwork {
     /// Performs a complete training step on GPU with MSE loss.
     ///
     /// This method combines forward pass, loss computation, backward pass,
-    /// and optimizer step into a single call.
+    /// and optimizer step into a single call. It delegates to
+    /// [`train_step_with_options`](Self::train_step_with_options) with
+    /// [`TrainOptions::default()`] (no gradient clipping, no weight decay),
+    /// matching the CPU default.
     ///
     /// # Arguments
     ///
@@ -1550,39 +1547,16 @@ impl GpuNetwork {
         optimizer: &mut Adam,
         cpu_network: &mut KanNetwork,
     ) -> ArkanResult<f32> {
-        // Validate target shape
-        let expected_target_len = batch_size * self.output_dim;
-        if target.len() != expected_target_len {
-            return Err(ArkanError::shape_mismatch(
-                &[batch_size, self.output_dim],
-                &[target.len() / self.output_dim, self.output_dim],
-            ));
-        }
-
-        // 1. Forward pass with training data
-        let output = self.forward_batch_training(input, batch_size, workspace)?;
-
-        // 2. Compute loss and gradient
-        let (loss, grad_output) = masked_mse(&output, target, None);
-
-        // 3. Backward pass
-        let mut grad_weights = Vec::new();
-        let mut grad_biases = Vec::new();
-        let _grad_input = self.backward_batch(
-            &grad_output,
+        self.train_step_with_options(
+            input,
+            target,
+            None,
             batch_size,
             workspace,
-            &mut grad_weights,
-            &mut grad_biases,
-        )?;
-
-        // 4. Optimizer step on CPU network
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, Some(1.0))?;
-
-        // 5. Sync weights from CPU to GPU
-        self.sync_weights(cpu_network)?;
-
-        Ok(loss)
+            optimizer,
+            cpu_network,
+            &TrainOptions::default(),
+        )
     }
 
     /// Performs a training step with cross-entropy loss.
@@ -1607,8 +1581,8 @@ impl GpuNetwork {
         // 1. Forward pass with training data
         let output = self.forward_batch_training(input, batch_size, workspace)?;
 
-        // 2. Compute loss and gradient
-        let (loss, grad_output) = masked_cross_entropy(&output, target, None);
+        // 2. Compute loss and gradient — output is raw KAN logits, use logit-aware BCE
+        let (loss, grad_output) = masked_bce_with_logits(&output, target, None);
 
         // 3. Backward pass
         let mut grad_weights = Vec::new();
@@ -1621,8 +1595,10 @@ impl GpuNetwork {
             &mut grad_biases,
         )?;
 
-        // 4. Optimizer step on CPU network
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, Some(1.0))?;
+        // 4. Optimizer step on CPU network. No gradient clipping by default; for
+        //    configurable clipping pass max_grad_norm to optimizer.step in your own
+        //    BCE training loop (there is no _with_options variant for the BCE path).
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, None)?;
 
         // 5. Sync weights from CPU to GPU
         self.sync_weights(cpu_network)?;

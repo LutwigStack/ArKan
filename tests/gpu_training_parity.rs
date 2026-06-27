@@ -15,7 +15,7 @@
 use arkan::gpu::{
     GpuAdam, GpuAdamConfig, GpuNetwork, GpuSgd, GpuSgdConfig, WgpuBackend, WgpuOptions,
 };
-use arkan::optimizer::{Adam, AdamConfig, SGD};
+use arkan::optimizer::{Adam, AdamConfig, SGDConfig, SGD};
 use arkan::{KanConfig, KanNetwork, TrainOptions, Workspace};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -269,7 +269,15 @@ fn test_hybrid_vs_native_parity_sgd() {
     let mut workspace_native = gpu_native.create_workspace(batch_size).expect("Failed");
 
     // CPU SGD for hybrid (network, lr, momentum, weight_decay)
-    let mut sgd_cpu = SGD::new(&cpu_hybrid, TEST_LR, 0.0, 0.0);
+    let mut sgd_cpu = SGD::new(
+        &cpu_hybrid,
+        SGDConfig {
+            lr: TEST_LR,
+            momentum: 0.0,
+            weight_decay: 0.0,
+            ..Default::default()
+        },
+    );
 
     // GPU SGD for native
     let layer_sizes = gpu_native.layer_param_sizes();

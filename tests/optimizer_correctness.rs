@@ -38,7 +38,12 @@ fn minimal_network() -> KanNetwork {
     KanNetwork::new(config)
 }
 
-/// Computes expected Adam update manually (reference implementation)
+/// Computes expected Adam update manually (reference implementation).
+///
+/// Uses the PyTorch / original paper convention:
+///   `theta -= lr * m_hat / (sqrt(v_hat) + eps)`
+/// where `m_hat = m / bc1` and `v_hat = v / bc2`.
+/// Epsilon is added to the bias-corrected `sqrt(v_hat)`, not to `sqrt(v)`.
 fn adam_step_reference(
     param: f32,
     grad: f32,
@@ -55,13 +60,14 @@ fn adam_step_reference(
     *m = beta1 * *m + (1.0 - beta1) * grad;
     *v = beta2 * *v + (1.0 - beta2) * grad * grad;
 
-    // Bias correction
+    // Bias-corrected estimates (PyTorch / paper convention)
     let bc1 = 1.0 - beta1.powi(t);
     let bc2 = 1.0 - beta2.powi(t);
-    let alpha = lr * bc2.sqrt() / bc1;
+    let m_hat = *m / bc1;
+    let v_hat = *v / bc2;
 
-    // Compute update
-    let update = alpha * *m / (v.sqrt() + epsilon);
+    // Compute update: lr * m_hat / (sqrt(v_hat) + eps)
+    let update = lr * m_hat / (v_hat.sqrt() + epsilon);
 
     // Apply weight decay (AdamW-style, before gradient step)
     let mut new_param = param;
@@ -567,6 +573,7 @@ mod gpu_tests {
             beta2: 0.999,
             epsilon: 1e-8,
             weight_decay: 0.0,
+            ..Default::default()
         };
         let gpu_adam_config = GpuAdamConfig {
             lr: 0.001,
@@ -705,6 +712,7 @@ mod gpu_tests {
             beta2: 0.999,
             epsilon: 1e-8,
             weight_decay: 0.0,
+            ..Default::default()
         };
         let gpu_adam_config = GpuAdamConfig {
             lr: 0.01,
