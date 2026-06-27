@@ -623,8 +623,8 @@ cargo bench --bench forward -- --noplot              # Quick CPU benchmark
 
 ### Accuracy
 
-The int8 quantized path uses fixed-point i64 accumulators, i8 weights, and u16 B-spline
-basis values (Q0.15). Two metrics are reported:
+The int8 quantized path uses fixed-point i64 accumulators, i8 weights (quantized
+**per output channel** since WS02), and u16 B-spline basis values (Q0.15). Two metrics:
 
 - **NRMSE** (aggregate): `||baked - f32||₂ / ||f32||₂` over all outputs × 2000 test inputs.
   This is the standard quantization quality metric.
@@ -632,31 +632,61 @@ basis values (Q0.15). Two metrics are reported:
   to output values where `|f32| > 0.1 × σ_j` (per-output std over the test set). This
   metric is NOT gated — it reveals the real tail that the NRMSE aggregate conceals.
 
+#### Post-WS01 (i32 inter-layer activations + 99.9th-percentile calibration)
+
+| Config | Architecture | NRMSE | Worst-case (significant outputs) |
+|--------|-------------|-------|----------------------------------|
+| small (1-hidden) | 4→[8]→2 | 0.74% | 8.8% |
+| medium (2-hidden) | 8→[16,8]→4 | 1.40% | **120%** |
+| single-layer | 4→2 | — | — |
+
+#### Post-WS02 (per-output-channel weight scales — current)
+
+Each output channel j gets its own weight scale `s_w[j] = 127 / max|w[j,*,*]|`, with
+matching per-channel requant multipliers M0[j]/shift[j] and biases folded with `s_w[j]`.
+
 | Config | Architecture | NRMSE | Gate | Pass? | Worst-case (significant outputs) |
 |--------|-------------|-------|------|-------|----------------------------------|
-| small | 4→[8]→2, grid=5, order=3 | **2.16%** | ≤5% | PASS | 19.1% |
-| medium | 8→[16,8]→4, grid=5, order=3 | **3.77%** | ≤10% | PASS | 206% |
-| single-layer | 4→2, grid=5, order=3 | **0.47%** | ≤5% | PASS | 9.2% |
+| small (1-hidden) | 4→[8]→2, grid=5, order=3 | **0.64%** | ≤5% | PASS | 8.70% |
+| medium (2-hidden) | 8→[16,8]→4, grid=5, order=3 | **1.29%** | ≤10% | PASS | **114.72%** |
+| single-layer | 4→2, grid=5, order=3 | **0.60%** | ≤5% | PASS | 9.20% |
 
-**Interpretation of worst-case numbers (honest):**
+**Honest diagnosis — why the 2-hidden worst-case remains ~115% despite per-channel quant:**
 
-- The NRMSE aggregate is comfortably within gate for all configs. WS02's reported 2.9-3.6%
-  aggregate figure is confirmed.
-- However, the worst-case per-element relative error on significant outputs tells a different
-  story. For the small config it is 19%, and for the medium 3-layer config it reaches 206%
-  — meaning some individual outputs are flipped in sign or more than doubled. This is caused
-  by error amplification across layers: inter-layer normalization multiplies quantization noise.
-- Conclusion: the baked int8 path is suitable for coarse ranking / selection use cases
-  (where relative ordering of a large number of outputs matters more than per-output precision),
-  but NOT suitable as a drop-in replacement where per-output absolute accuracy is required.
-  A per-channel quantization scheme or int16 weights would reduce the worst-case substantially.
+Per-channel weight scales eliminate the int8 noise floor *on the weight side*. The 1-hidden
+worst-case improved from 8.8% → 8.7% (marginal: weights were not the bottleneck there).
+The NRMSE for 2-hidden improved from 1.40% → 1.29% (aggregate is better).
+
+However the 2-hidden worst-case dropped only from 120% → 115%, not to the ~15% target.
+Diagnosis: the residual error is **inter-layer activation quantization noise amplification**,
+not weight quantization. Each inter-layer requant step loses up to 0.5 LSB relative to the
+i32 range; a channel whose f32 output is near-zero after two layers of requant accumulates
+relative error that exceeds 100%. This is a fundamental floor of the current scheme where
+inter-layer activations are shared across output channels (single s_act per layer).
+
+What would actually fix the 2-hidden tail:
+1. **Per-channel output activation scales** (a full per-tensor-of-each-channel scheme) — but
+   these scales are not known until calibration, and the inter-layer normalization would need
+   to be per-channel too, complicating the forward pass significantly.
+2. **Int16 weights** — more bits per weight, but the requant noise is in the activation path,
+   so this helps less than expected.
+3. **Accept the floor**: the NRMSE (1.29%) is well within target; the 115% worst-case is a
+   genuine int8 limitation for 3-layer networks with near-zero outputs.
+
+**Conclusion:** The baked int8 path with per-channel weight quantization is suitable for
+coarse ranking/selection (where NRMSE < 2% is sufficient) but NOT for per-output absolute
+accuracy in deep configs. The 2-hidden worst-case of ~115% reflects an int8 precision floor
+that per-weight-channel quantization alone cannot eliminate.
 
 ### Model Size (compression)
 
+Per-channel metadata (M0[j] + shift[j] per output channel) adds a small overhead vs
+the old per-layer scalar. The trade-off is well worth it for the accuracy improvement.
+
 | Config | f32 weight bytes | baked bytes | Compression ratio |
 |--------|-----------------|-------------|-------------------|
-| small 4→[8]→2 | 1,576 B | 640 B | **2.46×** |
-| medium 8→[16,8]→4 | 9,328 B | 2,904 B | **3.21×** |
+| small 4→[8]→2 | 1,576 B | 720 B | **2.19×** |
+| medium 8→[16,8]→4 | 9,328 B | 3,128 B | **2.98×** |
 
 The compression comes from replacing f32 weights (4 bytes each) with i8 (1 byte each),
 plus storing i64 biases and int32 normalization constants. For larger networks the ratio
