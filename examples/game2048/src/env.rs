@@ -99,12 +99,6 @@ impl Env {
         &self.state_buffer
     }
 
-    /// Copies current state into provided buffer.
-    #[inline]
-    pub fn copy_state_to(&self, dest: &mut [f32; STATE_DIM]) {
-        *dest = self.state_buffer;
-    }
-
     /// Takes an action and returns (next_state, reward, done).
     pub fn step(&mut self, action: usize) -> (Vec<f32>, f32, bool) {
         let dir = Direction::from_index(action);
@@ -120,26 +114,6 @@ impl Env {
     #[inline]
     pub fn board(&self) -> &Board {
         &self.game.board
-    }
-
-    /// Takes an action and fills Experience struct (zero-copy friendly).
-    /// Returns reward and done flag.
-    #[inline]
-    pub fn step_into(&mut self, action: usize, exp: &mut Experience) -> (f32, bool) {
-        // Copy current state before move
-        exp.state = self.state_buffer;
-        exp.action = action;
-        
-        let dir = Direction::from_index(action);
-        let (reward, _changed) = self.game.make_move(dir);
-        
-        self.update_state_buffer();
-        
-        exp.reward = reward;
-        exp.next_state = self.state_buffer;
-        exp.done = self.game.game_over;
-        
-        (reward, self.game.game_over)
     }
 
     /// Returns current score.
@@ -229,19 +203,6 @@ impl ReplayBuffer {
         self.buffer.is_empty()
     }
 
-    /// Samples random indices for a batch (for lock-free pattern).
-    pub fn sample_indices(&self, batch_size: usize) -> Option<Vec<usize>> {
-        if self.buffer.len() < batch_size {
-            return None;
-        }
-        
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let len = self.buffer.len();
-        
-        Some((0..batch_size).map(|_| rng.gen_range(0..len)).collect())
-    }
-
     /// Samples a batch into pre-allocated buffers (minimal allocations).
     /// Returns batch_size on success.
     pub fn sample_batch_into(
@@ -325,9 +286,10 @@ use std::sync::RwLock;
 const NUM_SHARDS: usize = 16;
 
 /// Sharded replay buffer for reduced lock contention.
-/// 
+///
 /// Uses multiple shards with per-shard locking to reduce contention
 /// when multiple threads are pushing/sampling simultaneously.
+/// TODO: wire into train/gpu.rs for multi-threaded collection
 /// 
 /// # Design
 /// 
