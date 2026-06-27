@@ -611,6 +611,92 @@ cargo bench --bench forward -- --noplot              # Quick CPU benchmark
 
 ---
 
+## Baked (int8) Inference
+
+> **Date:** 2026-06-27
+> **Measured by:** `cargo test --test baked_parity -- --nocapture` and `cargo bench --bench baked`
+> **Method:** Random KanNetwork (untrained, random weights), baked with 256 calibration inputs
+> in `[-0.9, 0.9]`, tested against 2000 inputs in the same range. Test is against the same
+> `KanNetwork::forward_single` f32 baseline. All numbers are on debug/release builds of
+> the same platform (Windows 11, AMD Ryzen with AVX2).
+> **Source files:** `tests/baked_parity.rs`, `benches/baked.rs`
+
+### Accuracy
+
+The int8 quantized path uses fixed-point i64 accumulators, i8 weights, and u16 B-spline
+basis values (Q0.15). Two metrics are reported:
+
+- **NRMSE** (aggregate): `||baked - f32||₂ / ||f32||₂` over all outputs × 2000 test inputs.
+  This is the standard quantization quality metric.
+- **Worst-case on significant outputs**: `max per-element |baked - f32| / |f32|` restricted
+  to output values where `|f32| > 0.1 × σ_j` (per-output std over the test set). This
+  metric is NOT gated — it reveals the real tail that the NRMSE aggregate conceals.
+
+| Config | Architecture | NRMSE | Gate | Pass? | Worst-case (significant outputs) |
+|--------|-------------|-------|------|-------|----------------------------------|
+| small | 4→[8]→2, grid=5, order=3 | **2.16%** | ≤5% | PASS | 19.1% |
+| medium | 8→[16,8]→4, grid=5, order=3 | **3.77%** | ≤10% | PASS | 206% |
+| single-layer | 4→2, grid=5, order=3 | **0.47%** | ≤5% | PASS | 9.2% |
+
+**Interpretation of worst-case numbers (honest):**
+
+- The NRMSE aggregate is comfortably within gate for all configs. WS02's reported 2.9-3.6%
+  aggregate figure is confirmed.
+- However, the worst-case per-element relative error on significant outputs tells a different
+  story. For the small config it is 19%, and for the medium 3-layer config it reaches 206%
+  — meaning some individual outputs are flipped in sign or more than doubled. This is caused
+  by error amplification across layers: inter-layer normalization multiplies quantization noise.
+- Conclusion: the baked int8 path is suitable for coarse ranking / selection use cases
+  (where relative ordering of a large number of outputs matters more than per-output precision),
+  but NOT suitable as a drop-in replacement where per-output absolute accuracy is required.
+  A per-channel quantization scheme or int16 weights would reduce the worst-case substantially.
+
+### Model Size (compression)
+
+| Config | f32 weight bytes | baked bytes | Compression ratio |
+|--------|-----------------|-------------|-------------------|
+| small 4→[8]→2 | 1,576 B | 640 B | **2.46×** |
+| medium 8→[16,8]→4 | 9,328 B | 2,904 B | **3.21×** |
+
+The compression comes from replacing f32 weights (4 bytes each) with i8 (1 byte each),
+plus storing i64 biases and int32 normalization constants. For larger networks the ratio
+will approach 4× as bias/metadata overhead becomes relatively smaller.
+
+### Batch=1 Latency (deployment scenario)
+
+All times are Criterion medians (100 samples, 3 s warmup), `--release` build,
+no `simd` or `parallel` features.
+
+| Config | f32 `forward_single` | baked `forward` | Baked vs f32 |
+|--------|----------------------|-----------------|--------------|
+| small 4→[8]→2 | **578 ns** | 735 ns | **1.27× SLOWER** |
+| medium 8→[16,8]→4 | **1.80 µs** | 4.73 µs | **2.63× SLOWER** |
+
+**Baked int8 is slower than f32 at batch=1.** This is expected: the current implementation
+uses scalar i64 arithmetic in the hot path. Modern CPUs have native f32 SIMD lanes optimized
+by the compiler (auto-vectorization) whereas the fixed-point integer path involves i64
+multiply-accumulate and i128 requantization steps that do not vectorize as well without
+explicit SIMD intrinsics.
+
+The latency penalty grows with network depth (2.63× for the 3-layer config vs 1.27× for
+the 2-layer) because inter-layer fixed-point normalization adds overhead that compounds.
+
+**The current win from baking is purely model size (2.5-3.2×), not inference speed.**
+SIMD-optimized int8 kernels (analogous to ARM NEON `vdot` or x86 `_mm256_madd_epi16`)
+are a planned future epic and would likely bring baked latency below f32 at batch=1.
+
+### How to reproduce
+
+```bash
+# Accuracy (NRMSE + worst-case on significant outputs)
+cargo test --test baked_parity -- --nocapture
+
+# Latency + size
+cargo bench --bench baked
+```
+
+---
+
 ## 🔧 Test Environment
 
 - **OS:** Windows 11
