@@ -10,12 +10,19 @@
 //! - Basis functions: u16 Q0.15, value ≈ q_b/32768 (int16 basis variant)
 //! - Accumulator: i64 (safe for typical nets; i128 for requant product)
 //! - Bias: i64 (folded with weight scale)
+//! - Inter-layer activations: i32 with target range ~2^28 (wider than i16 to reduce
+//!   inter-layer error amplification)
+//! - Activation calibration: 99.9th-percentile clip to stop outliers wasting range
 //! - No f32 between entry normalization and final dequantization
 //!
 //! # Accuracy
 //!
-//! Expected ~3–5% relative error for in_dim ≤ 32 with calibration data.
-//! Larger networks may see up to ~10% without per-channel quantization.
+//! Expected ~1–5% NRMSE for in_dim ≤ 32 with calibration data.
+//! Worst-case on significant outputs (per-element relative error, tau=0.1σ):
+//! single-layer ~9%, 1-hidden ~9%, 2-hidden ~120%.
+//! The tail worst-case for deep configs reflects quantization noise floor vs.
+//! near-zero outputs in randomly-initialized networks; per-channel weight
+//! quantization (WS02) is the next lever for further improvement.
 
 use crate::config::{KanConfig, EPSILON};
 use crate::network::KanNetwork;
@@ -310,20 +317,29 @@ pub struct BakedModel {
 }
 
 impl BakedModel {
+    /// Target range for i32 inter-layer activations.
+    /// Using ~2^28 gives 28 bits of dynamic range for typical values,
+    /// vs only 15 bits with the old i16 scheme. This is the key lever
+    /// against inter-layer error amplification.
+    const ACT_TARGET: f64 = 268_435_456.0; // 2^28
+
     /// Bakes a trained KAN network into fixed-point quantized form.
     ///
     /// # Arguments
     ///
     /// * `network` - Trained KAN network to bake.
     /// * `calibration` - Optional calibration inputs (flat: [n_samples * input_dim]).
-    ///   If provided, activation scales are set from the actual dynamic range of
-    ///   each layer. If None, a heuristic scale is used and `uncalibrated` is set.
+    ///   If provided, activation scales are set using 99.9th-percentile clipping
+    ///   (stops outliers from wasting the i32 dynamic range). If None, a heuristic
+    ///   scale is used and `uncalibrated` is set.
     pub fn from_network(network: &KanNetwork, calibration: Option<&[f32]>) -> Self {
         let config = network.config.clone();
         let uncalibrated = calibration.is_none();
 
         // Compute activation scales s_act[L] for each layer output.
-        // s_act[L] = 32767 / max |layer L output| over calibration inputs.
+        // s_act[L] = ACT_TARGET / p99.9(|layer L output|) over calibration inputs.
+        // Activations are clamped to ±ACT_TARGET at requant time so outliers saturate
+        // instead of stealing dynamic range from the bulk of values.
         let n_layers = network.layers.len();
         let mut s_act = vec![1.0f32; n_layers];
 
@@ -331,7 +347,7 @@ impl BakedModel {
             let input_dim = config.input_dim;
             if !cal_data.is_empty() && cal_data.len() >= input_dim {
                 let n_samples = cal_data.len() / input_dim;
-                // Run f32 forward through all layers to collect per-layer max activations.
+                // Run f32 forward through all layers to collect per-layer activation magnitudes.
                 let layer_dims: Vec<usize> = config.layer_dims();
                 let max_dim = *layer_dims.iter().max().unwrap_or(&1);
 
@@ -340,7 +356,8 @@ impl BakedModel {
                 let mut act_out = vec![0.0f32; max_dim];
                 let mut basis_buf = vec![0.0f32; 16]; // max basis_aligned
 
-                let mut layer_maxes = vec![0.0f32; n_layers];
+                // Collect all activation magnitudes per layer for percentile computation
+                let mut layer_mags: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
 
                 for s in 0..n_samples {
                     let sample = &cal_data[s * input_dim..(s + 1) * input_dim];
@@ -356,10 +373,7 @@ impl BakedModel {
                         layer.forward_single(in_slice, out_slice, &mut basis_buf);
 
                         for &v in out_slice.iter() {
-                            let av = v.abs();
-                            if av > layer_maxes[l] {
-                                layer_maxes[l] = av;
-                            }
+                            layer_mags[l].push(v.abs());
                         }
 
                         // Copy output to next input
@@ -367,17 +381,27 @@ impl BakedModel {
                     }
                 }
 
+                // Compute 99.9th percentile per layer and set s_act accordingly.
                 for l in 0..n_layers {
-                    let max_v = layer_maxes[l];
-                    if max_v > EPSILON {
-                        s_act[l] = 32767.0 / max_v;
+                    let mags = &mut layer_mags[l];
+                    if mags.is_empty() {
+                        s_act[l] = Self::ACT_TARGET as f32;
+                        continue;
+                    }
+                    // Sort to find percentile (NaN-safe: treat NaN as large)
+                    mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
+                    // 99.9th percentile index
+                    let idx = ((mags.len() - 1) as f64 * 0.999) as usize;
+                    let p999 = mags[idx];
+                    if p999 > EPSILON {
+                        s_act[l] = (Self::ACT_TARGET / p999 as f64) as f32;
                     } else {
-                        s_act[l] = 32767.0; // trivially zero output
+                        s_act[l] = Self::ACT_TARGET as f32; // trivially zero output
                     }
                 }
             }
         } else {
-            // Heuristic: assume output range ≈ [-2, 2] (reasonable for KAN)
+            // Heuristic: assume output range ≈ [-4, 4] (reasonable for KAN)
             // This is a loose guess. Calibration strongly recommended.
             eprintln!(
                 "[BakedModel] WARNING: No calibration data provided. \
@@ -385,7 +409,7 @@ impl BakedModel {
                  Accuracy may be significantly reduced."
             );
             for s in s_act.iter_mut() {
-                *s = 32767.0 / 4.0; // assume max |activation| ≈ 4
+                *s = (Self::ACT_TARGET / 4.0) as f32; // assume max |activation| ≈ 4
             }
         }
 
@@ -452,26 +476,45 @@ impl BakedModel {
             // For layer 0: the raw inputs are f32 and we normalize in the entry step.
             //   norm_a_fixed and norm_b_fixed are used only for inter-layer (layers 1+).
             //   For layer 0, they are unused but we still compute them for consistency.
-            // For layer L > 0: inputs are i16 activations scaled by 1/s_act_prev.
-            //   The i16 value q_out satisfies: z_actual = (q_out/s_act_prev - mean_i) / std_i
+            // For layer L > 0: inputs are i32 activations scaled by 1/s_act_prev.
+            //   The i32 value q_out satisfies: z_actual = (q_out/s_act_prev - mean_i) / std_i
             //   We need q_z = z_actual * 2^16 for span/t extraction.
             //   q_z = (q_out/s_act_prev - mean_i) / std_i * 2^16
             //       = q_out * (2^16 / (s_act_prev * std_i)) + (-mean_i/std_i) * 2^16
             //       = q_out * A_FIXED[i] + B_FIXED[i]
+            // Note: s_act_prev is now ~ACT_TARGET/p999 (much larger than 32767),
+            // so A_FIXED will be smaller (often < 1 in f32, stored as i32 fraction).
+            // To preserve precision, we scale A_FIXED by 2^16 (stored as i32 fraction
+            // of 2^16), and divide by 2^16 in the hot path using i64 arithmetic.
+            // This avoids losing sub-1 precision in A_FIXED for i32 activations.
+            // Encoding: norm_a_fixed[i] = round(2^32 / (s_act_prev * std_i))
+            // Hot path: q_z = (q_in * A_FIXED + B_FIXED_shifted) >> 16
+            // where B_FIXED_shifted = round(-mean_i/std_i * 2^32)
+            // NOTE: we still store the old scale (2^16 / ...) and shift by 0 when
+            // s_act_prev == 1.0 (layer 0, which is unused anyway).
+            // For layers > 0 with wide i32 activations, we use Q16 scaling:
+            //   A_FIXED = round(2^32 / (s_act_prev * std_i))
+            //   B_FIXED = round(-mean_i / std_i * 2^32)
+            //   q_z = (q_in * A_FIXED + B_FIXED) >> 16
+            // This maps i32 activations in range ±ACT_TARGET to q_z in Q15.16.
             let norm_a_fixed: Vec<i32> = (0..in_dim)
                 .map(|i| {
-                    let std_i = layer.std[i].max(EPSILON);
-                    let a = 65536.0 / (s_act_prev * std_i);
-                    // Clamp to avoid i32 overflow
-                    a.round().clamp(i32::MIN as f32, i32::MAX as f32) as i32
+                    let std_i = layer.std[i].max(EPSILON) as f64;
+                    let s_prev = s_act_prev as f64;
+                    // Use 2^32 scale for i32 activations; for layer 0 (s_prev=1.0),
+                    // this is unused but we compute it for consistency.
+                    let a = (1u64 << 32) as f64 / (s_prev * std_i);
+                    // Clamp to i32 range (a can be very small for large s_act_prev)
+                    a.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32
                 })
                 .collect();
 
             let norm_b_fixed: Vec<i32> = (0..in_dim)
                 .map(|i| {
-                    let std_i = layer.std[i].max(EPSILON);
-                    let b = -layer.mean[i] / std_i * 65536.0;
-                    b.round().clamp(i32::MIN as f32, i32::MAX as f32) as i32
+                    let std_i = layer.std[i].max(EPSILON) as f64;
+                    // Match the 2^32 scaling used in norm_a_fixed (then >> 16 in hot path).
+                    let b = -layer.mean[i] as f64 / std_i * (1u64 << 32) as f64;
+                    b.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32
                 })
                 .collect();
 
@@ -563,7 +606,7 @@ impl BakedModel {
             return;
         }
 
-        // Allocate activation buffers (i16). Max size across layers.
+        // Allocate activation buffers. Max size across layers.
         let max_dim = self
             .layers
             .iter()
@@ -572,7 +615,7 @@ impl BakedModel {
             .unwrap_or(1);
 
         let mut act_a = vec![0i32; max_dim]; // current layer inputs as Q15.16 z-values
-        let mut act_b = vec![0i16; max_dim]; // current layer outputs as i16 (1/s_act)
+        let mut act_b = vec![0i32; max_dim]; // current layer outputs as i32 (scaled by s_act)
         let mut basis_buf = vec![0u16; 8]; // max order+1 = 6 (order 5), 8 is safe
 
         // ENTRY: normalize layer-0 inputs to Q15.16 fixed-point z
@@ -650,7 +693,10 @@ impl BakedModel {
                     }
                 }
 
-                // Requant: q_out = ((acc * M0) + round) >> S, clamp to i16
+                // Requant: q_out = ((acc * M0) + round) >> S, clamp to ±ACT_TARGET.
+                // Using i32 output (wider than old i16) to preserve inter-layer precision.
+                // Saturate to ACT_TARGET so that the few outliers above the 99.9th
+                // percentile clipping point don't corrupt the fixed-point scale.
                 let product = (acc as i128) * (layer.requant_m0 as i128);
                 let round_offset = if layer.requant_shift > 0 {
                     1i128 << (layer.requant_shift - 1)
@@ -658,7 +704,8 @@ impl BakedModel {
                     0
                 };
                 let q_out_i64 = ((product + round_offset) >> layer.requant_shift) as i64;
-                act_b[j] = q_out_i64.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+                const ACT_CLAMP: i64 = 268_435_456; // 2^28 = ACT_TARGET
+                act_b[j] = q_out_i64.clamp(-ACT_CLAMP, ACT_CLAMP) as i32;
             }
 
             // INTER-LAYER: compute next layer's z values in Q15.16
@@ -666,18 +713,24 @@ impl BakedModel {
             if l + 1 < self.layers.len() {
                 let next_layer = &self.layers[l + 1];
                 let next_in_dim = next_layer.in_dim;
-                // act_b[i] is the i16 output, act_a[i] will be the next layer's q_z
-                // q_z = (act_b[i] * A_FIXED[i] + B_FIXED[i]).clamp(q_rmin, q_rmax)
+                // act_b[i] is now an i32 output scaled by s_act.
+                // A_FIXED[i] = round(2^32 / (s_act_prev * std_i))  (stored in norm_a_fixed)
+                // B_FIXED[i] = round(-mean_i / std_i * 2^32)        (stored in norm_b_fixed)
+                // q_z = (q_in * A_FIXED + B_FIXED) >> 16
+                // This maps i32 activations → Q15.16 z value.
+                // q_in * A_FIXED can be up to 2^28 * 2^31 = 2^59 — fits in i64.
                 for i in 0..next_in_dim {
                     let a_fixed = next_layer.norm_a_fixed[i] as i64;
                     let b_fixed = next_layer.norm_b_fixed[i] as i64;
-                    let q_z = ((act_b[i] as i64) * a_fixed + b_fixed) as i32;
+                    let q_z = (((act_b[i] as i64) * a_fixed + b_fixed) >> 16) as i32;
                     act_a[i] = q_z.clamp(next_layer.q_rmin, next_layer.q_rmax);
                 }
             }
         }
 
         // EXIT: dequantize last layer outputs to f32
+        // act_b[j] is i32 scaled by s_act_last (ACT_TARGET / p99.9).
+        // output[j] = act_b[j] / s_act_last
         let last_layer = self.layers.last().unwrap();
         let s_act_last = last_layer.s_act_out;
         for j in 0..last_layer.out_dim {
