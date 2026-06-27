@@ -107,35 +107,40 @@ fn measure_accuracy(
     let rms_f = (sum_sq_f / count).sqrt().max(1e-9);
     let nrmse = (rmse / rms_f) as f32;
 
-    // (b) worst-case on significant outputs
-    // For each output dimension j, compute std of f32 outputs across test set.
-    // tau_j = 0.1 * std_j
-    let mut tau = vec![0.0f32; output_dim];
+    // (b) worst-case on significant outputs, at several significance thresholds.
+    // tau_j = factor * std_j. The 0.1σ threshold includes near-noise outputs;
+    // 0.5σ/1.0σ show whether the tail affects decision-relevant outputs.
+    let mut std_j = vec![0.0f32; output_dim];
     for j in 0..output_dim {
         let vals: Vec<f32> = (0..n).map(|s| f32_outs[s][j]).collect();
         let mean = vals.iter().copied().sum::<f32>() / n as f32;
         let var = vals.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
-        tau[j] = 0.1 * var.sqrt();
+        std_j[j] = var.sqrt();
     }
 
-    let mut worst_case = 0.0f32;
-    let mut n_significant = 0usize;
-    for s in 0..n {
-        for j in 0..output_dim {
-            let fv = f32_outs[s][j].abs();
-            if fv > tau[j] {
-                let rel_err = (baked_outs[s][j] - f32_outs[s][j]).abs() / fv;
-                if rel_err > worst_case {
-                    worst_case = rel_err;
+    let worst_at = |factor: f32| -> f32 {
+        let mut wc = 0.0f32;
+        for s in 0..n {
+            for j in 0..output_dim {
+                let fv = f32_outs[s][j].abs();
+                if fv > factor * std_j[j] {
+                    let rel_err = (baked_outs[s][j] - f32_outs[s][j]).abs() / fv;
+                    if rel_err > wc {
+                        wc = rel_err;
+                    }
                 }
-                n_significant += 1;
             }
         }
-    }
-    if n_significant == 0 {
-        // All outputs near zero — worst-case undefined; report 0
-        worst_case = 0.0;
-    }
+        wc
+    };
+
+    let worst_case = worst_at(0.1);
+    println!(
+        "    worst-case by significance: 0.1σ={:.1}%  0.5σ={:.1}%  1.0σ={:.1}%",
+        worst_case * 100.0,
+        worst_at(0.5) * 100.0,
+        worst_at(1.0) * 100.0
+    );
 
     (nrmse, worst_case)
 }

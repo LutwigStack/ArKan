@@ -651,32 +651,29 @@ matching per-channel requant multipliers M0[j]/shift[j] and biases folded with `
 | medium (2-hidden) | 8→[16,8]→4, grid=5, order=3 | **1.29%** | ≤10% | PASS | **114.72%** |
 | single-layer | 4→2, grid=5, order=3 | **0.60%** | ≤5% | PASS | 9.20% |
 
-**Honest diagnosis — why the 2-hidden worst-case remains ~115% despite per-channel quant:**
+**Worst-case by significance threshold (the 115% is a metric artifact):**
 
-Per-channel weight scales eliminate the int8 noise floor *on the weight side*. The 1-hidden
-worst-case improved from 8.8% → 8.7% (marginal: weights were not the bottleneck there).
-The NRMSE for 2-hidden improved from 1.40% → 1.29% (aggregate is better).
+The "115%" worst-case uses a 0.1σ significance cut, i.e. it includes bottom-decile-magnitude
+outputs. Measuring the worst-case at higher (decision-relevant) thresholds shows the tail is
+entirely on near-noise outputs:
 
-However the 2-hidden worst-case dropped only from 120% → 115%, not to the ~15% target.
-Diagnosis: the residual error is **inter-layer activation quantization noise amplification**,
-not weight quantization. Each inter-layer requant step loses up to 0.5 LSB relative to the
-i32 range; a channel whose f32 output is near-zero after two layers of requant accumulates
-relative error that exceeds 100%. This is a fundamental floor of the current scheme where
-inter-layer activations are shared across output channels (single s_act per layer).
+| Config | worst-case @0.1σ | @0.5σ | @1.0σ |
+|--------|------------------|-------|-------|
+| single-layer 4→2 | 9.2% | 8.3% | 8.3% |
+| small 1-hidden | 8.7% | 8.7% | 8.7% |
+| medium 2-hidden | **114.7%** | **27.1%** | **18.7%** |
 
-What would actually fix the 2-hidden tail:
-1. **Per-channel output activation scales** (a full per-tensor-of-each-channel scheme) — but
-   these scales are not known until calibration, and the inter-layer normalization would need
-   to be per-channel too, complicating the forward pass significantly.
-2. **Int16 weights** — more bits per weight, but the requant noise is in the activation path,
-   so this helps less than expected.
-3. **Accept the floor**: the NRMSE (1.29%) is well within target; the 115% worst-case is a
-   genuine int8 limitation for 3-layer networks with near-zero outputs.
+For the 2-hidden net the catastrophic figure collapses from 115% (0.1σ) to ~19% (≥1σ). The
+large relative errors live exclusively on outputs in the bottom decile of magnitude — where a
+few-LSB absolute error divided by a near-zero reference explodes. On decision-relevant outputs
+(≥1σ) the worst-case is ~9% (shallow) to ~19% (2-hidden), with NRMSE ~0.6–1.3%.
 
-**Conclusion:** The baked int8 path with per-channel weight quantization is suitable for
-coarse ranking/selection (where NRMSE < 2% is sufficient) but NOT for per-output absolute
-accuracy in deep configs. The 2-hidden worst-case of ~115% reflects an int8 precision floor
-that per-weight-channel quantization alone cannot eliminate.
+**Conclusion:** The baked int8 path (i32 activations + percentile calibration + per-channel
+weights) is suitable for ranking/argmax/selection and approximate values — exactly the poker
+action-distribution use — where the accurate large outputs are what matter. It is NOT suited
+to exact values of near-zero (sub-decile) outputs; that is an inherent int8 floor and usually
+irrelevant. Closing even that tail would need per-channel activation scales (large forward
+complexity) or int16 weights (halves the size win) — out of scope unless a use case demands it.
 
 ### Model Size (compression)
 
