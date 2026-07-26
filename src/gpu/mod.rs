@@ -47,6 +47,15 @@
 //! - [`shaders`] — Dynamic shader generation for variable spline orders
 //! - [`optimizer`] — GPU-accelerated optimizers (Adam, SGD)
 
+// `rust-version` in Cargo.toml is 1.73, the floor for the default and `serde`
+// builds. clippy applies it to the whole crate, but this module can never be
+// compiled at 1.73: enabling `gpu` pulls wgpu 23 -> naga -> indexmap, which
+// requires 1.85. So APIs newer than 1.73 (`Option::is_none_or`, stable 1.82)
+// are fine here and the lint is a false positive against our actual policy.
+// ponytail: cargo has one rust-version per package, not per feature, so there
+// is nowhere to state the real 1.85 gpu floor except the README table.
+#![allow(clippy::incompatible_msrv)]
+
 mod backend;
 mod layer;
 mod network;
