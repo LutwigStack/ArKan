@@ -1215,7 +1215,8 @@ fn layer_tolerance_can_see_a_tenth_of_a_percent_gradient_error() {
     clean.assert_clean("calibration baseline");
     assert!(
         dirty.failures.len() > 150,
-        "a 0.1% gradient error was flagged on only {} of {} probes - the layer          tolerance has gone blind",
+        "a 0.1% gradient error was flagged on only {} of {} probes - the layer \
+         tolerance has gone blind",
         dirty.failures.len(),
         dirty.probes
     );
@@ -1228,9 +1229,8 @@ fn layer_tolerance_can_see_a_tenth_of_a_percent_gradient_error() {
 ///
 /// Measured flag counts on the deep fixture, out of 893 probes: 0 at `d = 0`, 0 at
 /// 1e-3, 0 at 3e-3, 242 at 1e-2, 361 at 3e-2. The floor is between 0.3% and 1%, set by
-/// `f32`
-/// round-off in a 4-layer backward pass - see [`NET_ANA_REL`] - not by anything the
-/// difference quotient could improve.
+/// `f32` round-off in a 4-layer backward pass - see [`NET_ANA_REL`] - not by anything
+/// the difference quotient could improve.
 #[test]
 fn network_tolerance_can_see_a_one_percent_gradient_error() {
     let mut clean = Check::default();
@@ -1250,7 +1250,8 @@ fn network_tolerance_can_see_a_one_percent_gradient_error() {
     clean.assert_clean("calibration baseline");
     assert!(
         dirty.failures.len() > 100,
-        "a 1% gradient error was flagged on only {} of {} probes - the network          tolerance has gone blind",
+        "a 1% gradient error was flagged on only {} of {} probes - the network \
+         tolerance has gone blind",
         dirty.failures.len(),
         dirty.probes
     );
