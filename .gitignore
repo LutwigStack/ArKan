@@ -5,6 +5,7 @@
 Cargo.lock
 
 # IDE and editor files
+.claude/
 .idea/
 .vscode/
 *.swp
