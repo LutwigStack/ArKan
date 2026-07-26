@@ -1339,10 +1339,12 @@ impl GpuNetwork {
             self.pipeline_cache.backward_workspace_layout_ref(),
         )?;
 
-        // Get pipelines
+        // Get pipelines. The backward shaders are order-specific (active basis count,
+        // basis polynomials and their derivatives all depend on the order), so they
+        // must be selected by `spline_order` exactly like the forward ones.
         let weights_pipeline = self
             .pipeline_cache
-            .get_backward_weights_pipeline(&backward_layer_layout)?;
+            .get_backward_weights_pipeline_for_order(&backward_layer_layout, self.spline_order)?;
 
         // Create command encoder
         let mut encoder = self
@@ -1425,7 +1427,7 @@ impl GpuNetwork {
         if compute_input_grad {
             let input_pipeline = self
                 .pipeline_cache
-                .get_backward_input_pipeline(&backward_layer_layout)?;
+                .get_backward_input_pipeline_for_order(&backward_layer_layout, self.spline_order)?;
 
             let total_inputs = batch_size * in_dim;
             let workgroups = workgroup_count(total_inputs, WORKGROUP_SIZE);

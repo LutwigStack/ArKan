@@ -412,7 +412,12 @@ fn add_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
-/// Backward pass shader for KAN layer - weight gradients.
+/// Backward pass shader for KAN layer - weight gradients (**cubic only, order=3**).
+///
+/// The basis polynomials and the count of active basis functions are baked in at
+/// order 3. Compiling this for any other order silently produces wrong gradients -
+/// that is exactly how orders 2/4/5 shipped broken. Use
+/// [`generate_backward_weights_shader`] instead; the live pipeline does.
 ///
 /// **Strategy: Per-weight-element parallelism with batch reduction**
 ///
@@ -579,7 +584,11 @@ fn backward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 "#;
 
-/// Backward pass shader for input gradients.
+/// Backward pass shader for input gradients (**cubic only, order=3**).
+///
+/// The basis *derivative* polynomials are baked in at order 3. See
+/// [`BACKWARD_WEIGHTS_SHADER`] for why that matters; use
+/// [`generate_backward_input_shader`] for any other order.
 ///
 /// **Strategy: Per-input-element parallelism with output reduction**
 ///

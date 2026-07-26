@@ -31,10 +31,10 @@ pub struct PipelineCache {
     // Training pipelines
     /// Forward training pipeline (saves z_values and span_indices)
     forward_training_pipeline: Option<wgpu::ComputePipeline>,
-    /// Backward weights pipeline
-    backward_weights_pipeline: Option<wgpu::ComputePipeline>,
-    /// Backward input gradients pipeline
-    backward_input_pipeline: Option<wgpu::ComputePipeline>,
+    /// Backward weights pipelines cached by spline order (2-5)
+    backward_weights_pipelines: HashMap<usize, wgpu::ComputePipeline>,
+    /// Backward input gradient pipelines cached by spline order (2-5)
+    backward_input_pipelines: HashMap<usize, wgpu::ComputePipeline>,
     /// Backward bias pipeline
     backward_bias_pipeline: Option<wgpu::ComputePipeline>,
     /// Bind group layout for training (Group 1).
@@ -59,8 +59,8 @@ impl PipelineCache {
             forward_layout: None,
             workspace_layout: None,
             forward_training_pipeline: None,
-            backward_weights_pipeline: None,
-            backward_input_pipeline: None,
+            backward_weights_pipelines: HashMap::new(),
+            backward_input_pipelines: HashMap::new(),
             backward_bias_pipeline: None,
             training_workspace_layout: None,
             backward_workspace_layout: None,
@@ -641,21 +641,29 @@ impl PipelineCache {
         Ok(())
     }
 
-    /// Gets or creates the backward weights pipeline.
-    pub fn get_backward_weights_pipeline(
+    /// Gets or creates the backward weights pipeline for a specific spline order.
+    ///
+    /// The shader is generated per order: the number of active basis functions and
+    /// the basis polynomials both depend on it, so a single order-3 shader silently
+    /// computes the wrong gradient at every other order.
+    pub fn get_backward_weights_pipeline_for_order(
         &mut self,
         layer_layout: &wgpu::BindGroupLayout,
+        order: usize,
     ) -> ArkanResult<&wgpu::ComputePipeline> {
-        if self.backward_weights_pipeline.is_none() {
-            self.create_backward_weights_pipeline(layer_layout)?;
+        if !self.backward_weights_pipelines.contains_key(&order) {
+            self.create_backward_weights_pipeline_for_order(layer_layout, order)?;
         }
-        Ok(self.backward_weights_pipeline.as_ref().unwrap())
+        Ok(self.backward_weights_pipelines.get(&order).unwrap())
     }
 
-    fn create_backward_weights_pipeline(
+    fn create_backward_weights_pipeline_for_order(
         &mut self,
         layer_layout: &wgpu::BindGroupLayout,
+        order: usize,
     ) -> ArkanResult<()> {
+        let shader_source = shaders::generate_backward_weights_shader(order)?;
+
         // Ensure the layout is populated while we hold &mut self.
         self.get_backward_workspace_layout();
         // The mutable borrow from get_backward_workspace_layout ends here.
@@ -665,8 +673,8 @@ impl PipelineCache {
         let shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Backward Weights Shader"),
-                source: wgpu::ShaderSource::Wgsl(shaders::BACKWARD_WEIGHTS_SHADER.into()),
+                label: Some(&format!("Backward Weights Shader Order {}", order)),
+                source: wgpu::ShaderSource::Wgsl(shader_source.into()),
             });
 
         let layout = self
@@ -680,7 +688,7 @@ impl PipelineCache {
         let pipeline = self
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Backward Weights Pipeline"),
+                label: Some(&format!("Backward Weights Pipeline Order {}", order)),
                 layout: Some(&layout),
                 module: &shader,
                 entry_point: Some("backward_main"),
@@ -688,25 +696,32 @@ impl PipelineCache {
                 cache: None,
             });
 
-        self.backward_weights_pipeline = Some(pipeline);
+        self.backward_weights_pipelines.insert(order, pipeline);
         Ok(())
     }
 
-    /// Gets or creates the backward input pipeline.
-    pub fn get_backward_input_pipeline(
+    /// Gets or creates the backward input pipeline for a specific spline order.
+    ///
+    /// See [`get_backward_weights_pipeline_for_order`](Self::get_backward_weights_pipeline_for_order):
+    /// the basis *derivative* polynomials are order-specific too.
+    pub fn get_backward_input_pipeline_for_order(
         &mut self,
         layer_layout: &wgpu::BindGroupLayout,
+        order: usize,
     ) -> ArkanResult<&wgpu::ComputePipeline> {
-        if self.backward_input_pipeline.is_none() {
-            self.create_backward_input_pipeline(layer_layout)?;
+        if !self.backward_input_pipelines.contains_key(&order) {
+            self.create_backward_input_pipeline_for_order(layer_layout, order)?;
         }
-        Ok(self.backward_input_pipeline.as_ref().unwrap())
+        Ok(self.backward_input_pipelines.get(&order).unwrap())
     }
 
-    fn create_backward_input_pipeline(
+    fn create_backward_input_pipeline_for_order(
         &mut self,
         layer_layout: &wgpu::BindGroupLayout,
+        order: usize,
     ) -> ArkanResult<()> {
+        let shader_source = shaders::generate_backward_input_shader(order)?;
+
         // Ensure the layout is populated while we hold &mut self.
         self.get_backward_workspace_layout();
         // The mutable borrow from get_backward_workspace_layout ends here.
@@ -716,8 +731,8 @@ impl PipelineCache {
         let shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Backward Input Shader"),
-                source: wgpu::ShaderSource::Wgsl(shaders::BACKWARD_INPUT_SHADER.into()),
+                label: Some(&format!("Backward Input Shader Order {}", order)),
+                source: wgpu::ShaderSource::Wgsl(shader_source.into()),
             });
 
         let layout = self
@@ -731,7 +746,7 @@ impl PipelineCache {
         let pipeline = self
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Backward Input Pipeline"),
+                label: Some(&format!("Backward Input Pipeline Order {}", order)),
                 layout: Some(&layout),
                 module: &shader,
                 entry_point: Some("backward_input_main"),
@@ -739,7 +754,7 @@ impl PipelineCache {
                 cache: None,
             });
 
-        self.backward_input_pipeline = Some(pipeline);
+        self.backward_input_pipelines.insert(order, pipeline);
         Ok(())
     }
 
@@ -850,12 +865,12 @@ impl std::fmt::Debug for PipelineCache {
                 &self.forward_training_pipeline.is_some(),
             )
             .field(
-                "has_backward_weights",
-                &self.backward_weights_pipeline.is_some(),
+                "backward_weights_orders_cached",
+                &self.backward_weights_pipelines.keys().collect::<Vec<_>>(),
             )
             .field(
-                "has_backward_input",
-                &self.backward_input_pipeline.is_some(),
+                "backward_input_orders_cached",
+                &self.backward_input_pipelines.keys().collect::<Vec<_>>(),
             )
             .field("has_backward_bias", &self.backward_bias_pipeline.is_some())
             .finish()
