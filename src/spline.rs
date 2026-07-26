@@ -266,37 +266,25 @@ pub fn compute_basis_and_deriv(
     // Build order p-1 basis functions from scratch using De Boor recursion
     let mut basis_prev = [0.0f32; MAX_ORDER + 2];
 
-    // Initialize order 0: B_{j,0}(x) = 1 if t_j <= x < t_{j+1}, else 0
-    // We need values for j from start_idx to span+1
-    for j in start_idx..=span + 1 {
-        let idx = j - start_idx;
-        if idx < MAX_ORDER + 2 {
-            basis_prev[idx] = if x >= knots[j] && x < knots[j + 1] {
-                1.0
-            } else {
-                0.0
-            };
-        }
-    }
-
-    // Handle the right endpoint (x == knots[span+1] case)
-    // The rightmost non-zero basis should be 1 at the right boundary.
-    // Exact comparison, not `.abs() < EPSILON`: the half-open indicator above
-    // misses exactly `x == knots[span+1]` and nothing else, and on a grid
-    // narrower than EPSILON an absolute tolerance swallowed every x in range.
-    if x >= knots[span + 1] {
-        for j in start_idx..=span + 1 {
-            let idx = j - start_idx;
-            if idx < MAX_ORDER + 2 {
-                basis_prev[idx] = 0.0;
-            }
-        }
-        // Set the rightmost basis to 1
-        let idx = span - start_idx;
-        if idx < MAX_ORDER + 2 {
-            basis_prev[idx] = 1.0;
-        }
-    }
+    // Order 0, relative to `span`: `B_{span,0}(x) = 1` and every other order-0
+    // function is 0. Index `span - start_idx == order`.
+    //
+    // This used to be an indicator built by comparing `x` against `knots[j]` and
+    // `knots[j+1]` for every `j`, plus a special case restoring
+    // `basis_prev[order] = 1` at the right endpoint. That agreed with `span` for
+    // every `x` except a sliver one ULP wide, and disagreed there: `find_span`
+    // deliberately snaps `x` to the interval starting at the *next* knot when the
+    // f32 ratio `(x - t_min)/h` rounds up to an integer, so `x` can sit up to one
+    // ULP below `knots[span]`. `compute_basis` follows `span` and evaluates that
+    // interval's polynomial a hair outside it; the comparison-based indicator
+    // followed `x` instead and switched to the previous interval. At order 2 and up
+    // that is invisible (the pieces meet C^1, so both answers agree to
+    // `O(ULP/h)`), but at order 1 the order-0 indicator *is* the answer: forward
+    // moved with slope `(w1 - w0)/h` while backward reported `+w0/h`, a wrong-signed
+    // `grad_input` for any input landing in the sliver. Deriving it from `span`
+    // makes the two functions agree by construction - and it is the textbook de Boor
+    // initialization, not a special case.
+    basis_prev[order] = 1.0;
 
     // Build up to order p-1 using De Boor recursion
     // We need (order + 2) basis functions of order (p-1) for the derivative formula
