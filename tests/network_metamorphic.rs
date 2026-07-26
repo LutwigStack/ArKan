@@ -638,6 +638,40 @@ fn non_finite_inputs_have_defined_behaviour() {
     }
 }
 
+/// `normalize_batch` processes eight samples per SIMD step and the remainder with
+/// scalar code. Position in the batch must not change the answer.
+///
+/// It used to: `f32x8::max`/`min` return the other operand for a NaN lane, so with
+/// `grid_range = (-1, 1)` a batch of 13 NaNs came back as eight `-1.0`s followed by
+/// five NaNs. Fixed in `src/spline.rs` by restoring NaN after the clamp.
+#[test]
+fn normalize_batch_does_not_depend_on_position_in_the_batch() {
+    use arkan::spline::normalize_batch;
+
+    for grid_range in [(-1.0f32, 1.0f32), (0.0, 1.0), (0.5, 2.5), (-5.0, 5.0)] {
+        for std in [1e-6f32, 1e-3, 1.0, 1e3] {
+            for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.4, 123.0] {
+                // 13 = one full SIMD step of 8 plus a 5-wide scalar remainder.
+                let batch = 13;
+                let x = vec![value; batch];
+                let mut z = vec![0.0f32; batch];
+                normalize_batch(&x, &[0.25], &[std], grid_range, &mut z);
+
+                let reference = ((value - 0.25) / std).clamp(grid_range.0, grid_range.1);
+                for (b, got) in z.iter().enumerate() {
+                    assert_eq!(
+                        got.to_bits(),
+                        reference.to_bits(),
+                        "range={grid_range:?} std={std:e} value={value} slot {b} \
+                         (SIMD head is 0..8, scalar tail is 8..13): got {got}, \
+                         f32::clamp gives {reference}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn extreme_input_std_stays_finite() {
     // `input_std` is only bounded below by EPSILON, so both ends are reachable.

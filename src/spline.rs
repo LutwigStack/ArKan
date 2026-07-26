@@ -381,6 +381,11 @@ pub fn compute_basis_and_deriv(
 /// * `std` - Per-feature std: `[input_dim]`
 /// * `grid_range` - (min, max) clamp values
 /// * `z_out` - Output buffer: `[batch_size * input_dim]`
+///
+/// # Non-finite inputs
+///
+/// `+/-inf` clamps to `grid_max`/`grid_min`. NaN propagates, matching
+/// `f32::clamp` and [`crate::KanLayer::forward_batch`].
 #[inline]
 pub fn normalize_batch(
     x: &[f32],    // [batch * input_dim], Row-Major
@@ -414,8 +419,13 @@ pub fn normalize_batch(
                 x[(b + 7) * input_dim + i],
             ]);
 
-            // Normalize and clamp
-            let z = ((x_vals - m) / s).max(grid_min).min(grid_max);
+            // Normalize and clamp. `f32x8::max`/`min` return the *other* operand
+            // when a lane is NaN, so a NaN would come out as `grid_min` here while
+            // the scalar remainder below - and `KanLayer::forward_batch` - keep it.
+            // Same input, different answer depending on its slot in the batch, so
+            // put the NaN back.
+            let raw = (x_vals - m) / s;
+            let z = raw.is_nan().blend(raw, raw.max(grid_min).min(grid_max));
 
             // Scatter to z_out
             let z_arr: [f32; 8] = z.into();
