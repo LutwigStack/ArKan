@@ -1,11 +1,30 @@
 # ArKan Benchmark Results
 
-**Test Date:** 2026-06-27 *(CPU/GPU forward+backward re-measured; competitor comparison added — see tasks/02-reference-parity-and-benchmarks/results/comparison.md)*  
-**Platform:** Windows 11, CPU + GPU  
-**CPU Config:** Poker preset `[21, 64, 64, 24]`, Grid 5, Spline Order 3 (cubic)  
-**GPU:** NVIDIA GeForce RTX 4070 SUPER (Vulkan via wgpu 0.23)  
-**Rust:** `cargo bench` with AVX2 (`simd` feature) and Rayon (`parallel` feature)  
-**Python:** PyTorch 2.x (CPU comparison via `scripts/bench_pytorch_train.py`)
+**Platform:** Windows 11, AMD Ryzen (AVX2), NVIDIA GeForce RTX 4070 SUPER
+(Vulkan via wgpu 0.23)
+**CPU Config:** Poker preset `[21, 64, 64, 24]`, Grid 5, Spline Order 3 (cubic)
+**Rust:** `cargo bench`, release profile, default features (SIMD via `wide` is
+always on; `parallel` is **not** enabled — these are single-threaded numbers)
+**Python:** PyTorch 2.x
+
+### Which numbers are how old
+
+Every table below is labelled. Read the label before you quote the number.
+
+| Section | Last measured | Note |
+|---|---|---|
+| [Baked (int8)](#baked-int8-inference) | **2026-07-26** | Re-measured after the order-4/5 basis fix |
+| CPU forward / train / latency / scaling | 2026-06-27 | `cargo bench --bench forward --bench backward` |
+| GPU forward | 2026-06-27 | `gpu_forward` bench with `ARKAN_GPU_BENCH=1` |
+| GPU train step (hybrid, native, options) | **not re-measured** | Predates 2026-06-27; `gpu_backward` was not run |
+| PyTorch CPU comparison | 2026-06-27 | Some entries are *extrapolated*, marked "(est.)" |
+| PyTorch GPU comparison | 2026-06-27 | Config mismatch, see that section |
+
+> **Void:** any baked accuracy figure for **spline order 4 or 5** published
+> before commit `576fbc7` (2026-07-26) was measured on a numerically wrong
+> fixed-point basis — max absolute basis error 0.208 (order 4) and 0.775
+> (order 5), end-to-end NRMSE 13.98% and 89.30%. Those numbers are not
+> conservative, they are meaningless. The tables in this file are post-fix.
 
 ---
 
@@ -22,7 +41,9 @@
 | **vs FastKAN GPU** | **FastKAN wins** (RBF not B-splines — different math) |
 | **Memory footprint** | 218.6 KB (weights only) |
 | **Zero-allocation training** | Full train step without allocs |
-| **Native GPU training (batch=64)** | **3.96 ms** (see GPU section) |
+| **Native GPU training (batch=64)** | **3.96 ms** (see GPU section; not re-measured) |
+| **Baked (int8) vs f32 at batch=1** | **1.4–2.1x SLOWER** — the win is size (2.2–3.0x), not speed |
+| **Baked worst-case error at ≥1σ** | **34–54%** on a 2-hidden net — ranking/argmax only |
 
 ---
 
@@ -59,7 +80,7 @@
 
 ### GPU Train Step — Hybrid mode (Adam optimizer)
 
-> **Note:** These figures are from the *hybrid* `train_step_mse` path (forward on GPU, backward + optimizer on CPU with weight sync). Criterion group: `gpu_train_step_adam`. **Numbers not re-measured in 2026-06-27 run** (gpu_backward bench not run; the gpu_forward bench does not cover train step). See tasks/02-reference-parity-and-benchmarks/results/comparison.md for context.
+> **Note:** These figures are from the *hybrid* `train_step_mse` path (forward on GPU, backward + optimizer on CPU with weight sync). Criterion group: `gpu_train_step_adam`. **Numbers not re-measured in 2026-06-27 run** (gpu_backward bench not run; the gpu_forward bench does not cover train step).
 
 | Batch | Time | Throughput |
 |-------|------|------------|
@@ -337,7 +358,10 @@ Critical for MCTS/CFR solvers where thousands of single inferences per second ar
 > and `scripts/bench_competitors.py` (median of 50 repeats, 10 warmup).  
 > **Config:** ArKan poker preset `[21, 64, 64, 24]`, grid=5, order=3.  
 > **Baseline:** "faithful-PyTorch" = pure B-spline without residual term (same math as ArKan).  
-> **Caveat:** efficient-kan adds SiLU base residual (different formulation). FastKAN uses RBF (different math entirely). See `tasks/02-reference-parity-and-benchmarks/results/comparison.md` for full breakdown.
+> **Estimates:** the faithful-PyTorch column at `[21,64,64,24]` is **extrapolated**
+> from measured `[16,64,64,8]` numbers, not measured at this shape. Rows carrying
+> "(est.)" are therefore an approximation, and the speedup ratios inherit that.  
+> **Caveat:** efficient-kan adds SiLU base residual (different formulation). FastKAN uses RBF (different math entirely). Neither is an apples-to-apples comparison; see the per-implementation notes in each table.
 
 ### Forward Pass (Inference) — ArKan CPU vs faithful-PyTorch (same math)
 
@@ -501,7 +525,7 @@ The crossover point where GPU becomes faster than CPU depends on batch size:
 
 ### GPU vs PyTorch GPU Comparison
 
-**Re-measured 2026-06-27.** See `tasks/02-reference-parity-and-benchmarks/results/comparison.md` for full methodology and config notes. ArKan GPU uses wgpu/Vulkan, NOT CUDA. Python competitors use PyTorch CUDA. Config mismatch: Python benches use [16,64,64,8]; ArKan GPU uses [21,64,64,24] (slightly larger).
+**Re-measured 2026-06-27** via `scripts/bench_pytorch_gpu.py` (median of 50 repeats, 10 warmup). ArKan GPU uses wgpu/Vulkan, NOT CUDA. Python competitors use PyTorch CUDA. Config mismatch: Python benches use [16,64,64,8]; ArKan GPU uses [21,64,64,24] (slightly larger).
 
 | Implementation | Forward batch=64 | Forward batch=256 | Forward batch=1024 | Math | Notes |
 |----------------|-----------------|------------------|--------------------|------|-------|
@@ -567,11 +591,12 @@ cargo bench --bench spline_config # Groups: spline_order_batch64, grid_size_batc
 cargo bench --bench memory        # Memory bandwidth analysis
 cargo bench --bench optimizer     # Groups: raw_train_step, train_options_batch64, optimizer_init, learning_rates_batch64
 cargo bench --bench latency       # Groups: single_sample_latency, latency_distribution
+cargo bench --bench baked         # Groups: baked_batch1_small, baked_batch1_medium
 
 # Optional feature flags for CPU benches
-cargo bench --features simd       # Enable AVX2 SIMD paths
+# NOTE: there is no `simd` feature. SIMD via `wide` is unconditional; passing
+# `--features simd` was a no-op before 0.4.0 and is now a hard error.
 cargo bench --features parallel   # Enable Rayon parallel paths
-cargo bench --features simd,parallel  # Both
 
 # GPU benchmarks (require gpu feature + ARKAN_GPU_BENCH=1 env var; skipped silently otherwise)
 # Windows PowerShell:
@@ -613,67 +638,89 @@ cargo bench --bench forward -- --noplot              # Quick CPU benchmark
 
 ## Baked (int8) Inference
 
-> **Date:** 2026-06-27
-> **Measured by:** `cargo test --test baked_parity -- --nocapture` and `cargo bench --bench baked`
-> **Method:** Random KanNetwork (untrained, random weights), baked with 256 calibration inputs
-> in `[-0.9, 0.9]`, tested against 2000 inputs in the same range. Test is against the same
-> `KanNetwork::forward_single` f32 baseline. All numbers are on debug/release builds of
-> the same platform (Windows 11, AMD Ryzen with AVX2).
+> **Date:** 2026-07-26 (re-measured after the order-4/5 basis fix, `576fbc7`)
+> **Measured by:** `cargo test --release --test baked_parity -- --nocapture` and `cargo bench --bench baked`
+> **Method:** Random KanNetwork (untrained, random weights), `grid_range = (-1, 1)`,
+> baked with 256 calibration inputs in `[-0.9, 0.9]`, tested against 2000 inputs in the
+> same range, against the `KanNetwork::forward_single` f32 baseline.
 > **Source files:** `tests/baked_parity.rs`, `benches/baked.rs`
+>
+> **Any order-4 or order-5 baked figure published before `576fbc7` is void.** The
+> fixed-point basis was numerically wrong at those orders — max absolute basis error
+> 0.208 (order 4) and 0.775 (order 5), end-to-end NRMSE 13.98% and 89.30%. Orders 2 and
+> 3 were unaffected and are bit-identical across that fix.
+
+### What baked is for
+
+Ranking, argmax and classification. **Not** per-output absolute accuracy, and
+**not** latency. Both of those are measured below and both are bad news; read
+them before choosing this path.
 
 ### Accuracy
 
-The int8 quantized path uses fixed-point i64 accumulators, i8 weights (quantized
-**per output channel** since WS02), and u16 B-spline basis values (Q0.15). Two metrics:
+The int8 path uses i64 accumulators, per-output-channel i8 weights
+(`s_w[j] = 127 / max|w[j,*,*]|`) and u16 B-spline basis values (Q0.15). Two
+metrics, because one of them hides the problem:
 
-- **NRMSE** (aggregate): `||baked - f32||₂ / ||f32||₂` over all outputs × 2000 test inputs.
-  This is the standard quantization quality metric.
-- **Worst-case on significant outputs**: `max per-element |baked - f32| / |f32|` restricted
-  to output values where `|f32| > 0.1 × σ_j` (per-output std over the test set). This
-  metric is NOT gated — it reveals the real tail that the NRMSE aggregate conceals.
+- **NRMSE** (aggregate): `||baked - f32||₂ / ||f32||₂` over all outputs × 2000 test
+  inputs. The standard quantization quality metric — and flattering here.
+- **Worst-case on significant outputs**: `max per-element |baked - f32| / |f32|`
+  restricted to outputs where `|f32| > τ · σ_j` (per-output std over the test
+  set). This is the number that decides whether you can use baked.
 
-#### Post-WS01 (i32 inter-layer activations + 99.9th-percentile calibration)
+#### Per-config, order 3
 
-| Config | Architecture | NRMSE | Worst-case (significant outputs) |
-|--------|-------------|-------|----------------------------------|
-| small (1-hidden) | 4→[8]→2 | 0.74% | 8.8% |
-| medium (2-hidden) | 8→[16,8]→4 | 1.40% | **120%** |
-| single-layer | 4→2 | — | — |
+| Config | Architecture | NRMSE | worst @0.1σ | @0.5σ | @1.0σ |
+|--------|-------------|-------|-------------|-------|-------|
+| single-layer | 4→2 | **0.60%** | 9.2% | 8.3% | 8.3% |
+| small (1-hidden) | 4→[8]→2 | **0.64%** | 8.7% | 8.7% | 8.7% |
+| medium (2-hidden) | 8→[16,8]→4 | **1.29%** | 114.7% | 27.1% | 18.7% |
 
-#### Post-WS02 (per-output-channel weight scales — current)
+Shallow nets are genuinely fine. The 2-hidden config is where the tail appears.
 
-Each output channel j gets its own weight scale `s_w[j] = 127 / max|w[j,*,*]|`, with
-matching per-channel requant multipliers M0[j]/shift[j] and biases folded with `s_w[j]`.
+#### All orders, 2-hidden (`baked_parity_all_orders`, 8→[16,8]→4, seed 4242)
 
-| Config | Architecture | NRMSE | Gate | Pass? | Worst-case (significant outputs) |
-|--------|-------------|-------|------|-------|----------------------------------|
-| small (1-hidden) | 4→[8]→2, grid=5, order=3 | **0.64%** | ≤5% | PASS | 8.70% |
-| medium (2-hidden) | 8→[16,8]→4, grid=5, order=3 | **1.29%** | ≤10% | PASS | **114.72%** |
-| single-layer | 4→2, grid=5, order=3 | **0.60%** | ≤5% | PASS | 9.20% |
+| Order | NRMSE | worst @0.1σ | @0.5σ | @1.0σ |
+|-------|-------|-------------|-------|-------|
+| 2 | 2.65% | 474.5% | 62.3% | **34.6%** |
+| 3 | 1.71% | 53.9% | 53.9% | **53.9%** |
+| 4 | 2.26% | 149.5% | 63.1% | **50.0%** |
+| 5 | 2.28% | 326.1% | 78.3% | **35.1%** |
 
-**Worst-case by significance threshold (the 115% is a metric artifact):**
+**Read the last column.** Aggregate NRMSE on a 2-hidden net is 1.7–2.7%, which
+looks excellent. The worst-case error on *decision-relevant* outputs — those at
+or above one standard deviation, the ones a caller would actually act on — is
+**34.6–53.9%**. That is not a metric artifact and it does not live only on
+near-zero outputs.
 
-The "115%" worst-case uses a 0.1σ significance cut, i.e. it includes bottom-decile-magnitude
-outputs. Measuring the worst-case at higher (decision-relevant) thresholds shows the tail is
-entirely on near-noise outputs:
+At the 0.1σ cut the figure blows up past 100% because a few-LSB absolute error
+divided by a near-noise reference explodes; that part *is* an artifact. The ≥1σ
+column is not.
 
-| Config | worst-case @0.1σ | @0.5σ | @1.0σ |
-|--------|------------------|-------|-------|
-| single-layer 4→2 | 9.2% | 8.3% | 8.3% |
-| small 1-hidden | 8.7% | 8.7% | 8.7% |
-| medium 2-hidden | **114.7%** | **27.1%** | **18.7%** |
+**So: baked reliably preserves the ordering of outputs, and does not preserve
+their values.** Use it where you take an argmax or a top-k. Do not use it where
+a caller reads an individual output as a quantity.
 
-For the 2-hidden net the catastrophic figure collapses from 115% (0.1σ) to ~19% (≥1σ). The
-large relative errors live exclusively on outputs in the bottom decile of magnitude — where a
-few-LSB absolute error divided by a near-zero reference explodes. On decision-relevant outputs
-(≥1σ) the worst-case is ~9% (shallow) to ~19% (2-hidden), with NRMSE ~0.6–1.3%.
+#### Two identified causes, both unfixed
 
-**Conclusion:** The baked int8 path (i32 activations + percentile calibration + per-channel
-weights) is suitable for ranking/argmax/selection and approximate values — exactly the poker
-action-distribution use — where the accurate large outputs are what matter. It is NOT suited
-to exact values of near-zero (sub-decile) outputs; that is an inherent int8 floor and usually
-irrelevant. Closing even that tail would need per-channel activation scales (large forward
-complexity) or int16 weights (halves the size win) — out of scope unless a use case demands it.
+1. **`ACT_CLAMP` is applied to the output layer.** Activations are clamped to
+   ±2^28 (`src/baked.rs:812`) at every layer including the last, and the exit
+   scale is `s_act_last = 2^28 / p99.9`. The clamp is therefore a hard ceiling
+   at the calibration set's 99.9th percentile: `|output[j]| <= p99.9`, always.
+   Measured on the fixture above, with calibration and evaluation drawn from the
+   *same* distribution, the ceiling truncates 0.08–0.36% of outputs, costing up
+   to 7.2% relative error on each one and 0.07–0.37% NRMSE overall. That cost is
+   bounded only by how far live inputs push the model past its calibration set —
+   and there is no mechanism by which a larger magnitude can ever be returned.
+2. **`norm_a_fixed` carries about 3 bits.** The inter-layer normalization
+   constant is `A_FIXED[i] = round(2^32 / (s_act_prev · std_i))`, which on these
+   fixtures lands on the integers **5 to 10**. Rounding an integer that small is
+   a systematic **2.6–6.7%** scale error, applied at every inter-layer hop. This
+   is the most likely origin of the ≥1σ tail, and it is why a 2-hidden net is so
+   much worse than a 1-hidden one.
+
+Closing the tail means fixing those two, not adding int16 weights (which would
+halve the size win).
 
 ### Model Size (compression)
 
@@ -689,38 +736,82 @@ The compression comes from replacing f32 weights (4 bytes each) with i8 (1 byte 
 plus storing i64 biases and int32 normalization constants. For larger networks the ratio
 will approach 4× as bias/metadata overhead becomes relatively smaller.
 
+**This is the only thing baking currently buys you.**
+
 ### Batch=1 Latency (deployment scenario)
 
-All times are Criterion medians (100 samples, 3 s warmup), `--release` build,
-no `simd` or `parallel` features.
+Criterion medians (100 samples, 3 s warmup), `--release`, default features.
+**Re-measured 2026-07-26.**
 
 | Config | f32 `forward_single` | baked `forward` | Baked vs f32 |
 |--------|----------------------|-----------------|--------------|
-| small 4→[8]→2 | **578 ns** | 735 ns | **1.27× SLOWER** |
-| medium 8→[16,8]→4 | **1.80 µs** | 4.73 µs | **2.63× SLOWER** |
+| small 4→[8]→2 | **422 ns** | 578 ns | **1.37× SLOWER** |
+| medium 8→[16,8]→4 | **1.346 µs** | 2.885 µs | **2.14× SLOWER** |
 
-**Baked int8 is slower than f32 at batch=1.** This is expected: the current implementation
-uses scalar i64 arithmetic in the hot path. Modern CPUs have native f32 SIMD lanes optimized
-by the compiler (auto-vectorization) whereas the fixed-point integer path involves i64
-multiply-accumulate and i128 requantization steps that do not vectorize as well without
-explicit SIMD intrinsics.
+An earlier run on the same machine recorded 578 ns / 735 ns (1.27×) and
+1.80 µs / 4.73 µs (2.63×); spikes across a wider set of shapes span roughly
+1.3–2.6× slower. The absolute numbers move with machine load, the direction
+does not.
 
-The latency penalty grows with network depth (2.63× for the 3-layer config vs 1.27× for
-the 2-layer) because inter-layer fixed-point normalization adds overhead that compounds.
+**Baked int8 is slower than f32 at batch=1, on every shape measured so far.**
+The penalty grows with depth, because inter-layer fixed-point normalization
+compounds.
 
-**The current win from baking is purely model size (2.5-3.2×), not inference speed.**
-SIMD-optimized int8 kernels (analogous to ARM NEON `vdot` or x86 `_mm256_madd_epi16`)
-are a planned future epic and would likely bring baked latency below f32 at batch=1.
+**The current win from baking is model size (2.2–3.0×), not inference speed.**
+Do not adopt `BakedModel` expecting a latency improvement — today there is none
+to have.
+
+#### The faster design exists, is measured, and is not implemented
+
+Three competing spikes settled the question, and the answer is **not SIMD**:
+
+- Hand-written AVX2 and plain scalar relayout landed in a dead heat
+  (medium 1466.0 vs 1443.9 ns), with the scalar build's AVX2 *disabled*. LLVM
+  auto-vectorizes a unit-stride scalar loop on bare SSE2 as well as intrinsics do.
+- Explicit `wide::i32x8` was **slower** (0.70–0.82×): `wide` 0.7 gates
+  `i32x4::Mul` on `sse4.1`, so without it the "SIMD" path degrades to four
+  scalar `wrapping_mul`.
+- Batch tiling got *worse* with batch size. There is no throughput story.
+
+The actual cost is structural: `forward` evaluates the span and the basis inside
+the output loop — `in_dim × out_dim` times instead of `in_dim` — including two
+runtime i64 divisions by `h_q16`. Hoisting that recovers roughly parity with
+f32; changing the weight layout to output-innermost (`[in, basis, out]`, giving
+a unit-stride inner loop) is what converts parity into a win. Measured in the
+spikes at roughly **1.5–2.8× faster than f32** depending on shape.
+
+That is about 120 lines, no new dependency, no `unsafe`, no runtime dispatch —
+and it is **not in this release**. Nothing in the shipped `BakedModel` is fast.
 
 ### How to reproduce
 
 ```bash
-# Accuracy (NRMSE + worst-case on significant outputs)
-cargo test --test baked_parity -- --nocapture
+# Accuracy (NRMSE + worst-case on significant outputs, all orders 2..=5)
+cargo test --release --test baked_parity -- --nocapture
 
 # Latency + size
 cargo bench --bench baked
 ```
+
+### Related: what the grid range does to a network
+
+Not a baked issue, but it lands in the same place — silently wrong numbers.
+`grid_range` is shared by every layer while only layer 0 receives
+`input_mean` / `input_std`, so a hidden layer's input is the previous layer's
+raw activation clamped to the range you picked for the *inputs*. Measured on
+the 256 → [64, 32] → 4 shape (`cargo test --test hidden_layer_saturation --
+--nocapture`):
+
+| `grid_range` | layer 0 saturated | layer 1 | layer 2 |
+|---|---|---|---|
+| `(0.0, 1.0)` | 0% | **43.6%** | **48.9%** |
+| `(-1.0, 1.0)` | 0% | 0% | 0% |
+| `(-3.0, 3.0)` | 0% | 0% | 0% |
+
+A saturated input has zero derivative, so nearly half of each hidden layer
+emits a constant and receives no gradient. Nothing reports this — there is no
+`out_of_grid_fraction` and no drift warning. See
+[ARCHITECTURE.md](ARCHITECTURE.md#design-constraints).
 
 ---
 
@@ -729,10 +820,12 @@ cargo bench --bench baked
 - **OS:** Windows 11
 - **CPU:** AMD Ryzen (with AVX2 support)
 - **GPU:** NVIDIA GeForce RTX 4070 SUPER
-- **Rust:** stable (AVX2 SIMD via `simd` feature, Rayon via `parallel` feature)
+- **Rust:** stable, release profile. SIMD via `wide` is unconditional; unless a
+  table says otherwise, `parallel` was **not** enabled and the CPU numbers are
+  single-threaded.
 - **Python:** 3.12 with PyTorch (CPU and CUDA)
 - **GPU Backend:** wgpu 0.23 (Vulkan)
 
 ---
 
-*Generated by ArKan benchmark suite v0.3.0*
+*ArKan benchmark suite, v0.4.0*
