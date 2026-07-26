@@ -126,6 +126,19 @@ speed.
   degeneracy. Worst per-channel error against an independent `f64` Cox-de Boor on
   the previously-broken grids is now 1e-7, the same as the ordinary ranges.
   Nothing changes on a grid that already worked.
+- **At `spline_order = 1`, `grad_input` had the wrong sign for inputs landing one
+  ULP below a knot.** `find_span` deliberately snaps `x` to the interval starting
+  at the next knot when the `f32` ratio `(x - t_min) / h` rounds up to an integer,
+  and `compute_basis` follows the span. `compute_basis_and_deriv` built its
+  order-0 term by comparing `x` against the knots instead, so in that
+  one-ULP-wide sliver it used the *previous* interval. At order 2 and up the
+  pieces meet C^1 and both answers agree to `O(ULP/h)`; at order 1 the order-0
+  term is the whole answer, so the forward pass moved with slope `(w1 - w0)/h`
+  while backward reported `+w0/h` and `sum_i B'_i` came out as `1/h` instead of
+  0. Measured at `grid_range = (-5, 5)`, `grid_size = 63`, `x = 3.253968`. The
+  order-0 term is now derived from `span`, which is both the textbook de Boor
+  initialization and 31 lines shorter than the indicator loop and right-endpoint
+  special case it replaces. Nothing changes outside the sliver.
 - **`KanConfig::validate` accepted a grid whose knots collide in `f32`.**
   `grid_range = (1e6, 1e6 + 1.0)` with `grid_size = 64` asks for a spacing of
   1.5625e-2 where the ULP at 1e6 is 0.0625, so consecutive knots are literally
