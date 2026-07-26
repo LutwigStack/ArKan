@@ -185,9 +185,78 @@ fn optimizer_step_is_allocation_free() {
 /// sections each observed the *sum* of all threads' allocations and reported identical
 /// bogus totals (228 allocations / 550240 bytes each). Sequencing them inside one test
 /// is the fix that does not depend on remembering `--test-threads=1`.
+/// `create_workspace(n)` must allocate for `n`, not for `multithreading_threshold`.
+///
+/// `Workspace::new` used to pre-reserve `config.multithreading_threshold` rows -
+/// a field documented as consulted only with the `parallel` feature - so a caller
+/// asking for a batch-1 workspace on the latency path got the default 128 rows of
+/// buffers, tunable only through a knob named after multithreading. Measured in
+/// bytes rather than asserted structurally, because the point is the memory.
+fn workspace_size_ignores_the_multithreading_threshold() {
+    let mut per_threshold = Vec::new();
+    for threshold in [1usize, 8, 128, 1 << 20] {
+        let config = KanConfig {
+            input_dim: 784,
+            output_dim: 10,
+            hidden_dims: vec![64, 32],
+            grid_size: 12,
+            spline_order: 3,
+            grid_range: (-3.0, 3.0),
+            input_mean: vec![0.0; 784],
+            input_std: vec![1.0; 784],
+            multithreading_threshold: threshold,
+            simd_width: 8,
+            init_seed: Some(1),
+        };
+        let network = KanNetwork::new(config);
+
+        let mut ws = None;
+        let (_, bytes) = measure(|| ws = Some(network.create_workspace(1)));
+        assert_eq!(ws.expect("workspace").batch_capacity(), 1);
+        println!("threshold={threshold}: create_workspace(1) allocated {bytes} bytes");
+        per_threshold.push(bytes);
+    }
+
+    assert!(
+        per_threshold.windows(2).all(|w| w[0] == w[1]),
+        "a batch-1 workspace must cost the same at every multithreading_threshold, \
+         got {per_threshold:?} for thresholds [1, 8, 128, 1<<20]"
+    );
+}
+
+/// The `# Errors` contract of `try_create_workspace` has to hold for a config that
+/// `validate` accepts. It used to panic out of the `Result` instead, because the
+/// infallible `Workspace::new` reserved `multithreading_threshold` rows *before*
+/// the `try_reserve` that would have reported the overflow.
+fn try_create_workspace_does_not_panic_on_a_valid_config() {
+    let config = KanConfig {
+        input_dim: 784,
+        output_dim: 10,
+        hidden_dims: vec![64, 32],
+        grid_size: 12,
+        spline_order: 3,
+        grid_range: (-3.0, 3.0),
+        input_mean: vec![0.0; 784],
+        input_std: vec![1.0; 784],
+        // The natural way to write "never take the parallel branch".
+        multithreading_threshold: 1 << 30,
+        simd_width: 8,
+        init_seed: Some(1),
+    };
+    assert!(config.validate().is_ok(), "config must be accepted");
+
+    let network = KanNetwork::new(config);
+    let ws = network
+        .try_create_workspace(32)
+        .expect("a batch-32 workspace fits regardless of multithreading_threshold");
+    assert_eq!(ws.batch_capacity(), 32);
+}
+
 #[test]
 fn allocation_budget() {
     inference_is_allocation_free();
     train_step_is_allocation_free();
     optimizer_step_is_allocation_free();
+    workspace_size_ignores_the_multithreading_threshold();
+    try_create_workspace_does_not_panic_on_a_valid_config();
 }

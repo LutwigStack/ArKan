@@ -784,9 +784,27 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// Creates a new workspace for the given config.
+    /// Creates a new workspace for the given config, with no batch capacity yet.
+    ///
+    /// Call [`reserve`](Self::reserve) - or go through
+    /// [`KanNetwork::create_workspace`](crate::KanNetwork::create_workspace), which
+    /// does it for you - to size it for a batch. The forward and training paths
+    /// also reserve on demand, so the only cost of skipping it is one allocation on
+    /// the first call.
+    ///
+    /// This used to pre-reserve `config.multithreading_threshold` rows, which was
+    /// wrong twice over. That field is documented as consulted only with the
+    /// `parallel` feature, yet it sized every workspace on every build; and it is
+    /// caller-controlled and unbounded, so `multithreading_threshold = 1 << 30` -
+    /// the natural way to say "never go parallel" - made `try_create_workspace`
+    /// *panic* out of a `Result`-returning function before its own `try_reserve`
+    /// could report the overflow. At the default of 128 it silently gave a
+    /// `create_workspace(1)` caller 128 rows of buffers.
     pub fn new(config: &KanConfig) -> Self {
-        let mut ws = Self {
+        // Nothing here is sized from the config any more. The parameter stays for
+        // API compatibility, and because every `reserve` call needs the same one.
+        let _ = config;
+        Self {
             z_buffer: AlignedBuffer::new(),
             basis_values: AlignedBuffer::new(),
             basis_derivs: AlignedBuffer::new(),
@@ -804,11 +822,7 @@ impl Workspace {
             batch_capacity: 0,
             max_dim: 0,
             history_batch_size: 0,
-        };
-
-        // Pre-allocate for typical batch size
-        ws.reserve(config.multithreading_threshold, config);
-        ws
+        }
     }
 
     /// Ensures workspace has capacity for the given batch size (fallible version).
@@ -1320,8 +1334,9 @@ mod tests {
         let config = KanConfig::preset();
         let mut ws = Workspace::new(&config);
 
-        // Initial capacity
-        assert!(ws.batch_capacity() >= config.multithreading_threshold);
+        // A fresh workspace holds no batch capacity. It used to pre-reserve
+        // `multithreading_threshold` rows - see `Workspace::new`.
+        assert_eq!(ws.batch_capacity(), 0);
 
         // Reserve more
         ws.reserve(1024, &config);
