@@ -773,7 +773,7 @@ fn test_batch_position_invariance() {
     let mut ws = network.create_workspace(batch_size);
 
     // Create batch where sample at position 0 and position 5 are identical
-    let test_sample = vec![0.1, 0.2, 0.3, 0.4];
+    let test_sample = [0.1, 0.2, 0.3, 0.4];
     let mut batch_input = vec![0.0f32; batch_size * config.input_dim];
 
     // Fill with random data
@@ -782,18 +782,18 @@ fn test_batch_position_invariance() {
     }
 
     // Place identical samples at positions 0 and 5
-    for (i, &val) in test_sample.iter().enumerate() {
-        batch_input[0 * config.input_dim + i] = val;
-        batch_input[5 * config.input_dim + i] = val;
+    for sample in [0, 5] {
+        let base = sample * config.input_dim;
+        batch_input[base..base + config.input_dim].copy_from_slice(&test_sample);
     }
 
     let mut output = vec![0.0f32; batch_size * config.output_dim];
     network.forward_batch(&batch_input, &mut output, &mut ws);
 
     // Compare outputs at position 0 and 5
-    for i in 0..config.output_dim {
-        let out0 = output[0 * config.output_dim + i];
-        let out5 = output[5 * config.output_dim + i];
+    let sample_0 = &output[..config.output_dim];
+    let sample_5 = &output[5 * config.output_dim..6 * config.output_dim];
+    for (i, (&out0, &out5)) in sample_0.iter().zip(sample_5).enumerate() {
         let diff = (out0 - out5).abs();
         assert!(
             diff < 1e-6,
