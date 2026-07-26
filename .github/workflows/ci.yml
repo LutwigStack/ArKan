@@ -111,20 +111,40 @@ jobs:
   # MSRV. Measured, not guessed: 1.72 fails on our own div_ceil
   # (int_roundings, stable since 1.73) at src/config.rs:287; 1.73 builds.
   #
-  # Scope is `--lib` with default features and with serde, which is exactly what
-  # rust-version in Cargo.toml claims. It cannot be more: dev-dependencies need
-  # 1.81 (half, via criterion) so tests will not build here, `parallel` needs
-  # 1.80 (rayon-core) and `gpu` needs 1.85 (indexmap, via wgpu 23 -> naga).
-  # Those two floors are documented in the README MSRV table.
+  # Scope is `--lib` throughout: dev-dependencies need 1.81 (half, via criterion),
+  # so tests cannot build on the 1.73 floor. One matrix row per row of the README's
+  # MSRV table -- 1.73 (default + serde), 1.80 (parallel, floor set by rayon-core),
+  # 1.85 (gpu, floor set by indexmap via wgpu 23 -> naga). Checking only the lowest
+  # would leave the other two claims undefended, and with no committed Cargo.lock
+  # they drift on their own as dependencies release new minimums.
   # ==========================================================================
   msrv:
-    name: msrv (1.73)
+    name: msrv ${{ matrix.toolchain }} (${{ matrix.label }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each row pins one row of the README's MSRV table. Without all three,
+          # only the default floor is defended and the other two drift silently --
+          # there is no committed Cargo.lock to hold dependencies still.
+          - toolchain: 1.73.0
+            label: default+serde
+            check: --lib --no-default-features
+            check2: --lib --features serde
+          - toolchain: 1.80.0
+            label: parallel
+            check: --lib --features parallel
+            check2: ""
+          - toolchain: 1.85.0
+            label: gpu
+            check: --lib --features gpu
+            check2: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.73.0
+          toolchain: ${{ matrix.toolchain }}
       - uses: actions/cache@v4
         with:
           path: |
@@ -132,11 +152,12 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-msrv173-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-msrv${{ matrix.toolchain }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-msrv173-
-      - run: cargo check --lib --no-default-features
-      - run: cargo check --lib --features serde
+            ${{ runner.os }}-cargo-msrv${{ matrix.toolchain }}-
+      - run: cargo check ${{ matrix.check }}
+      - if: matrix.check2 != ''
+        run: cargo check ${{ matrix.check2 }}
 
   # ==========================================================================
   # Publish-time packaging. `cargo package` also runs a verification build of
