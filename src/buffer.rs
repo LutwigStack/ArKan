@@ -977,11 +977,19 @@ impl Workspace {
         self.basis_derivs.reserve(deriv_size);
         self.basis_derivs.resize(deriv_size);
 
-        // Training ping-pong buffers
+        // Training ping-pong buffers.
+        //
+        // `predictions_buffer` is deliberately NOT sized here. Its only consumer,
+        // `KanNetwork::try_forward_backward_mse`, sizes it itself and then
+        // `std::mem::take`s it to dodge a borrow conflict before calling into the
+        // forward pass — which lands here. Re-reserving it at that point allocates a
+        // fresh buffer for the field the caller just emptied, and the caller then
+        // overwrites it with the original on the way out, throwing the new one away.
+        // That was one heap allocation on every single training step, which is what
+        // the "zero-allocation training" claim tripped over. Pinned by
+        // tests/allocation_budget.rs.
         let output_dim = config.output_dim;
         let output_size = checked_buffer_size(batch_size, output_dim)?;
-        self.predictions_buffer.reserve(output_size);
-        self.predictions_buffer.resize(output_size);
 
         self.grad_output.reserve(output_size);
         self.grad_output.resize(output_size);
@@ -998,7 +1006,10 @@ impl Workspace {
     /// - `layers_grid_indices`: one vec per layer for saved spline indices
     /// - `layer_grads`, `staging_buffer`: ping-pong gradient buffers
     /// - `basis_derivs`: B-spline derivative values
-    /// - `predictions_buffer`, `grad_output`: loss computation buffers
+    /// - `grad_output`: loss gradient buffer
+    ///
+    /// Note: `predictions_buffer` is NOT sized here — its consumer sizes and owns it.
+    /// See the comment at the call site below.
     ///
     /// # Zero-Allocation Guarantee
     ///

@@ -38,6 +38,8 @@
 //! Weight decay is implemented as decoupled weight decay (AdamW style),
 //! not L2 regularization. This provides better generalization.
 
+use std::borrow::Cow;
+
 use crate::buffer::AlignedBuffer;
 use crate::error::{ArkanError, ArkanResult};
 use crate::layer::KanLayer;
@@ -319,22 +321,29 @@ fn find_nan_in_grads(grads: &[f32]) -> Option<usize> {
 /// Applies gradient scaling for AMP.
 ///
 /// Returns scaled gradients if scaling factor is set, otherwise clones input.
-fn apply_grad_scaling(grads: &[f32], scaling_factor: Option<f64>) -> Vec<f32> {
+/// Returns `Cow::Borrowed` when no scaling is configured, so the common path copies
+/// nothing. Previously this returned `Vec` unconditionally, and `None => grads.to_vec()`
+/// meant a full clone of every gradient tensor on every step for the default config.
+fn apply_grad_scaling(grads: &[f32], scaling_factor: Option<f64>) -> Cow<'_, [f32]> {
     match scaling_factor {
         Some(factor) => {
             let inv_factor = 1.0 / factor as f32;
-            grads.iter().map(|&g| g * inv_factor).collect()
+            Cow::Owned(grads.iter().map(|&g| g * inv_factor).collect())
         }
-        None => grads.to_vec(),
+        None => Cow::Borrowed(grads),
     }
 }
 
 /// Applies gradient clipping and returns clipped gradients.
-fn clip_gradients(
-    weight_grads: &[f32],
-    bias_grads: &[f32],
+/// Borrows when no clipping applies — which includes the whole
+/// `train_step_with_optimizer` path, where clipping has already been done in place and
+/// `None` is passed to avoid double-clipping. Returning `Vec` there meant copying every
+/// gradient tensor twice per layer per step for nothing.
+fn clip_gradients<'a>(
+    weight_grads: &'a [f32],
+    bias_grads: &'a [f32],
     max_norm: Option<f32>,
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Cow<'a, [f32]>, Cow<'a, [f32]>) {
     if let Some(max_norm) = max_norm {
         let mut sq: f32 = weight_grads.iter().map(|g| g * g).sum();
         sq += bias_grads.iter().map(|g| g * g).sum::<f32>();
@@ -344,10 +353,10 @@ fn clip_gradients(
             let scale = max_norm / norm;
             let wg: Vec<f32> = weight_grads.iter().map(|g| g * scale).collect();
             let bg: Vec<f32> = bias_grads.iter().map(|g| g * scale).collect();
-            return (wg, bg);
+            return (Cow::Owned(wg), Cow::Owned(bg));
         }
     }
-    (weight_grads.to_vec(), bias_grads.to_vec())
+    (Cow::Borrowed(weight_grads), Cow::Borrowed(bias_grads))
 }
 
 /// Adam optimizer state for a single parameter tensor.
