@@ -326,7 +326,9 @@ impl KanConfig {
     /// - `spline_order` not in 1..=[`MAX_SPLINE_ORDER`]
     ///   - Note: `spline_order = 1` is valid but produces a degenerate step function,
     ///     not a smooth spline. Consider `spline_order >= 2` for smooth approximation.
-    /// - `grid_range.0 >= grid_range.1`
+    /// - `grid_range.0 >= grid_range.1`, or a `grid_range`/`grid_size` pair whose knot
+    ///   spacing is not representable in `f32` at that magnitude (e.g. `(1e6, 1e6 + 1.0)`
+    ///   with `grid_size = 64`: consecutive knots collide and the basis collapses)
     /// - Normalization arrays don't match `input_dim`
     /// - Any `input_std[i] <= 0` (callers wanting EPSILON clamping must apply it before validation)
     /// - `simd_width` is not 4, 8, or 16
@@ -363,6 +365,19 @@ impl KanConfig {
             return Err(ConfigError::InvalidSplineOrder(self.spline_order));
         }
         if self.grid_range.0 >= self.grid_range.1 {
+            return Err(ConfigError::InvalidGridRange);
+        }
+        // `min < max` is not enough: the knot vector also has to survive f32.
+        // `grid_range = (1e6, 1e6 + 1.0)` with `grid_size = 64` asks for a spacing of
+        // 1.5625e-2 where the f32 ULP at 1e6 is 0.0625, so consecutive knots round to
+        // the same value, every Cox-de Boor denominator is zero, and the layer silently
+        // degenerates into its bias with no gradient anywhere. Reject it here rather
+        // than let the hot loop paper over it.
+        // `all` rather than `any(<=)` so a NaN endpoint - which slips past the
+        // comparison above - is rejected here too.
+        let knots =
+            crate::spline::compute_knots(self.grid_size, self.spline_order, self.grid_range);
+        if !knots.windows(2).all(|w| w[1] > w[0]) {
             return Err(ConfigError::InvalidGridRange);
         }
         if self.input_mean.len() != self.input_dim {
@@ -458,8 +473,9 @@ pub enum ConfigError {
     #[error("Spline order must be 1-7 for CPU, 2-5 for GPU, got {0}")]
     InvalidSplineOrder(usize),
 
-    /// Grid range is invalid (min >= max).
-    #[error("Invalid grid range")]
+    /// Grid range is invalid: `min >= max`, non-finite, or so narrow relative to its
+    /// own magnitude that consecutive `f32` knots collide.
+    #[error("Invalid grid range: need min < max, and a knot spacing representable in f32")]
     InvalidGridRange,
 
     /// Normalization arrays don't match input dimension.

@@ -124,7 +124,12 @@ pub fn find_span(x: f32, knots: &[f32], order: usize, grid_size: usize) -> usize
     // Uniform grid, so we can compute span in O(1).
     let t_min = knots[order];
     let t_max = knots[order + grid_size];
-    let step = (t_max - t_min).max(EPSILON) / grid_size as f32;
+    // No `.max(EPSILON)` here. `t_max > t_min` is enforced by `KanConfig::validate`,
+    // and flooring the *width* at an absolute 1e-6 pinned every x on a narrower grid
+    // to the first interval, so `compute_basis` extrapolated instead of interpolating.
+    // A hand-built degenerate knot vector gives inf/NaN, and the clamp below still
+    // lands on a valid interval (`as isize` saturates, NaN goes to 0).
+    let step = (t_max - t_min) / grid_size as f32;
     let x_clamped = x.clamp(t_min, t_max);
 
     // Use round instead of floor to handle floating point precision issues
@@ -185,7 +190,13 @@ pub fn compute_basis(x: f32, span: usize, knots: &[f32], order: usize, basis_out
         let mut saved = 0.0f32;
         for r in 0..j {
             let denom = right[r + 1] + left[j - r];
-            let temp = if denom.abs() > EPSILON {
+            // `denom` is `knots[span+r+1] - knots[span+r+1-j]`, i.e. `j * h` on a
+            // uniform grid: it is zero only if the knots actually collided in f32.
+            // The guard used to be `> EPSILON` (1e-6, absolute), which fired for
+            // *every* denominator on a grid narrower than ~1e-5 and collapsed the
+            // whole recursion to zero - a layer that silently returns its bias and
+            // has no gradient. The test is the exact degeneracy, not a magnitude.
+            let temp = if denom > 0.0 {
                 basis_out[r] / denom
             } else {
                 0.0
@@ -269,8 +280,11 @@ pub fn compute_basis_and_deriv(
     }
 
     // Handle the right endpoint (x == knots[span+1] case)
-    // The rightmost non-zero basis should be 1 at the right boundary
-    if (x - knots[span + 1]).abs() < EPSILON {
+    // The rightmost non-zero basis should be 1 at the right boundary.
+    // Exact comparison, not `.abs() < EPSILON`: the half-open indicator above
+    // misses exactly `x == knots[span+1]` and nothing else, and on a grid
+    // narrower than EPSILON an absolute tolerance swallowed every x in range.
+    if x >= knots[span + 1] {
         for j in start_idx..=span + 1 {
             let idx = j - start_idx;
             if idx < MAX_ORDER + 2 {
@@ -325,14 +339,14 @@ pub fn compute_basis_and_deriv(
             }
 
             let denom1 = knots[j + p] - knots[j];
-            let term1 = if denom1.abs() > EPSILON {
+            let term1 = if denom1 > 0.0 {
                 (x - knots[j]) / denom1 * basis_prev[k]
             } else {
                 0.0
             };
 
             let denom2 = knots[j + p + 1] - knots[j + 1];
-            let term2 = if denom2.abs() > EPSILON && k + 1 < MAX_ORDER + 2 {
+            let term2 = if denom2 > 0.0 && k + 1 < MAX_ORDER + 2 {
                 (knots[j + p + 1] - x) / denom2 * basis_prev[k + 1]
             } else {
                 0.0
@@ -351,14 +365,14 @@ pub fn compute_basis_and_deriv(
 
         // B'_{idx,p}(x) = p * (B_{idx,p-1}(x)/(t_{idx+p} - t_idx) - B_{idx+1,p-1}(x)/(t_{idx+p+1} - t_{idx+1}))
         let denom1 = knots[idx + order] - knots[idx];
-        let term1 = if denom1.abs() > EPSILON {
+        let term1 = if denom1 > 0.0 {
             basis_prev[i] / denom1
         } else {
             0.0
         };
 
         let denom2 = knots[idx + order + 1] - knots[idx + 1];
-        let term2 = if denom2.abs() > EPSILON {
+        let term2 = if denom2 > 0.0 {
             basis_prev[i + 1] / denom2
         } else {
             0.0

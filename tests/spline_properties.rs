@@ -418,48 +418,48 @@ fn derivatives_sum_to_zero() {
 }
 
 // ===========================================================================
-// KNOT COLLAPSE - a real defect, deliberately left failing.
+// NARROW GRIDS - the absolute-EPSILON collapse, now fixed.
 // ===========================================================================
 
-/// Grid ranges whose knot spacing is not resolvable in `f32`, either absolutely
-/// (`h <= EPSILON`) or relative to the offset (`1e6 + 1.5625e-2` rounds back to
-/// `1e6`). All of these pass `KanConfig::validate`.
-const DEGENERATE_RANGES: [((f32, f32), usize); 5] = [
-    ((0.0, 5e-6), 5),       // h = 1e-6, exactly EPSILON
-    ((0.0, 1e-5), 64),      // h = 1.5625e-7
-    ((0.0, 1e-6), 5),       // h = 2e-7
-    ((1e6, 1e6 + 1.0), 64), // h = 1.5625e-2, below the f32 ULP at 1e6
-    ((1e-30, 2e-30), 5),    // h = 2e-31
+/// Grid ranges whose knot spacing `h` is at or below the old absolute `EPSILON`
+/// guard of 1e-6. All of them are perfectly representable in `f32` - `h` is many
+/// orders of magnitude above the ULP at those magnitudes - and all of them used to
+/// come back as an all-zero basis.
+///
+/// Two separate absolute-1e-6 guards were responsible, and the second one hid
+/// behind the first:
+///  - `compute_basis` skipped every Cox-de Boor denominator with
+///    `denom.abs() <= EPSILON`. On these grids that is *every* denominator, so the
+///    recursion collapsed to zero: `KanLayer::forward_*` returned exactly `bias`
+///    and every gradient through the layer was 0, with nothing reported.
+///  - `find_span` floored the grid *width* at `EPSILON` before dividing, so on the
+///    `(1e-30, 2e-30)` grid every x landed in the first interval and `compute_basis`
+///    extrapolated (per-channel values up to 2e2, still summing to 1).
+///
+/// `(1e6, 1e6 + 1.0)` at `grid_size = 64` is deliberately *not* here: there `h`
+/// really is below the f32 ULP, the knots collide, and no arithmetic fix exists.
+/// `KanConfig::validate` rejects it - see
+/// [`config_rejects_a_grid_whose_knots_collide_in_f32`].
+const NARROW_RANGES: [((f32, f32), usize); 4] = [
+    ((0.0, 5e-6), 5),    // h = 1e-6, exactly the old EPSILON
+    ((0.0, 1e-5), 64),   // h = 1.5625e-7
+    ((0.0, 1e-6), 5),    // h = 2e-7
+    ((1e-30, 2e-30), 5), // h = 2e-31
 ];
 
-/// **KNOWN BUG - `compute_basis` returns a zero (or partially zeroed) basis when
-/// the knot spacing is at or below `config::EPSILON` (1e-6) in absolute terms, or
-/// below the `f32` ULP at the grid offset.**
+/// Partition of unity on grids narrower than the old absolute guard.
 ///
-/// Cox-de Boor divides by knot differences and skips any denominator with
-/// `denom.abs() <= EPSILON` (`src/spline.rs`, inside `compute_basis`). That guard
-/// is *absolute*, so on such a grid the whole recursion collapses: partition of
-/// unity reads 0 instead of 1, `KanLayer::forward_*` returns exactly `bias` for
-/// every input, and every gradient through the layer is 0. Nothing errors -
-/// `KanConfig::validate` accepts all the ranges below, training simply never
-/// moves and the model is a constant.
-///
-/// Not fixed here, because neither available fix is small *and* clearly right:
-///  - Rejecting these grids in `validate` breaks
-///    `baked::tests::test_bake_narrow_grid_range_no_clamp_panic`, which
-///    deliberately builds a `(0.0, 5e-6)` network to pin a separate bake bug -
-///    i.e. tolerating narrow ranges was a decision, not an oversight.
-///  - Making the guard relative (`denom > 0.0`, or scaling it by the knot
-///    spacing) changes the numerics of the hottest loop in the crate and trades
-///    the silent-zero failure for a possible overflow-to-inf one.
+/// Regression pin for the collapse described on [`NARROW_RANGES`]: before the fix
+/// this reported `|sum - 1| = 1.0` exactly - the basis was all zeros - on all 24
+/// (range, order) pairs.
 #[test]
-#[ignore = "known bug: absolute EPSILON guard in compute_basis collapses narrow/offset grids"]
 fn partition_of_unity_survives_narrow_grid_ranges() {
     let mut failures = Vec::new();
-    for (gr, grid_size) in DEGENERATE_RANGES {
+    for (gr, grid_size) in NARROW_RANGES {
         for order in ORDERS {
             let knots = compute_knots(grid_size, order, gr);
             let h = (gr.1 - gr.0) / grid_size as f32;
+            assert!(h <= EPSILON, "fixture must have a sub-EPSILON knot gap");
             let mut worst = 0.0f32;
             for s in 0..=17 {
                 let x = gr.0 + (gr.1 - gr.0) * (s as f32 / 17.0);
@@ -479,31 +479,77 @@ fn partition_of_unity_survives_narrow_grid_ranges() {
     }
     assert!(
         failures.is_empty(),
-        "basis collapses on {} narrow/offset grids that KanConfig::validate accepts:\n{}",
+        "basis collapses on {} narrow grids that KanConfig::validate accepts:\n{}",
         failures.len(),
         failures.join("\n")
     );
 }
 
-/// Characterization of the same bug, kept running so a fix is noticed here first:
-/// the `(0.0, 1e-5)` / `grid_size = 64` grid currently yields an all-zero basis.
+/// The sum check above is invariant under moving mass between channels, so the
+/// narrow grids get the same per-channel treatment as the ordinary ones: every
+/// channel against the independent `f64` Cox-de Boor.
 ///
-/// If this starts failing, `compute_basis` was fixed - delete it and un-ignore
-/// [`partition_of_unity_survives_narrow_grid_ranges`].
+/// This is what proves the fix restored the *right* basis rather than merely a
+/// normalized one. It is also the test that caught the `find_span` half of the
+/// bug: with only the `compute_basis` guard fixed, `(1e-30, 2e-30)` still had
+/// per-channel errors up to 2e2 while its sum read 1.0 to within 4.5e-5.
 #[test]
-fn collapsed_knots_currently_produce_a_zero_basis() {
-    let (gr, grid_size, order) = ((0.0f32, 1e-5f32), 64usize, 3usize);
-    let h = (gr.1 - gr.0) / grid_size as f32;
-    assert!(h < EPSILON, "fixture must have a sub-EPSILON knot gap");
+fn every_narrow_grid_basis_channel_matches_the_reference() {
+    let mut worst = 0.0f64;
+    let mut worst_at = String::new();
+
+    for (gr, grid_size) in NARROW_RANGES {
+        for order in ORDERS {
+            let knots = compute_knots(grid_size, order, gr);
+            let k64: Vec<f64> = knots.iter().map(|&k| f64::from(k)).collect();
+            for x in sample_points(gr, &knots, order, grid_size) {
+                let span = find_span(x, &knots, order, grid_size);
+                let mut basis = [0.0f32; MAX_SPLINE_ORDER + 1];
+                compute_basis(x, span, &knots, order, &mut basis[..=order]);
+                for (i, &b) in basis[..=order].iter().enumerate() {
+                    let j = span as isize - order as isize + i as isize;
+                    let err = (f64::from(b) - ref_basis(j, order, f64::from(x), &k64)).abs();
+                    if err > worst {
+                        worst = err;
+                        worst_at = format!(
+                            "range={gr:?} grid_size={grid_size} order={order} x={x:e} channel={i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        worst < 1e-5,
+        "worst per-channel basis error {worst:e} at {worst_at}"
+    );
+}
+
+/// The one grid no arithmetic fix reaches: `h = 1.5625e-2` at a magnitude where
+/// the f32 ULP is 0.0625, so consecutive knots are literally the same number.
+/// It used to pass `validate` and produce a network that was a constant.
+#[test]
+fn config_rejects_a_grid_whose_knots_collide_in_f32() {
+    let (gr, grid_size, order) = ((1e6f32, 1e6f32 + 1.0), 64usize, 3usize);
 
     let knots = compute_knots(grid_size, order, gr);
-    let x = gr.0 + (gr.1 - gr.0) * 0.5;
-    let span = find_span(x, &knots, order, grid_size);
-    let mut basis = [0.0f32; MAX_SPLINE_ORDER + 1];
-    compute_basis(x, span, &knots, order, &mut basis[..=order]);
-    let sum: f32 = basis[..=order].iter().sum();
-    assert_eq!(
-        sum, 0.0,
-        "compute_basis no longer collapses - see the doc comment"
+    assert!(
+        knots.windows(2).any(|w| w[1] == w[0]),
+        "fixture must actually collide in f32"
+    );
+
+    let config = arkan::KanConfig {
+        grid_size,
+        spline_order: order,
+        grid_range: gr,
+        ..arkan::KanConfig::default()
+    };
+    assert!(
+        matches!(
+            config.validate(),
+            Err(arkan::config::ConfigError::InvalidGridRange)
+        ),
+        "a grid with colliding knots must be rejected, not silently zeroed"
     );
 }
