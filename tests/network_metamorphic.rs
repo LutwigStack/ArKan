@@ -19,7 +19,16 @@ use arkan::{KanConfig, KanLayer, KanNetwork, Workspace};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
-const ORDERS: std::ops::RangeInclusive<usize> = 2..=MAX_SPLINE_ORDER;
+/// Every order `KanConfig::validate` accepts, 1 to [`MAX_SPLINE_ORDER`].
+///
+/// Order 1 was excluded here for no reason at all: a metamorphic relation - scaling,
+/// permutation, zeroing, `forward_single` vs `forward_batch`, `simd_width` invariance,
+/// clamping past the endpoints - says nothing about smoothness, so the degeneracy of a
+/// piecewise-linear basis is irrelevant to every test in this file. It only meant that
+/// `spline_order = 1`, which `validate()` accepts, reached the layer code in exactly
+/// one test ([`every_supported_grid_size_and_order_builds_and_runs`], which only checks
+/// that the output is finite and not constant).
+const ORDERS: std::ops::RangeInclusive<usize> = 1..=MAX_SPLINE_ORDER;
 
 fn config(in_dim: usize, hidden: Vec<usize>, out_dim: usize, order: usize, gs: usize) -> KanConfig {
     KanConfig {
@@ -279,11 +288,18 @@ fn normalization_is_equivalent_to_pre_normalizing_the_input() {
 
 #[test]
 fn a_single_layer_equals_the_explicit_basis_weighted_sum() {
-    // Independent recomputation of `output[j] = bias[j] + sum_i sum_k
+    // Recomputation of `output[j] = bias[j] + sum_i sum_k
     // w[j, i, span_i - order + k] * B_k(z_i)` straight from the public spline API,
     // in f64. This is what pins the weight indexing and the SIMD accumulation
     // paths: `accumulate_batch` picks 8-wide, 4-wide or scalar depending on
     // `simd_width` and `in_dim`, and all three must agree with the definition.
+    //
+    // It is *not* independent of the basis: it calls the same `compute_basis` the
+    // forward pass does, so any error in the basis values moves both sides equally and
+    // cancels. Verified - a swapped-channel order-1 fast path inside `compute_basis`
+    // leaves this test passing while `every_basis_channel_matches_an_independent_cox_de_boor`
+    // in `tests/spline_properties.rs` fails. That f64 Cox-de Boor reference is where
+    // basis values are pinned; here, only the indexing and accumulation around them.
     let mut worst = 0.0f64;
     let mut worst_at = String::new();
 
