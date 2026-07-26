@@ -201,6 +201,22 @@ dependencies and these floors drift upward as those crates release.
 
 #### Documentation
 
+- **README, BENCHMARKS, ARCHITECTURE and this file reconciled with the code.**
+  The English README still described `BakedModel` as a deprecated stub whose
+  `forward()` panics; the GPU snippet called `backend.adapter_name()`, which does
+  not exist (`adapter_info()` does), in both language halves; the baked
+  calibration snippet was an empty `vec![]`, which silently bakes a model at 100%
+  NRMSE; the GPU-vs-PyTorch table predated the 2026-06-27 re-measurement;
+  `docs/ARCHITECTURE.md` documented the weight layout with input and output
+  swapped and listed three features that no longer exist; `docs/BENCHMARKS.md`
+  told contributors to pass `--features simd` (now a hard error) and linked four
+  times into `tasks/`, which is gitignored and package-excluded.
+- **`tests/readme_snippets.rs`** — every README and BENCHMARKS code snippet,
+  copied verbatim. The CPU ones run; the `gpu` ones are type-checked by
+  `cargo clippy --all-targets --features gpu` in CI. A README example that stops
+  compiling now fails a job.
+- Four test files cited `FUNCTIONALITY_AUDIT.md` — a gitignored, package-excluded
+  file — from source that ships in the published crate. Reworded.
 - `cargo doc` is now clean under `-D warnings` for default, `serde`, `gpu` and
   `--all-features`. 72 unresolved intra-doc links are gone: most were math and
   index notation (`M0[j]`, `grad_weights[j,i,k]`) that rustdoc parsed as links
