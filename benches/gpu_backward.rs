@@ -27,7 +27,7 @@ use std::cell::RefCell;
 #[cfg(feature = "gpu")]
 use arkan::gpu::{GpuAdam, GpuAdamConfig, GpuNetwork, WgpuBackend, WgpuOptions};
 #[cfg(feature = "gpu")]
-use arkan::optimizer::{Adam, AdamConfig, SGD};
+use arkan::optimizer::{Adam, AdamConfig, SGDConfig, SGD};
 #[cfg(feature = "gpu")]
 use arkan::{KanConfig, KanNetwork, TrainOptions};
 
@@ -189,7 +189,7 @@ fn bench_gpu_train_step_sgd(c: &mut Criterion) {
                 b.iter_batched(
                     || {
                         let cpu_network = base_cpu_network.clone();
-                        let optimizer = SGD::new(&cpu_network, 0.01, 0.9, 0.0);
+                        let optimizer = SGD::new(&cpu_network, SGDConfig::with_momentum(0.01, 0.9));
                         gpu_network
                             .borrow_mut()
                             .sync_weights_cpu_to_gpu(&cpu_network)
