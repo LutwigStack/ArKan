@@ -721,3 +721,41 @@ fn every_supported_grid_size_and_order_builds_and_runs() {
         }
     }
 }
+
+/// `init_seed: Some(s)` must mean "reproducible", not "every layer is the same
+/// layer".
+///
+/// Every `KanLayer` used to build its own `SmallRng` from the *shared*
+/// `config.init_seed` and draw its whole weight vector from it, so two layers with
+/// the same `(in_dim, out_dim, basis_size)` came out bit-identical - a seeded run
+/// started from a layer-to-layer symmetric point. `hidden_dims: vec![64, 64]` is
+/// enough to hit it. `KanConfig::preset()` happens to have no two same-shaped
+/// layers, which is why nothing noticed.
+#[test]
+fn seeded_init_does_not_clone_identically_shaped_layers() {
+    let mut cfg = config(8, vec![8, 8, 8], 8, 3, 5);
+    cfg.init_seed = Some(1234);
+    let net = KanNetwork::new(cfg.clone());
+    assert_eq!(net.layers.len(), 4, "all four layers are 8x8 here");
+
+    for i in 0..net.layers.len() {
+        for j in i + 1..net.layers.len() {
+            assert_ne!(
+                net.layers[i].weights, net.layers[j].weights,
+                "layers {i} and {j} have identical weights - the seed is not being \
+                 varied per layer"
+            );
+        }
+    }
+
+    // Still deterministic: same seed, same network, bit for bit.
+    let again = KanNetwork::new(cfg.clone());
+    for (i, (a, b)) in net.layers.iter().zip(&again.layers).enumerate() {
+        assert_eq!(a.weights, b.weights, "layer {i} is not reproducible");
+    }
+
+    // And a different seed is a different network.
+    cfg.init_seed = Some(4321);
+    let other = KanNetwork::new(cfg);
+    assert_ne!(net.layers[0].weights, other.layers[0].weights);
+}

@@ -179,7 +179,10 @@ impl KanNetwork {
         for i in 0..layer_dims.len() - 1 {
             let in_dim = layer_dims[i];
             let out_dim = layer_dims[i + 1];
-            layers.push(KanLayer::try_new(in_dim, out_dim, &config)?);
+            // `try_new_at`, not `try_new`: a shared `init_seed` reseeds the same RNG
+            // per layer, so two layers of the same shape would otherwise get
+            // bit-identical weights.
+            layers.push(KanLayer::try_new_at(in_dim, out_dim, &config, i)?);
         }
 
         let layer_param_sizes: Vec<(usize, usize)> = layers

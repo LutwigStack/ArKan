@@ -211,6 +211,33 @@ impl KanLayer {
         out_dim: usize,
         config: &KanConfig,
     ) -> Result<Self, crate::ArkanError> {
+        Self::try_new_at(in_dim, out_dim, config, 0)
+    }
+
+    /// As [`try_new`](Self::try_new), but decorrelates the initialization of a layer
+    /// at position `layer_index` in a stack.
+    ///
+    /// With `config.init_seed = Some(s)`, [`try_new`](Self::try_new) seeds its RNG
+    /// with `s` every time, so two layers of the same shape in the same network get
+    /// *bit-identical* weights - `hidden_dims: vec![64, 64]` starts from a
+    /// layer-to-layer symmetric point, which is not what "deterministic
+    /// initialization" leads you to expect. This offsets the seed by `layer_index`,
+    /// so `layer_index = 0` reproduces the old weights exactly and each later layer
+    /// draws its own stream. `KanNetwork::try_new` passes the position.
+    ///
+    /// With `init_seed = None` this is identical to [`try_new`](Self::try_new): that
+    /// path already seeds per layer from entropy.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`try_new`](Self::try_new).
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_new_at(
+        in_dim: usize,
+        out_dim: usize,
+        config: &KanConfig,
+        layer_index: usize,
+    ) -> Result<Self, crate::ArkanError> {
         use crate::config::ConfigError;
         use crate::ArkanError;
         use std::borrow::Cow;
@@ -276,7 +303,10 @@ impl KanLayer {
         // KAN needs larger initialization because B-splines have bounded support
         let scale = (2.0 / (in_dim + out_dim) as f32).sqrt();
         let mut rng: SmallRng = if let Some(seed) = config.init_seed {
-            SmallRng::seed_from_u64(seed)
+            // `seed_from_u64` runs SplitMix64 to fill the state, so consecutive
+            // seeds give unrelated streams - offsetting by the layer's position is
+            // enough to stop two same-shaped layers being bit-identical.
+            SmallRng::seed_from_u64(seed.wrapping_add(layer_index as u64))
         } else {
             SmallRng::from_entropy()
         };
