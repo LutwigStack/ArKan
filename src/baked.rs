@@ -12,6 +12,8 @@
 //! - Bias: i64 (folded with per-channel weight scale and basis scale)
 //! - Inter-layer activations: i32 with target range ~2^28 (wider than i16 to reduce
 //!   inter-layer error amplification)
+//! - Output-layer activations: same i32 scale, but saturated at i32::MAX rather than
+//!   2^28 — nothing downstream depends on the p99.9 ceiling there
 //! - Activation calibration: 99.9th-percentile clip to stop outliers wasting range
 //! - Requant: per-output-channel `M0[j]`/`shift[j]` derived from `s_act/(s_w[j]·32768)`
 //! - No f32 between entry normalization and final dequantization
@@ -762,6 +764,29 @@ impl BakedModel {
                 basis_buf.resize(local_basis_size, 0);
             }
 
+            // Saturation bound for this layer's requantized activations.
+            //
+            // A HIDDEN layer clamps at ACT_TARGET because its output is the next
+            // layer's input, and that next layer's `norm_a_fixed` was derived from
+            // p99.9 of the calibration set: letting an outlier through would push
+            // `q_z` far outside the grid range and cost more than saturating does.
+            //
+            // The OUTPUT layer has no next layer. Its only consumer is the f32
+            // dequant at the bottom of `forward`, so the argument does not apply and
+            // the sole real bound is the i32 `act_b` is stored in. Clamping it at
+            // ACT_TARGET capped every value the model can ever return at p99.9 of
+            // the calibration set — on a calibrated 4->2 net, 2 of the 2000
+            // *calibration* samples already sat above the ceiling, worst case f32
+            // -0.520944 vs baked -0.471458, 9.50% error from clipping alone.
+            // i32::MAX keeps `as i32` well-defined while leaving ~3 bits (8x p99.9)
+            // of headroom.
+            const ACT_CLAMP: i64 = 268_435_456; // 2^28 = ACT_TARGET
+            let clamp_hi: i64 = if l + 1 < self.layers.len() {
+                ACT_CLAMP
+            } else {
+                i32::MAX as i64
+            };
+
             // For each output j
             for (j, act_out) in act_b[..out_dim].iter_mut().enumerate() {
                 let mut acc: i64 = layer.q_bias[j];
@@ -797,8 +822,8 @@ impl BakedModel {
 
                 // Per-channel requant: q_out[j] = ((acc * M0[j]) + round) >> S[j].
                 // Using i32 output (wider than old i16) to preserve inter-layer precision.
-                // Saturate to ACT_TARGET so that the few outliers above the 99.9th
-                // percentile clipping point don't corrupt the fixed-point scale.
+                // Saturate to `clamp_hi` (see above — ACT_TARGET on hidden layers,
+                // i32::MAX on the output layer).
                 let m0_j = layer.requant_m0[j] as i128;
                 let shift_j = layer.requant_shift[j];
                 let product = (acc as i128) * m0_j;
@@ -808,8 +833,7 @@ impl BakedModel {
                     0
                 };
                 let q_out_i64 = ((product + round_offset) >> shift_j) as i64;
-                const ACT_CLAMP: i64 = 268_435_456; // 2^28 = ACT_TARGET
-                *act_out = q_out_i64.clamp(-ACT_CLAMP, ACT_CLAMP) as i32;
+                *act_out = q_out_i64.clamp(-clamp_hi, clamp_hi) as i32;
             }
 
             // INTER-LAYER: compute next layer's z values in Q15.16
@@ -1213,6 +1237,69 @@ mod tests {
             err < 0.10,
             "max_rel_err = {:.4} exceeds 10% threshold for medium config",
             err
+        );
+    }
+
+    /// The output layer must not saturate at the calibration set's 99.9th percentile.
+    ///
+    /// `ACT_CLAMP` (2^28 = `ACT_TARGET`) used to be applied to every layer, and the
+    /// exit scale is `s_act_last = 2^28 / p99.9`, so `|output[j]| <= p99.9` held by
+    /// construction — the model could not return a larger magnitude no matter what
+    /// the input was. Calibration and test draw from the *same* distribution here
+    /// and the ceiling is still crossed, which is the point: this is not an
+    /// out-of-distribution scenario.
+    #[test]
+    fn test_output_layer_not_capped_at_calibration_p999() {
+        let network = make_network(4, vec![], 2, 5, 3, 77);
+        let cal = random_inputs(2000, 4, 333);
+        let baked = BakedModel::from_network(&network, Some(&cal));
+        // The hard ceiling the unconditional clamp imposed on every returned value.
+        let ceiling = BakedModel::ACT_TARGET as f32 / baked.layers[0].s_act_out;
+
+        let test = random_inputs(4000, 4, 444);
+        let mut workspace = network.create_workspace(1);
+        let mut f32_out = vec![0.0f32; 2];
+        let mut baked_out = vec![0.0f32; 2];
+        let mut n_above = 0usize;
+        let mut worst_rel = 0.0f32;
+        let mut max_baked = 0.0f32;
+
+        for s in 0..4000 {
+            let inp = &test[s * 4..(s + 1) * 4];
+            network.forward_single(inp, &mut f32_out, &mut workspace);
+            baked.forward(inp, &mut baked_out);
+            for j in 0..2 {
+                max_baked = max_baked.max(baked_out[j].abs());
+                if f32_out[j].abs() > ceiling {
+                    n_above += 1;
+                    worst_rel = worst_rel.max((baked_out[j] - f32_out[j]).abs() / f32_out[j].abs());
+                }
+            }
+        }
+
+        println!(
+            "[output clamp] ceiling={ceiling:.6}: {n_above} of 8000 f32 outputs above it, \
+             max |baked| = {max_baked:.6}, worst rel err {:.2}%",
+            worst_rel * 100.0
+        );
+        assert!(
+            n_above > 0,
+            "fixture no longer crosses the p99.9 ceiling ({ceiling}), so it guards nothing — \
+             pick a config that does rather than deleting this test"
+        );
+        // The structural falsifier: under the old clamp `max_baked <= ceiling` held
+        // for every input, so this is a binary check, not a tolerance.
+        assert!(
+            max_baked > ceiling,
+            "no baked output exceeded the calibration p99.9 ceiling ({ceiling}); max |baked| = \
+             {max_baked} — the output layer is still saturating"
+        );
+        // Loose but far below the 5.00% the clamp produced on this fixture.
+        assert!(
+            worst_rel < 0.01,
+            "output layer accuracy above the ceiling regressed: worst rel err {:.2}% over \
+             {n_above} outputs above {ceiling}",
+            worst_rel * 100.0
         );
     }
 
