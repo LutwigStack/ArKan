@@ -184,13 +184,12 @@ and `cargo bench --bench baked`. Random-init networks, `grid_range = (-1, 1)`,
 | Property | Value |
 |---|---|
 | Weight compression | **2.2–3.0×** vs f32 parameters |
-| NRMSE vs f32, 1-hidden (4→[8]→2) | 0.64% |
-| NRMSE vs f32, 2-hidden (8→[16,8]→4) | 1.29% (order 3); 1.7–2.7% across orders 2–5 |
-| **Worst-case error on outputs ≥1σ, 1-hidden** | 8.7% |
-| **Worst-case error on outputs ≥1σ, 2-hidden** | **34.6–53.9%** |
+| NRMSE vs f32, 1-hidden (4→[8]→2) | 0.17% |
+| NRMSE vs f32, 2-hidden (8→[16,8]→4) | 0.57% (order 3); 0.37–0.59% across orders 2–5 |
+| **Worst-case error on outputs ≥1σ, 1-hidden** | 0.8% |
+| **Worst-case error on outputs ≥1σ, 2-hidden** | **3.1–7.9%** (gated at 15%) |
 | **Latency vs f32 at batch=1** | **1.4× slower** (4→[8]→2), **2.1× slower** (8→[16,8]→4) |
-| Suitable for | Ranking, argmax, classification |
-| **Not** suitable for | Reading an individual output as a quantity |
+| Suitable for | Ranking, argmax, classification, and — now — reading outputs |
 | Spline orders supported | 2–5 only. `from_network` **panics** outside that range |
 
 Three things this table is saying that are easy to skim past:
@@ -199,13 +198,14 @@ Three things this table is saying that are easy to skim past:
    reverses this exists and is measured at roughly 1.5–2.8× *faster* than f32 —
    the win is a weight-layout change, not SIMD — but it is **not implemented**.
    Do not adopt `BakedModel` for latency.
-2. **The aggregate NRMSE is flattering.** 1.3% NRMSE and a 34–54% worst case on
-   significant outputs are the same measurement. Baked preserves the *ordering*
-   of outputs reliably; it does not preserve their values. Two identified,
-   unfixed causes: `ACT_CLAMP` is applied to the output layer, so the model can
-   never return a magnitude above the calibration set's 99.9th percentile; and
-   the inter-layer scale `norm_a_fixed` lands on the integers 5–10, i.e. carries
-   about 3 bits, costing a systematic 2.6–6.7% at every hop.
+2. **The ≥1σ tail used to be 34–54% and is now 3–8%.** Three fixed-point defects
+   caused it, all now fixed: activations saturated at the calibration set's
+   99.9th percentile on *every* layer (so the model could never return a larger
+   magnitude, and hidden layers got a saturation the f32 path does not have);
+   the inter-layer scale `norm_a_fixed` carried three bits, landing on the
+   integers 7–9; and it rounded to **0** — silently collapsing the next layer's
+   inputs to a constant — whenever a layer's `p99.9` fell below `std/32`.
+   `tests/baked_parity.rs` now gates the ≥1σ worst case, not just NRMSE.
 3. **Calibration is not optional.** Without it the activation scale falls back to
    a coarse heuristic and accuracy degrades badly. Passing an **empty** slice is
    worse and silent: `from_network` does not error, and the resulting model

@@ -16,17 +16,28 @@
 //!   percentile sets the SCALE, not a clip — see `forward` for why clipping there
 //!   only ever added error
 //! - Activation calibration: 99.9th percentile sets s_act so outliers do not waste range
+//! - Inter-layer z scale: `norm_a_fixed` with a per-layer `norm_shift`, so it fills
+//!   the i32 (~30 bits) instead of landing on a single-digit integer
 //! - Requant: per-output-channel `M0[j]`/`shift[j]` derived from `s_act/(s_w[j]·32768)`
 //! - No f32 between entry normalization and final dequantization
 //!
-//! # Accuracy (post per-channel quantization, WS02)
+//! # Accuracy
 //!
-//! NRMSE: single-layer 0.60%, 1-hidden 0.64%, 2-hidden 1.29% (all within gate).
-//! Worst-case on significant outputs: single-layer 9.2%, 1-hidden 8.7%, 2-hidden 115%.
-//! The 2-hidden tail (~115%) reflects inter-layer activation requant noise amplification,
-//! not weight quantization — a residual int8 precision floor for 3-layer deep configs.
-//! The NRMSE aggregate is suitable for ranking/selection; per-output absolute accuracy
-//! in deep nets requires int16 weights or per-channel activation scales.
+//! Measured by `tests/baked_parity.rs` (`cargo test --release --test baked_parity --
+//! --nocapture`), random-init nets, `grid_range = (-1, 1)`, 256 calibration and 2000
+//! test samples in `[-0.9, 0.9]`.
+//!
+//! | Config | NRMSE | worst @0.1σ | @0.5σ | @1.0σ |
+//! |---|---|---|---|---|
+//! | 4→2 | 0.34% | 9.2% | 2.3% | 1.2% |
+//! | 4→[8]→2 | 0.17% | 0.8% | 0.8% | 0.8% |
+//! | 8→[16,8]→4 | 0.57% | 47.0% | 10.5% | 5.0% |
+//! | 8→[16,8]→4, orders 2–5 | 0.37–0.59% | 3.1–61.3% | 3.1–14.2% | 3.1–7.9% |
+//!
+//! The 0.1σ column divides a few-LSB absolute error by a near-noise reference and
+//! explodes by construction; it is a diagnostic, not a quality number. The ≥1σ
+//! column is the one that decides whether a caller can read an output as a
+//! quantity, and `baked_parity` gates it at 15%.
 
 use crate::config::{KanConfig, EPSILON};
 use crate::network::KanNetwork;

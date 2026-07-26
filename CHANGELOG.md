@@ -91,19 +91,19 @@ above the given multiple of the per-output std.
 
 | Architecture | order | NRMSE | worst @0.1σ | @0.5σ | @1.0σ |
 |---|---|---|---|---|---|
-| 4→2 | 3 | 0.60% | 9.2% | 8.3% | 8.3% |
-| 4→[8]→2 | 3 | 0.64% | 8.7% | 8.7% | 8.7% |
-| 8→[16,8]→4 | 3 | 1.29% | 114.7% | 27.1% | 18.7% |
-| 8→[16,8]→4 (seed 4242) | 2 | 2.65% | 474.5% | 62.3% | **34.6%** |
-| 8→[16,8]→4 (seed 4242) | 3 | 1.71% | 53.9% | 53.9% | **53.9%** |
-| 8→[16,8]→4 (seed 4242) | 4 | 2.26% | 149.5% | 63.1% | **50.0%** |
-| 8→[16,8]→4 (seed 4242) | 5 | 2.28% | 326.1% | 78.3% | **35.1%** |
+| 4→2 | 3 | 0.34% | 9.2% | 2.3% | 1.2% |
+| 4→[8]→2 | 3 | 0.17% | 0.8% | 0.8% | 0.8% |
+| 8→[16,8]→4 | 3 | 0.57% | 47.0% | 10.5% | 5.0% |
+| 8→[16,8]→4 (seed 4242) | 2 | 0.49% | 61.3% | 14.2% | **7.9%** |
+| 8→[16,8]→4 (seed 4242) | 3 | 0.59% | 3.1% | 3.1% | **3.1%** |
+| 8→[16,8]→4 (seed 4242) | 4 | 0.37% | 16.5% | 4.6% | **3.4%** |
+| 8→[16,8]→4 (seed 4242) | 5 | 0.50% | 54.1% | 12.2% | **6.4%** |
 
-The aggregate NRMSE (0.6–2.7%) is good; the **per-output tail is not**. On a
-2-hidden net the worst-case error on decision-relevant outputs (≥1σ) is
-**34.6–53.9%**. Baked is therefore suitable for **ranking / argmax /
-classification** and unsuitable for per-output absolute accuracy. See
-`docs/BENCHMARKS.md` for the two identified, still-unfixed causes.
+These are the numbers *after* the three fixed-point defects listed under
+**Fixed** below. The same suite read 0.60–2.65% NRMSE with a **34.6–53.9%**
+worst case at ≥1σ before them. `baked_parity` now gates the ≥1σ worst case at
+15%, not just NRMSE — a change that improves the aggregate while widening the
+tail is a regression and now fails.
 
 **Baked is slower than f32 at batch=1** (1.4× on 4→[8]→2, 2.1× on
 8→[16,8]→4, re-measured 2026-07-26). Its win today is size (2.2–3.0×), not
@@ -111,6 +111,36 @@ speed.
 
 ### Fixed
 
+- **`BakedModel` could not return an output magnitude above the calibration
+  set's 99.9th percentile.** Every requantized activation saturated at ±2^28 and
+  the exit scale is `2^28 / p99.9`, so `|output[j]| <= p99.9` held by
+  construction. On a calibrated 4→2 net, 2 of the 2000 *calibration* samples
+  already sat above the ceiling — worst case f32 −0.520944 vs baked −0.471458,
+  9.50% error from clipping alone. The clip is gone on hidden layers too: the
+  justification (that saturating protects the next layer's z scale) does not
+  hold, because `q_z` is clamped to the grid range in the inter-layer step and
+  that is the same clamp the f32 path applies to `z`. The clip was a second,
+  tighter saturation the f32 path does not have. Removing it on hidden layers
+  alone moved the ≥1σ worst case from 25.2/51.8/33.7/29.5% to 7.9/3.1/3.4/6.4%
+  (orders 2/3/4/5). The 99.9th percentile still sets `s_act`; only the clip is
+  gone.
+- **`norm_a_fixed` carried ~3 bits.** The inter-layer z scale was
+  `A_FIXED[i] = round(2^32 / (s_act_prev · std_i))` consumed with a hardcoded
+  `>> 16`, which on freshly-built 4×8×2, 8×16×4, 16×32×8 and 32×64×16 nets
+  landed on the integers **8, 7, 8, 9** — a systematic 5.6–7.1% scale error at
+  every hop. A per-layer `norm_shift` now puts it in `[2^29, 2^30)`. NRMSE
+  improved 2–4×; the ≥1σ tail moved much less than expected (53.9% → 51.8% on
+  order 3), which is why the clip above turned out to be the dominant cause.
+- **`A_FIXED == 0` collapsed a layer's inputs to a constant, silently.**
+  `round(2^32 / (s_act_prev · std_i))` is `round(16 · p99.9 / std_i)`, which
+  rounds to 0 whenever a layer's outputs have `p99.9 < std/32` — scaling one
+  layer's weights by 1e-3 is enough. Verified: the model returned the same
+  `(0.12060832, 0.3845482)` for every input while f32 varied. Now unreachable by
+  construction; the same fixture tracks f32 to 0.19%.
+- **`BakedModel` binary `FORMAT_VERSION` is 2** (was 1) — `BakedLayer` gained
+  `norm_shift: u32` and `norm_b_fixed` changed scale from 2^32 to Q15.16.
+  `from_bytes` rejects version-1 files with the existing descriptive error.
+  Re-bake, do not re-interpret.
 - **Order-4 and order-5 baked B-spline basis were numerically wrong**
   (`576fbc7`). `eval_basis_fixed` summed numerator terms at inconsistent
   fixed-point Q scales: order 4 (Q64) left `12*t3` and `4*t3` at Q48; order 5
@@ -242,15 +272,10 @@ of the library as shipped.
   **layout** change to output-innermost plus hoisting the basis evaluation out
   of the `j` loop, *not* SIMD — has been prototyped and measured at roughly
   1.5–2.8× **faster** than f32 depending on shape. It is **not implemented**.
-- **`BakedModel` cannot return an output magnitude above the calibration set's
-  99.9th percentile.** `ACT_CLAMP` (2^28) is applied to the output layer's
-  activations too, and the exit scale is `2^28 / p99.9`, so the clamp becomes a
-  hard ceiling on the dequantized output. Unfixed.
-- **`norm_a_fixed` carries only ~3 bits.** The inter-layer scale
-  `A_FIXED[i] = round(2^32 / (s_act_prev · std_i))` lands on small integers
-  (measured 5–10 on the parity fixtures), so rounding it costs a systematic
-  2.6–6.7% per inter-layer hop. Together with the ceiling above, this is the
-  likely origin of the ≥1σ tail. Unfixed.
+- **The ≥1σ tail is 0.8–7.9%, not zero.** After the three fixed-point fixes
+  below the surviving outliers are absolute-error events (one sample's error
+  20–35× the mean absolute error), not a systematic scale error. Int16 weights
+  are the next lever and cost half the size win. Not planned.
 - **Only layer 0 receives `input_mean` / `input_std`.** Every hidden layer is
   built with identity normalization and there is no running-statistics update,
   so a hidden layer's input is the previous layer's *raw* activation, clamped to
@@ -401,8 +426,9 @@ measurement exists; see "Known limitations" under 0.4.0 for what they would fix.
       batch=1; not implemented.
 - [ ] Grid-domain observability — `out_of_grid_fraction`, drift warning,
       configurable extrapolation, grid recalibration. Saturation is silent today.
-- [ ] Close the baked ≥1σ tail — stop applying `ACT_CLAMP` to the output layer,
-      and give `norm_a_fixed` more than ~3 bits.
+- [ ] int16 baked weights — the remaining ≥1σ tail (0.8–7.9%) is absolute-error
+      outliers from int8 weight quantization, not a scale error. Costs half the
+      size win, so it is a trade, not a fix.
 
 ### Unscheduled
 - [ ] ONNX export

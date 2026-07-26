@@ -185,7 +185,7 @@ conversions. It is available in a **default build** — there is no feature flag
 | MAC accumulator | `i64` | — |
 | Requantization | `i128` product, per-channel `M0[j] >> shift[j]` | — |
 | Inter-layer activations | `i32` | `s_act = 2^28 / p99.9` of the calibration set |
-| Inter-layer normalization | `i32` `A_FIXED`/`B_FIXED` | Q32, `>> 16` in the hot path |
+| Inter-layer normalization | `i32` `A_FIXED`/`B_FIXED` | `A_FIXED` at Q(16+`norm_shift`) with a per-layer shift; `B_FIXED` at Q15.16 |
 
 **Data flow** (`BakedModel::forward`)
 
@@ -196,8 +196,8 @@ f32 input
               └─> eval_basis_fixed(order, t_q16)              -> u16 Q0.15
                     └─> acc: i64 = Σ_i Σ_k  w_i8 · basis_u16
                           └─> requant: ((acc·M0[j]) + round) >> shift[j]
-                                └─> clamp(±ACT_CLAMP = 2^28)  -> i32 activation
-                                      └─> inter-layer: q_z = (q·A_FIXED + B_FIXED) >> 16,
+                                └─> clamp to i32 (no p99.9 clip)  -> i32 activation
+                                      └─> inter-layer: q_z = ((q·A_FIXED + round) >> SH) + B_FIXED,
                                           clamped to the NEXT layer's [q_rmin, q_rmax]
   └─> exit: output[j] = act[j] / s_act_last                   -> f32
 ```
@@ -206,18 +206,22 @@ Calibration (`from_network(net, Some(&calib))`) sets `s_act` from the 99.9th
 percentile of observed activation magnitudes per layer. Without it the scale
 falls back to a coarse heuristic and accuracy degrades badly.
 
-**Two consequences of this design that you must know about** (both unfixed):
+**Two things about this pipeline that used to be wrong and are worth knowing**
+(both fixed; see [BENCHMARKS.md](BENCHMARKS.md#baked-int8-inference)):
 
-1. `ACT_CLAMP` is applied to the **output** layer's activations as well, and the
-   exit scale is `2^28 / p99.9`. So `|output[j]| <= p99.9` of the calibration
-   set — a hard ceiling. Nothing can produce a larger magnitude.
-2. `A_FIXED[i] = round(2^32 / (s_act_prev · std_i))` lands on small integers
-   (measured 5–10 on the parity fixtures, i.e. about 3 bits), so rounding it
-   costs a systematic 2.6–6.7% scale error at every inter-layer hop.
+1. Activations were clipped at `ACT_TARGET = 2^28` on **every** layer. Since the
+   exit scale is `2^28 / p99.9`, that made `|output[j]| <= p99.9` of the
+   calibration set a hard ceiling; on hidden layers it was a saturation the f32
+   path does not have, on top of the grid-range clamp that both paths share. The
+   percentile still sets `s_act`; only the clip is gone.
+2. `A_FIXED[i] = round(2^32 / (s_act_prev · std_i))` landed on the integers 7–9
+   (about 3 bits) with a hardcoded `>> 16`, and rounded to **0** — collapsing
+   the next layer's inputs to a constant — whenever a layer's `p99.9` fell below
+   `std/32`. The per-layer `norm_shift` puts `A_FIXED` in `[2^29, 2^30)` and
+   makes 0 unreachable.
 
-Together these are the likely origin of the per-output tail error reported in
-[BENCHMARKS.md](BENCHMARKS.md#baked-int8-inference). Baked is for ranking and
-argmax, not for per-output absolute accuracy.
+The remaining ≥1σ worst case is 0.8–7.9% and is gated by
+`tests/baked_parity.rs`.
 
 ## GPU Backend (`src/gpu/`)
 
@@ -377,8 +381,9 @@ custom `Deserialize` that recomputes the knot vector after load.
 [BODY: bincode-serialized BakedModel]
 ```
 `from_bytes` validates magic and version **before** deserializing and returns a
-descriptive `Err` on mismatch or truncation, not a panic. `FORMAT_VERSION` is 1
-(src/baked.rs:864). The two formats are not interchangeable.
+descriptive `Err` on mismatch or truncation, not a panic. `FORMAT_VERSION` is 2
+— version 1 predates the per-layer `norm_shift` field and the Q15.16 `norm_b_fixed`
+scale, and is rejected. The two formats are not interchangeable.
 
 ## Feature Flags
 
@@ -443,12 +448,14 @@ extrapolation and no grid recalibration. `SPAN_CLAMPED_FLAG` records saturation
 per element for the backward pass, but nothing surfaces it to the caller.
 Distribution drift shows up as unexplained accuracy loss, not as a diagnostic.
 
-### `BakedModel` accuracy has a per-output tail
+### `BakedModel` accuracy still has a per-output tail
 
-Aggregate NRMSE is 0.6–2.7%; the worst-case error on decision-relevant outputs
-(≥1σ) is 34–54% on a 2-hidden net. Two identified causes, both unfixed, are
-described in [Baked Inference](#6-baked-inference-srcbakedrs) above. Use baked
-for ranking / argmax, not for per-output absolute accuracy.
+Aggregate NRMSE is 0.17–0.59%; the worst-case error on decision-relevant outputs
+(≥1σ) is 0.8–7.9% on a 2-hidden net, down from 34–54% before the three
+fixed-point fixes described in
+[Baked Inference](#6-baked-inference-srcbakedrs) above. `tests/baked_parity.rs`
+gates the ≥1σ figure at 15%. What is left is absolute-error outliers from int8
+weight quantization, not a systematic scale error.
 
 ### `BakedModel` is slower than f32 at batch=1
 

@@ -166,7 +166,7 @@ fn main() {
         n_test,
         total_err / n_test as f64
     );
-    println!("(NRMSE ~0.6–1.3% for calibrated nets; suitable for ranking/argmax)");
+    println!("(NRMSE ~0.2–0.6% for calibrated nets; worst case on >=1 sigma outputs ~1–8%)");
 
     // ----------------------------------------------------------------
     // 6. Optional: serialization round-trip (requires --features serde)

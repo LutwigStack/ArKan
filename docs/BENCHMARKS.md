@@ -652,9 +652,10 @@ cargo bench --bench forward -- --noplot              # Quick CPU benchmark
 
 ### What baked is for
 
-Ranking, argmax and classification. **Not** per-output absolute accuracy, and
-**not** latency. Both of those are measured below and both are bad news; read
-them before choosing this path.
+Size. **Not** latency — baked is 1.4–2.1× *slower* than f32 at batch=1, measured
+below. Per-output accuracy used to be the other disqualifier and no longer is:
+the ≥1σ worst case is 0.8–7.9%, down from 34.6–53.9%, after three fixed-point
+defects were fixed (see below).
 
 ### Accuracy
 
@@ -672,55 +673,59 @@ metrics, because one of them hides the problem:
 
 | Config | Architecture | NRMSE | worst @0.1σ | @0.5σ | @1.0σ |
 |--------|-------------|-------|-------------|-------|-------|
-| single-layer | 4→2 | **0.60%** | 9.2% | 8.3% | 8.3% |
-| small (1-hidden) | 4→[8]→2 | **0.64%** | 8.7% | 8.7% | 8.7% |
-| medium (2-hidden) | 8→[16,8]→4 | **1.29%** | 114.7% | 27.1% | 18.7% |
-
-Shallow nets are genuinely fine. The 2-hidden config is where the tail appears.
+| single-layer | 4→2 | **0.34%** | 9.2% | 2.3% | 1.2% |
+| small (1-hidden) | 4→[8]→2 | **0.17%** | 0.8% | 0.8% | 0.8% |
+| medium (2-hidden) | 8→[16,8]→4 | **0.57%** | 47.0% | 10.5% | 5.0% |
 
 #### All orders, 2-hidden (`baked_parity_all_orders`, 8→[16,8]→4, seed 4242)
 
 | Order | NRMSE | worst @0.1σ | @0.5σ | @1.0σ |
 |-------|-------|-------------|-------|-------|
-| 2 | 2.65% | 474.5% | 62.3% | **34.6%** |
-| 3 | 1.71% | 53.9% | 53.9% | **53.9%** |
-| 4 | 2.26% | 149.5% | 63.1% | **50.0%** |
-| 5 | 2.28% | 326.1% | 78.3% | **35.1%** |
-
-**Read the last column.** Aggregate NRMSE on a 2-hidden net is 1.7–2.7%, which
-looks excellent. The worst-case error on *decision-relevant* outputs — those at
-or above one standard deviation, the ones a caller would actually act on — is
-**34.6–53.9%**. That is not a metric artifact and it does not live only on
-near-zero outputs.
+| 2 | 0.49% | 61.3% | 14.2% | **7.9%** |
+| 3 | 0.59% | 3.1% | 3.1% | **3.1%** |
+| 4 | 0.37% | 16.5% | 4.6% | **3.4%** |
+| 5 | 0.50% | 54.1% | 12.2% | **6.4%** |
 
 At the 0.1σ cut the figure blows up past 100% because a few-LSB absolute error
 divided by a near-noise reference explodes; that part *is* an artifact. The ≥1σ
-column is not.
+column is not, and `baked_parity` now **gates** it at 15%.
 
-**So: baked reliably preserves the ordering of outputs, and does not preserve
-their values.** Use it where you take an argmax or a top-k. Do not use it where
-a caller reads an individual output as a quantity.
+#### What changed: three fixed-point defects, all in `src/baked.rs`
 
-#### Two identified causes, both unfixed
+Before these, the same suite read 0.60–2.65% NRMSE with a **34.6–53.9%** worst
+case on ≥1σ outputs, and the honest advice was "use baked for ranking, never for
+reading an output as a quantity". Each was measured, not guessed.
 
-1. **`ACT_CLAMP` is applied to the output layer.** Activations are clamped to
-   ±2^28 (`src/baked.rs:812`) at every layer including the last, and the exit
-   scale is `s_act_last = 2^28 / p99.9`. The clamp is therefore a hard ceiling
-   at the calibration set's 99.9th percentile: `|output[j]| <= p99.9`, always.
-   Measured on the fixture above, with calibration and evaluation drawn from the
-   *same* distribution, the ceiling truncates 0.08–0.36% of outputs, costing up
-   to 7.2% relative error on each one and 0.07–0.37% NRMSE overall. That cost is
-   bounded only by how far live inputs push the model past its calibration set —
-   and there is no mechanism by which a larger magnitude can ever be returned.
-2. **`norm_a_fixed` carries about 3 bits.** The inter-layer normalization
-   constant is `A_FIXED[i] = round(2^32 / (s_act_prev · std_i))`, which on these
-   fixtures lands on the integers **5 to 10**. Rounding an integer that small is
-   a systematic **2.6–6.7%** scale error, applied at every inter-layer hop. This
-   is the most likely origin of the ≥1σ tail, and it is why a 2-hidden net is so
-   much worse than a 1-hidden one.
+1. **The ACT_TARGET clip.** Every requantized activation saturated at ±2^28, and
+   the exit scale is `s_act_last = 2^28 / p99.9`, so `|output[j]| <= p99.9` held
+   by construction — no input could make the model return a larger magnitude. On
+   a calibrated 4→2 net, 2 of the 2000 *calibration* samples already sat above
+   the ceiling (worst f32 −0.520944 vs baked −0.471458, 9.50% from clipping
+   alone). The stated justification — that saturating protects the next layer's
+   z scale — does not survive checking: `q_z` is clamped to the grid range in
+   the inter-layer step, which is the same clamp the f32 path applies to `z`.
+   The clip was a *second*, tighter saturation the f32 path does not have, so it
+   could only add error, on hidden layers as much as on the output layer.
+   Removing it on hidden layers alone moved the ≥1σ worst case from
+   25.2/51.8/33.7/29.5% to 7.9/3.1/3.4/6.4% for orders 2/3/4/5.
+   The percentile still sets `s_act`; only the clip is gone.
+2. **`norm_a_fixed` carried 3 bits.** The inter-layer scale was
+   `A_FIXED[i] = round(2^32 / (s_act_prev · std_i))` consumed with a hardcoded
+   `>> 16`, which on freshly-built 4×8×2, 8×16×4, 16×32×8 and 32×64×16 nets
+   landed on the integers **8, 7, 8, 9** — a systematic 5.6–7.1% error on the z
+   scale at every hop. A per-layer shift now puts it in [2^29, 2^30) (measured
+   5.4e8–1.0e9 at shifts 42–43). This is what moved NRMSE by 2–4×; it moved the
+   ≥1σ tail much less than the audit predicted (53.9% → 51.8% on order 3).
+3. **`A_FIXED == 0` was reachable and silent.** `round(16 · p99.9 / std)` is 0
+   whenever a layer's outputs have `p99.9 < std/32`; scaling one layer's weights
+   by 1e-3 is enough. The next layer's inputs then collapse to a constant —
+   verified: the model returned the same `(0.12060832, 0.3845482)` for every
+   input while f32 varied. Now unreachable by construction.
 
-Closing the tail means fixing those two, not adding int16 weights (which would
-halve the size win).
+Remaining tail: the ≥1σ worst case is 0.8–7.9%, and the surviving outliers are
+absolute-error events (one sample's error 20–35× the mean absolute error), not a
+systematic scale error. Int16 weights would be the next lever, at the cost of
+half the size win.
 
 ### Model Size (compression)
 
@@ -729,8 +734,8 @@ the old per-layer scalar. The trade-off is well worth it for the accuracy improv
 
 | Config | f32 weight bytes | baked bytes | Compression ratio |
 |--------|-----------------|-------------|-------------------|
-| small 4→[8]→2 | 1,576 B | 720 B | **2.19×** |
-| medium 8→[16,8]→4 | 9,328 B | 3,128 B | **2.98×** |
+| small 4→[8]→2 | 1,576 B | 728 B | **2.16×** |
+| medium 8→[16,8]→4 | 9,328 B | 3,140 B | **2.97×** |
 
 The compression comes from replacing f32 weights (4 bytes each) with i8 (1 byte each),
 plus storing i64 biases and int32 normalization constants. For larger networks the ratio
