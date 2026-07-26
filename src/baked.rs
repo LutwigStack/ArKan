@@ -37,6 +37,19 @@ use serde::{Deserialize, Serialize};
 /// Returns `order+1` values as u16 in Q0.15 format, value ≈ q_b/32768.
 /// Uses closed-form expressions for orders 2–5 reused from gpu/shaders.rs.
 /// t_q16 is in Q0.16 format: value = t_q16 / 65536.0, in [0, 65535].
+///
+/// Every term of a numerator must be at the same Q scale as the leading power
+/// (Q(16*order)); see the per-order INVARIANT comments. Note that
+/// `test_baked_basis_partition_of_unity` cannot police this, because one
+/// coefficient per order is derived as `32768 - sum(others)` and so absorbs any
+/// error in the others. `test_baked_basis_matches_f32_all_orders` is the check
+/// that actually can.
+///
+// ponytail: truncating i128 division (floor, not round-to-nearest) plus one
+// coefficient derived as the remainder. Ceiling: up to `order` Q0.15 LSBs of
+// skew (~1.5e-4) pile onto that one coefficient. Round-to-nearest would halve
+// the per-coefficient error but break the exact-32768 sum lemma that downstream
+// overflow proofs rely on, so it stays floor.
 fn eval_basis_fixed(order: usize, t_q16: u32, out: &mut [u16]) {
     // t is in [0, 1), represented as t_q16/65536
     // We use Q2.29 intermediate arithmetic scaled by 2^29 for precision
@@ -160,12 +173,20 @@ fn eval_basis_fixed(order: usize, t_q16: u32, out: &mut [u16]) {
             let b0 = (omt4 / denom).clamp(0, SCALE as i128) as u16;
             let b4 = (t4 / denom).clamp(0, SCALE as i128) as u16;
 
-            let b1_num = -4 * t4 + 12 * t3 - 6 * t2 * one * one - 12 * t * one * one * one
+            // INVARIANT: every term below must sit at Q64, the scale of the
+            // leading power t4. A term built from t^k carries Q(16k), so it needs
+            // (4-k) factors of `one` to reach Q64. Mixing scales here is exactly
+            // the P0 bug that made this order err by 0.208 (the `t3` terms were
+            // left at Q48).
+            let b1_num = -4 * t4 + 12 * t3 * one - 6 * t2 * one * one - 12 * t * one * one * one
                 + 11 * one * one * one * one;
             let b1 = (b1_num / denom).clamp(0, SCALE as i128) as u16;
 
-            let b3_num = -4 * t4 + 4 * t3 + 6 * t2 * one * one + 4 * t * one * one * one
-                + 1 * one * one * one * one;
+            let b3_num = -4 * t4
+                + 4 * t3 * one
+                + 6 * t2 * one * one
+                + 4 * t * one * one * one
+                + one * one * one * one;
             let b3 = (b3_num / denom).clamp(0, SCALE as i128) as u16;
 
             // B2 via partition of unity
@@ -195,8 +216,7 @@ fn eval_basis_fixed(order: usize, t_q16: u32, out: &mut [u16]) {
             let t2 = t * t;
             let t3 = t2 * t;
             let t4 = t3 * t;
-            let t5 = t4 * t; // Q80 - will overflow i128!
-            // i128 max ≈ 1.7e38, 65536^5 = 2^80 ≈ 1.2e24, *120 ≈ 1.5e26 — fits in i128.
+            let t5 = t4 * t; // Q80, < 2^80; see the magnitude bound below.
             let omt2 = omt * omt;
             let omt3 = omt2 * omt;
             let omt4 = omt3 * omt;
@@ -208,19 +228,31 @@ fn eval_basis_fixed(order: usize, t_q16: u32, out: &mut [u16]) {
             let b0 = (omt5 / denom).clamp(0, SCALE as i128) as u16;
             let b5 = (t5 / denom).clamp(0, SCALE as i128) as u16;
 
-            let b1_num = 5 * t5 - 20 * t4 + 20 * t3 + 20 * t2 * one * one
-                - 50 * t * one * one * one
-                + 26 * one * one * one * one;
+            // INVARIANT: every term below must sit at Q80, the scale of the
+            // leading power t5. A term built from t^k carries Q(16k), so it needs
+            // (5-k) factors of `one` to reach Q80. Mixing scales here is exactly
+            // the P0 bug that made this order err by 0.775.
+            //
+            // Magnitude bound: |t| < 2^16 and one = 2^16, so every term is
+            // < |coef| * 2^80 and every numerator (and every left-to-right
+            // partial sum) is < (sum of |coef|) * 2^80 <= 166 * 2^80 < 2^87.4.
+            // i128 holds up to 2^127 - 1, so there is >= 2^39 of headroom.
+            let b1_num = 5 * t5 - 20 * t4 * one + 20 * t3 * one * one + 20 * t2 * one * one * one
+                - 50 * t * one * one * one * one
+                + 26 * one * one * one * one * one;
             let b1 = (b1_num / denom).clamp(0, SCALE as i128) as u16;
 
-            let b4_num = -5 * t5 + 5 * t4 + 10 * t3 + 10 * t2 * one * one
-                + 5 * t * one * one * one
-                + 1 * one * one * one * one;
+            let b4_num = -5 * t5
+                + 5 * t4 * one
+                + 10 * t3 * one * one
+                + 10 * t2 * one * one * one
+                + 5 * t * one * one * one * one
+                + one * one * one * one * one;
             let b4 = (b4_num / denom).clamp(0, SCALE as i128) as u16;
 
-            // For b2 and b3, use partition-of-unity trick on b2+b3
             // b2_num = -10t^5 + 30t^4 - 60t^2 + 66
-            let b2_num = -10 * t5 + 30 * t4 - 60 * t2 * one * one + 66 * one * one * one * one;
+            let b2_num = -10 * t5 + 30 * t4 * one - 60 * t2 * one * one * one
+                + 66 * one * one * one * one * one;
             let b2 = (b2_num / denom).clamp(0, SCALE as i128) as u16;
 
             // b3 via partition of unity
@@ -955,49 +987,104 @@ mod tests {
         }
     }
 
+    /// Cox-de Boor ground truth for the *uniform* B-spline basis on t in [0,1).
+    ///
+    /// Knots are the integers, span = order, x = order + t — the canonical
+    /// uniform setup the closed forms in `eval_basis_fixed` (and in
+    /// gpu/shaders.rs) are derived from. `x` is exact in f32 (≤3 integer bits
+    /// plus 16 fractional bits), so this reference carries no scaling error.
+    fn f32_basis_ref(order: usize, t_q16: u32, out: &mut [f32]) {
+        let knots: Vec<f32> = (0..=(2 * order + 1)).map(|i| i as f32).collect();
+        let x = order as f32 + t_q16 as f32 / 65536.0;
+        compute_basis(x, order, &knots, order, out);
+    }
+
     #[test]
-    fn test_baked_basis_matches_f32_order3() {
-        // Compare fixed-point basis against f32 compute_basis for order=3
-        use crate::spline::{compute_basis, compute_knots, find_span};
+    fn test_baked_basis_matches_f32_all_orders() {
+        // Every order 2..=5, not just order 3. A correct fixed-point basis is
+        // within a couple of Q0.15 LSBs (~1e-4) of the f32 reference, so TOL is
+        // set an order of magnitude above that and ~200x below the Q-scale bug
+        // it replaced (order 4 erred by 0.208, order 5 by 0.775).
+        //
+        // This also pins the "every numerator >= 0" premise of the sum lemma:
+        // the multi-term numerators have a true minimum of 1/120 ≈ 0.0083 over
+        // t in [0,1] — 8x TOL — so a numerator that went negative would clamp to
+        // 0 and fail here. The other two numerators are the monomials t^p and
+        // (1-t)^p, non-negative by construction.
+        const TOL: f32 = 0.001;
 
-        let order = 3;
-        let grid_size = 5;
-        let knots = compute_knots(grid_size, order, (-1.0, 1.0));
-
-        for t_val in [0.0f32, 0.1, 0.25, 0.5, 0.75, 0.9, 0.999] {
-            // t_val is local t in [0,1)
-            // Pick a sample z value in the middle of a span
-            let z = -0.6 + t_val * 0.4; // stays in range [-1, 1]
-            let span = find_span(z, &knots, order, grid_size);
-
-            // F32 reference
+        // Report every order before failing, so one run localizes the fault.
+        let mut failures = Vec::new();
+        for order in 2..=5usize {
+            let mut worst = 0.0f32;
+            let mut worst_at = (0u32, 0usize);
             let mut basis_f = vec![0.0f32; order + 1];
-            compute_basis(z, span, &knots, order, &mut basis_f);
-
-            // Fixed-point: extract t from the f32 forward
-            let t_min = knots[order];
-            let t_max = knots[order + grid_size];
-            let h = (t_max - t_min) / grid_size as f32;
-            let interval = (span - order) as f32;
-            let t_local = ((z - t_min) / h - interval).clamp(0.0, 1.0 - 1e-6);
-            let t_q16 = (t_local * 65536.0).round() as u32;
-
             let mut basis_i = vec![0u16; order + 1];
-            eval_basis_fixed(order, t_q16, &mut basis_i);
 
-            for k in 0..=order {
-                let bf = basis_f[k];
-                let bi = basis_i[k] as f32 / 32768.0;
-                let err = (bf - bi).abs();
-                assert!(
-                    err < 0.01,
-                    "order=3, k={}, t_local={}: f32={:.6}, fixed={:.6}, err={:.6}",
-                    k,
-                    t_local,
-                    bf,
-                    bi,
-                    err
+            for t_q16 in (0..65536u32).step_by(64).chain([65535]) {
+                f32_basis_ref(order, t_q16, &mut basis_f);
+                eval_basis_fixed(order, t_q16, &mut basis_i);
+                for k in 0..=order {
+                    let err = (basis_f[k] - basis_i[k] as f32 / 32768.0).abs();
+                    if err > worst {
+                        worst = err;
+                        worst_at = (t_q16, k);
+                    }
+                }
+            }
+
+            println!(
+                "[basis order={}] max abs err vs f32 = {:.6} at t_q16={}, k={}",
+                order, worst, worst_at.0, worst_at.1
+            );
+            if worst >= TOL {
+                failures.push(format!(
+                    "order={order}: max abs err {worst:.6} >= {TOL} (worst at t_q16={}, k={})",
+                    worst_at.0, worst_at.1
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+
+        // Exact-integer regression pins for the two vectors the P0 bug report
+        // named. These are floor(32768 * B_k), with the last-computed
+        // coefficient (k=3 for order 5, k=2 for order 4) taking the remainder,
+        // so they sit up to ~1.3 LSB off a round-to-nearest reference. The
+        // broken code returned [273,0,0,32495,0,0] and [85,4437,22359,5802,85].
+        let mut b5 = [0u16; 6];
+        eval_basis_fixed(5, 0, &mut b5);
+        assert_eq!(b5, [273, 7099, 18022, 7101, 273, 0], "order 5 at t_q16=0");
+        let mut b4 = [0u16; 5];
+        eval_basis_fixed(4, 32768, &mut b4);
+        assert_eq!(b4, [85, 6485, 19628, 6485, 85], "order 4 at t_q16=32768");
+    }
+
+    #[test]
+    fn test_baked_basis_sum_lemma_exhaustive() {
+        // Sum lemma, load-bearing for downstream overflow proofs: for every
+        // representable t_q16 and every order 2..=5 the basis is non-negative
+        // (u16, so by type) and sums to EXACTLY 32768.
+        //
+        // The exact sum is not cosmetic: the last coefficient is computed as
+        // 32768 - sum(others), clamped to [0, 32768]. If sum(others) ever
+        // exceeded 32768 the clamp would fire and the total would come out
+        // above 32768, so `sum == 32768` is the check that the clamp is dead
+        // code on this input domain.
+        for order in 2..=5usize {
+            let mut basis = vec![0u16; order + 1];
+            for t_q16 in 0..65536u32 {
+                eval_basis_fixed(order, t_q16, &mut basis);
+                let sum: u32 = basis.iter().map(|&b| b as u32).sum();
+                assert_eq!(
+                    sum, 32768,
+                    "order={order}, t_q16={t_q16}: basis sum={sum} (basis={basis:?})"
                 );
+                for &b in basis.iter() {
+                    assert!(
+                        b <= 32768,
+                        "order={order}, t_q16={t_q16}: coeff {b} exceeds 32768"
+                    );
+                }
             }
         }
     }
