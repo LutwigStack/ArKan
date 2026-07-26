@@ -788,11 +788,16 @@ fn span_pattern(net: &KanNetwork, input: &[f32], ws: &mut Workspace) -> Vec<u32>
 
 /// Central-difference step for network weights.
 ///
-/// The loss is not polynomial in a weight two layers down, so this cannot be pushed
-/// up the way the layer-level step was: truncation and the span-pattern skip rate
-/// both grow with it. 3e-3 was measured to skip 3x more probes than 1e-3 while
-/// improving nothing, since with Richardson the round-off floor - `eps * |L| / h`,
-/// ~6e-4 here - is what binds.
+/// Bigger is better here for the same reason as [`Z_STEP_FRACTION`]: what binds is
+/// round-off, `eps * |L| / h`, and Richardson removes the `h^2` truncation a larger
+/// step would otherwise cost. At 1e-3 the saturating sweep could not be made to pass
+/// at all - the difference quotient's own noise reached 1.1e-2 on gradients of ~0.16 -
+/// and 4e-3 brings that to 1.6e-2 on gradients of 292. The price is probes lost to the
+/// span-pattern skip, and it is small: measured 4410 usable probes on the deep sweep
+/// against 4465 at 1e-3, 871 against 883 on the saturating one.
+///
+/// It cannot be pushed much further: the loss is not polynomial in a weight two layers
+/// down, so truncation is real, and the skip rate grows.
 const NET_FD_STEP: f32 = 4e-3;
 
 /// Absolute floor of the network-level tolerance.
@@ -827,12 +832,14 @@ const NET_REL: f64 = 3e-3;
 /// coefficient whose gradient is far below its layer's scale is the tail of a heavily
 /// cancelling sum.
 ///
-/// Measured on the saturating sweep: layer 0 has `max |grad_w| = 36`, and the five
-/// probes whose analytic value is ~1e-4..3e-3 disagree with a stable difference
-/// quotient by 1e-4..4e-4 - i.e. ~1e-5 of the layer scale, independent of the probe's
-/// own value, which is what a round-off explanation predicts and a systematic error
-/// does not. 3e-5 leaves 2.7x margin. On the well-conditioned sweeps the layer scale
-/// is ~0.05 and this term is ~1e-6, so it costs nothing there.
+/// Measured on the saturating sweep: the probes that disagree with a *stable*
+/// difference quotient all have analytic values of ~1e-4..3e-3 while their layer's
+/// scale is 1..36, and they disagree by 1e-4..4e-4 - an absolute error set by the layer
+/// scale and independent of the probe's own value, which is what round-off predicts and
+/// a systematic error does not. Worst case needs `1e-4 * scale` and
+/// `SPREAD_SAFETY * spread` *together*: 9.8e-5 + 2.1e-4 against a gap of 1.97e-4, the
+/// 0.584 worst ratio this file reports. On the well-conditioned sweeps the layer scale
+/// is ~0.05, so this term is ~5e-6 and costs nothing.
 const NET_ANA_REL: f64 = 1e-4;
 
 /// Safety factor on the measured spread.
@@ -843,8 +850,8 @@ const NET_ANA_REL: f64 = 1e-4;
 /// sweep is 4.7, so 5 is at the observed edge and [`NET_ANA_REL`] carries the rest.
 const SPREAD_SAFETY: f64 = 5.0;
 
-/// Tolerance for one network probe: the fixed part, plus three times the difference
-/// quotient's own measured uncertainty, plus the analytic side's own round-off.
+/// Tolerance for one network probe: the fixed part, plus [`SPREAD_SAFETY`] times the
+/// difference quotient's own measured uncertainty, plus the analytic side's round-off.
 ///
 /// `spread` is `|R(h) - R(h/2)|`, the disagreement between two Richardson estimates
 /// built from central differences at `h`, `h/2` and `h/4`. It is the standard
