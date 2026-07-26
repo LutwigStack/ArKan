@@ -312,8 +312,7 @@ fn run_gradient_check(config: &KanConfig, batch_size: usize, test_name: &str) {
         }
 
         // Check ALL biases (they're fewer)
-        for b_idx in 0..num_biases {
-            let ana_grad = ana_bias_grads[layer_idx][b_idx];
+        for (b_idx, &ana_grad) in ana_bias_grads[layer_idx].iter().enumerate() {
             let num_grad = numerical_gradient_bias(
                 &mut network,
                 &input,

@@ -63,8 +63,14 @@ fn main() {
 
     let mut network = KanNetwork::new(config.clone());
 
-    println!("Network architecture: {}→{:?}→{}", config.input_dim, config.hidden_dims, config.output_dim);
-    println!("Grid size: {}, Spline order: {}\n", config.grid_size, config.spline_order);
+    println!(
+        "Network architecture: {}→{:?}→{}",
+        config.input_dim, config.hidden_dims, config.output_dim
+    );
+    println!(
+        "Grid size: {}, Spline order: {}\n",
+        config.grid_size, config.spline_order
+    );
 
     // ----------------------------------------------------------------
     // 2. Brief training (a few steps so weights are non-trivial)
@@ -120,7 +126,10 @@ fn main() {
     // 5. Inference comparison on a few sample inputs
     // ----------------------------------------------------------------
     println!("\n--- Sample inference (baked vs f32) ---");
-    println!("{:<6}  {:<22}  {:<22}  {}", "sample", "baked out", "f32 out", "abs_err");
+    println!(
+        "{:<6}  {:<22}  {:<22}  abs_err",
+        "sample", "baked out", "f32 out"
+    );
 
     let n_test = 5;
     let test_inputs = generate_inputs(n_test, config.input_dim, 5678);
@@ -152,7 +161,11 @@ fn main() {
         );
     }
 
-    println!("\nMean abs error across {} samples: {:.5}", n_test, total_err / n_test as f64);
+    println!(
+        "\nMean abs error across {} samples: {:.5}",
+        n_test,
+        total_err / n_test as f64
+    );
     println!("(NRMSE ~0.6–1.3% for calibrated nets; suitable for ranking/argmax)");
 
     // ----------------------------------------------------------------
@@ -162,8 +175,11 @@ fn main() {
     {
         println!("\n--- Serialization round-trip (serde feature) ---");
         let bytes = baked.to_bytes().expect("to_bytes failed");
-        println!("  Serialized to {} bytes (header: 16 bytes magic+version, body: {} bytes)",
-            bytes.len(), bytes.len() - 16);
+        println!(
+            "  Serialized to {} bytes (header: 16 bytes magic+version, body: {} bytes)",
+            bytes.len(),
+            bytes.len() - 16
+        );
 
         let baked2 = BakedModel::from_bytes(&bytes).expect("from_bytes failed");
 

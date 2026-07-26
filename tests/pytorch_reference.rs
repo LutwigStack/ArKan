@@ -4,6 +4,10 @@
 //! Reference values were generated using scripts/pytorch_optimizer_reference.py
 //!
 //! The goal is to ensure mathematical equivalence between implementations.
+//!
+//! Reference literals are written in the shortest decimal form that round-trips
+//! to the same f32 bit pattern PyTorch produced — the extra digits PyTorch
+//! printed are below f32 resolution and only tripped `excessive_precision`.
 
 /// Tolerance for floating point comparison
 /// PyTorch uses float32, and there can be minor differences due to:
@@ -41,7 +45,11 @@ fn assert_vec_eq(actual: &[f32], expected: &[f32], tolerance: f32, context: &str
         assert!(
             diff < tolerance,
             "{}: element {} differs: actual={}, expected={}, diff={}",
-            context, i, a, e, diff
+            context,
+            i,
+            a,
+            e,
+            diff
         );
     }
 }
@@ -56,55 +64,59 @@ fn test_pytorch_adam_default_quadratic() {
     // Adam(lr=0.01, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
     // init_params=[1.0, 2.0, 3.0, 4.0]
     // 10 steps on quadratic f(x) = Σ x_i²
-    
+
     // Expected trajectory from PyTorch (first few steps)
-    let expected_steps = vec![
-        vec![1.0, 2.0, 3.0, 4.0],                                    // Initial
-        vec![0.99, 1.99, 2.99, 3.99],                                // Step 1
-        vec![0.9800027608871, 1.9800013303757, 2.9800009727478, 3.9800007343292], // Step 2
-        vec![0.9700101017952, 1.9700049161911, 2.9700033664703, 3.9700024127960], // Step 3
+    let expected_steps = [
+        [1.0f32, 2.0, 3.0, 4.0],                      // Initial
+        [0.99, 1.99, 2.99, 3.99],                     // Step 1
+        [0.98000276, 1.9800013, 2.980001, 3.9800007], // Step 2
+        [0.9700101, 1.9700049, 2.9700034, 3.9700024], // Step 3
     ];
-    
+
     let mut params = vec![1.0f32, 2.0, 3.0, 4.0];
-    
+
     // Simulate Adam manually (we need direct param access, not through network)
     // Adam state
-    let mut m = vec![0.0f32; 4]; // First moment
-    let mut v = vec![0.0f32; 4]; // Second moment
+    let mut m = [0.0f32; 4]; // First moment
+    let mut v = [0.0f32; 4]; // Second moment
     let lr = 0.01f32;
     let beta1 = 0.9f32;
     let beta2 = 0.999f32;
     let eps = 1e-8f32;
-    
+
     // Verify initial state
     assert_vec_eq(&params, &expected_steps[0], TOLERANCE, "Initial params");
-    
-    for step in 1..4 {
+
+    for (step, expected) in expected_steps.iter().enumerate().skip(1) {
         let grad = quadratic_grad(&params);
-        
+
         // Update biased first moment estimate
         for i in 0..4 {
             m[i] = beta1 * m[i] + (1.0 - beta1) * grad[i];
         }
-        
+
         // Update biased second raw moment estimate
         for i in 0..4 {
             v[i] = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i];
         }
-        
+
         // Compute bias-corrected estimates
         let bias_correction1 = 1.0 - beta1.powi(step as i32);
         let bias_correction2 = 1.0 - beta2.powi(step as i32);
-        
+
         // Update parameters
         for i in 0..4 {
             let m_hat = m[i] / bias_correction1;
             let v_hat = v[i] / bias_correction2;
             params[i] -= lr * m_hat / (v_hat.sqrt() + eps);
         }
-        
-        assert_vec_eq(&params, &expected_steps[step], LOOSE_TOLERANCE, 
-            &format!("Step {}", step));
+
+        assert_vec_eq(
+            &params,
+            expected,
+            LOOSE_TOLERANCE,
+            &format!("Step {}", step),
+        );
     }
 }
 
@@ -112,73 +124,78 @@ fn test_pytorch_adam_default_quadratic() {
 fn test_pytorch_adam_with_weight_decay() {
     // PyTorch Adam with weight_decay=0.01 (L2 regularization)
     // Note: PyTorch's Adam adds weight_decay * param to gradient BEFORE Adam update
-    
+
     // Expected after 10 steps from PyTorch
-    let expected_final = vec![0.9003496766090393, 1.9001675844192505, 2.9001107215881348, 3.9000821113586426];
-    
+    let expected_final = [0.9003497f32, 1.9001676, 2.9001107, 3.900082];
+
     let mut params = vec![1.0f32, 2.0, 3.0, 4.0];
-    let mut m = vec![0.0f32; 4];
-    let mut v = vec![0.0f32; 4];
+    let mut m = [0.0f32; 4];
+    let mut v = [0.0f32; 4];
     let lr = 0.01f32;
     let beta1 = 0.9f32;
     let beta2 = 0.999f32;
     let eps = 1e-8f32;
     let weight_decay = 0.01f32;
-    
+
     for step in 1..=10 {
         // Gradient with L2 regularization (PyTorch style)
         let mut grad = quadratic_grad(&params);
         for i in 0..4 {
             grad[i] += weight_decay * params[i]; // L2 regularization
         }
-        
+
         for i in 0..4 {
             m[i] = beta1 * m[i] + (1.0 - beta1) * grad[i];
             v[i] = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i];
         }
-        
+
         let bias_correction1 = 1.0 - beta1.powi(step);
         let bias_correction2 = 1.0 - beta2.powi(step);
-        
+
         for i in 0..4 {
             let m_hat = m[i] / bias_correction1;
             let v_hat = v[i] / bias_correction2;
             params[i] -= lr * m_hat / (v_hat.sqrt() + eps);
         }
     }
-    
-    assert_vec_eq(&params, &expected_final, LOOSE_TOLERANCE, "Final params with weight decay");
+
+    assert_vec_eq(
+        &params,
+        &expected_final,
+        LOOSE_TOLERANCE,
+        "Final params with weight decay",
+    );
 }
 
 #[test]
 fn test_pytorch_adamw_decoupled_weight_decay() {
     // PyTorch AdamW with decoupled weight decay
     // weight_decay is applied directly to weights, not added to gradient
-    
+
     // Expected after 10 steps from PyTorch AdamW
-    let expected_final = vec![0.8993987441062927, 1.898216724395752, 2.8971598148345947, 3.8961315155029297];
-    
+    let expected_final = [0.89939874f32, 1.8982167, 2.8971598, 3.8961315];
+
     let mut params = vec![1.0f32, 2.0, 3.0, 4.0];
-    let mut m = vec![0.0f32; 4];
-    let mut v = vec![0.0f32; 4];
+    let mut m = [0.0f32; 4];
+    let mut v = [0.0f32; 4];
     let lr = 0.01f32;
     let beta1 = 0.9f32;
     let beta2 = 0.999f32;
     let eps = 1e-8f32;
     let weight_decay = 0.01f32;
-    
+
     for step in 1..=10 {
         // Regular gradient (no L2 term)
         let grad = quadratic_grad(&params);
-        
+
         for i in 0..4 {
             m[i] = beta1 * m[i] + (1.0 - beta1) * grad[i];
             v[i] = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i];
         }
-        
+
         let bias_correction1 = 1.0 - beta1.powi(step);
         let bias_correction2 = 1.0 - beta2.powi(step);
-        
+
         for i in 0..4 {
             let m_hat = m[i] / bias_correction1;
             let v_hat = v[i] / bias_correction2;
@@ -186,44 +203,54 @@ fn test_pytorch_adamw_decoupled_weight_decay() {
             params[i] -= lr * (m_hat / (v_hat.sqrt() + eps) + weight_decay * params[i]);
         }
     }
-    
-    assert_vec_eq(&params, &expected_final, LOOSE_TOLERANCE, "Final params AdamW");
+
+    assert_vec_eq(
+        &params,
+        &expected_final,
+        LOOSE_TOLERANCE,
+        "Final params AdamW",
+    );
 }
 
 #[test]
 fn test_pytorch_adam_custom_betas() {
     // PyTorch Adam with custom betas=(0.5, 0.9999)
-    
+
     // Expected after 10 steps from PyTorch
-    let expected_final = vec![0.9900153279304504, 1.9900075197219849, 2.9900052547454834, 3.9900035858154297];
-    
+    let expected_final = [0.9900153f32, 1.9900075, 2.9900053, 3.9900036];
+
     let mut params = vec![1.0f32, 2.0, 3.0, 4.0];
-    let mut m = vec![0.0f32; 4];
-    let mut v = vec![0.0f32; 4];
+    let mut m = [0.0f32; 4];
+    let mut v = [0.0f32; 4];
     let lr = 0.001f32;
     let beta1 = 0.5f32;
     let beta2 = 0.9999f32;
     let eps = 1e-8f32;
-    
+
     for step in 1..=10 {
         let grad = quadratic_grad(&params);
-        
+
         for i in 0..4 {
             m[i] = beta1 * m[i] + (1.0 - beta1) * grad[i];
             v[i] = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i];
         }
-        
+
         let bias_correction1 = 1.0 - beta1.powi(step);
         let bias_correction2 = 1.0 - beta2.powi(step);
-        
+
         for i in 0..4 {
             let m_hat = m[i] / bias_correction1;
             let v_hat = v[i] / bias_correction2;
             params[i] -= lr * m_hat / (v_hat.sqrt() + eps);
         }
     }
-    
-    assert_vec_eq(&params, &expected_final, LOOSE_TOLERANCE, "Final params custom betas");
+
+    assert_vec_eq(
+        &params,
+        &expected_final,
+        LOOSE_TOLERANCE,
+        "Final params custom betas",
+    );
 }
 
 // ============================================================================
@@ -233,28 +260,28 @@ fn test_pytorch_adam_custom_betas() {
 #[test]
 fn test_pytorch_sgd_no_momentum() {
     // PyTorch SGD(lr=0.1, momentum=0) on quadratic
-    
+
     // Expected trajectory (analytical for quadratic):
     // x[t+1] = x[t] - lr * 2 * x[t] = x[t] * (1 - 2*lr) = x[t] * 0.8
-    
-    let expected_steps = vec![
-        vec![1.0, 2.0, 3.0, 4.0],                     // Initial
-        vec![0.8, 1.6, 2.4, 3.2],                     // Step 1
-        vec![0.64, 1.28, 1.92, 2.56],                 // Step 2
-        vec![0.512, 1.024, 1.536, 2.048],             // Step 3
+
+    let expected_steps = [
+        [1.0f32, 2.0, 3.0, 4.0],      // Initial
+        [0.8, 1.6, 2.4, 3.2],         // Step 1
+        [0.64, 1.28, 1.92, 2.56],     // Step 2
+        [0.512, 1.024, 1.536, 2.048], // Step 3
     ];
-    
+
     let mut params = vec![1.0f32, 2.0, 3.0, 4.0];
     let lr = 0.1f32;
-    
+
     assert_vec_eq(&params, &expected_steps[0], TOLERANCE, "Initial");
-    
-    for step in 1..4 {
+
+    for (step, expected) in expected_steps.iter().enumerate().skip(1) {
         let grad = quadratic_grad(&params);
         for i in 0..4 {
             params[i] -= lr * grad[i];
         }
-        assert_vec_eq(&params, &expected_steps[step], TOLERANCE, &format!("Step {}", step));
+        assert_vec_eq(&params, expected, TOLERANCE, &format!("Step {}", step));
     }
 }
 
@@ -262,20 +289,15 @@ fn test_pytorch_sgd_no_momentum() {
 fn test_pytorch_sgd_with_momentum() {
     // PyTorch SGD(lr=0.1, momentum=0.9) on quadratic
     // Note: PyTorch SGD momentum formula: v = momentum * v + grad; param -= lr * v
-    
+
     // Expected from PyTorch
-    let expected_final = vec![
-        0.0043998658657073975, 
-        0.008799731731414795, 
-        0.013199687004089355, 
-        0.01759946346282959
-    ];
-    
+    let expected_final = [0.004399866f32, 0.008799732, 0.013199687, 0.017599463];
+
     let mut params = vec![1.0f32, 2.0, 3.0, 4.0];
-    let mut velocity = vec![0.0f32; 4];
+    let mut velocity = [0.0f32; 4];
     let lr = 0.1f32;
     let momentum = 0.9f32;
-    
+
     for _ in 0..10 {
         let grad = quadratic_grad(&params);
         for i in 0..4 {
@@ -283,28 +305,28 @@ fn test_pytorch_sgd_with_momentum() {
             params[i] -= lr * velocity[i];
         }
     }
-    
-    assert_vec_eq(&params, &expected_final, LOOSE_TOLERANCE, "SGD with momentum");
+
+    assert_vec_eq(
+        &params,
+        &expected_final,
+        LOOSE_TOLERANCE,
+        "SGD with momentum",
+    );
 }
 
 #[test]
 fn test_pytorch_sgd_nesterov() {
     // PyTorch SGD(lr=0.1, momentum=0.9, nesterov=True) on quadratic
     // Nesterov momentum: v = momentum * v + grad; param -= lr * (momentum * v + grad)
-    
+
     // Expected from PyTorch
-    let expected_final = vec![
-        0.051360733807086945, 
-        0.10272146761417389, 
-        0.15408211946487427, 
-        0.20544293522834778
-    ];
-    
+    let expected_final = [0.051360734f32, 0.10272147, 0.15408212, 0.20544294];
+
     let mut params = vec![1.0f32, 2.0, 3.0, 4.0];
-    let mut velocity = vec![0.0f32; 4];
+    let mut velocity = [0.0f32; 4];
     let lr = 0.1f32;
     let momentum = 0.9f32;
-    
+
     for _ in 0..10 {
         let grad = quadratic_grad(&params);
         for i in 0..4 {
@@ -313,28 +335,23 @@ fn test_pytorch_sgd_nesterov() {
             params[i] -= lr * (momentum * velocity[i] + grad[i]);
         }
     }
-    
+
     assert_vec_eq(&params, &expected_final, LOOSE_TOLERANCE, "SGD Nesterov");
 }
 
 #[test]
 fn test_pytorch_sgd_with_weight_decay() {
     // PyTorch SGD(lr=0.1, momentum=0.9, weight_decay=0.01)
-    
+
     // Expected from PyTorch
-    let expected_final = vec![
-        0.011977165937423706, 
-        0.023954331874847412, 
-        0.03593176603317261, 
-        0.047908663749694824
-    ];
-    
+    let expected_final = [0.011977166f32, 0.023954332, 0.035931766, 0.047908664];
+
     let mut params = vec![1.0f32, 2.0, 3.0, 4.0];
-    let mut velocity = vec![0.0f32; 4];
+    let mut velocity = [0.0f32; 4];
     let lr = 0.1f32;
     let momentum = 0.9f32;
     let weight_decay = 0.01f32;
-    
+
     for _ in 0..10 {
         let mut grad = quadratic_grad(&params);
         // PyTorch SGD adds weight_decay * param to gradient
@@ -346,8 +363,13 @@ fn test_pytorch_sgd_with_weight_decay() {
             params[i] -= lr * velocity[i];
         }
     }
-    
-    assert_vec_eq(&params, &expected_final, LOOSE_TOLERANCE, "SGD with weight decay");
+
+    assert_vec_eq(
+        &params,
+        &expected_final,
+        LOOSE_TOLERANCE,
+        "SGD with weight decay",
+    );
 }
 
 // ============================================================================
@@ -358,18 +380,18 @@ fn test_pytorch_sgd_with_weight_decay() {
 fn test_pytorch_lbfgs_quadratic_convergence() {
     // L-BFGS should converge on quadratic in very few steps
     // Since quadratic is convex, L-BFGS approximates true Hessian well
-    
+
     // PyTorch LBFGS with strong_wolfe on quadratic
     // Expected: should reach near-zero very quickly
-    
-    let init_params = vec![1.0f32, 2.0, 3.0, 4.0];
+
+    let init_params = [1.0f32, 2.0, 3.0, 4.0];
     let init_loss = init_params.iter().map(|x| x * x).sum::<f32>();
-    
+
     // For quadratic, L-BFGS should converge to ~0 within 5 steps
     // We just verify it converges significantly
-    
+
     assert!((init_loss - 30.0).abs() < 1e-5, "Initial loss should be 30");
-    
+
     // Note: Full L-BFGS integration test would require network, skipping here
 }
 
@@ -377,24 +399,27 @@ fn test_pytorch_lbfgs_quadratic_convergence() {
 fn test_pytorch_lbfgs_rosenbrock() {
     // L-BFGS on Rosenbrock function starting from (-1, 1)
     // Minimum is at (1, 1) with f(1,1) = 0
-    
+
     // PyTorch LBFGS converges to near (1, 1) after ~20 steps
     // Expected trajectory shows decreasing loss
-    
+
     let mut x = -1.0f32;
     let mut y = 1.0f32;
-    
+
     let init_loss = rosenbrock_loss(x, y);
-    assert!((init_loss - 4.0).abs() < 1e-5, "Initial Rosenbrock loss at (-1,1) should be 4");
-    
+    assert!(
+        (init_loss - 4.0).abs() < 1e-5,
+        "Initial Rosenbrock loss at (-1,1) should be 4"
+    );
+
     // Verify gradient computation
     let (gx, gy) = rosenbrock_grad(x, y);
-    // At (-1, 1): 
+    // At (-1, 1):
     // dx = -2(1-(-1)) - 400*(-1)*(1-1) = -2*2 - 0 = -4
     // dy = 200*(1-1) = 0
     assert!((gx - (-4.0)).abs() < 1e-5, "Gradient x at (-1,1)");
     assert!((gy - 0.0).abs() < 1e-5, "Gradient y at (-1,1)");
-    
+
     // Simple gradient descent to verify we can reach minimum
     // (L-BFGS would be faster but harder to verify step-by-step)
     let lr = 0.001f32;
@@ -403,9 +428,13 @@ fn test_pytorch_lbfgs_rosenbrock() {
         x -= lr * gx;
         y -= lr * gy;
     }
-    
+
     let final_loss = rosenbrock_loss(x, y);
-    assert!(final_loss < 1.0, "Should converge toward minimum, got loss={}", final_loss);
+    assert!(
+        final_loss < 1.0,
+        "Should converge toward minimum, got loss={}",
+        final_loss
+    );
 }
 
 /// Standalone L-BFGS implementation for pure function optimization.
@@ -465,7 +494,7 @@ impl StandaloneLBFGS {
         let mut r: Vec<f64> = q.iter().map(|&q| gamma * q).collect();
 
         // Second loop (forward)
-        for i in 0..m {
+        for (i, &alpha_i) in alpha.iter().enumerate() {
             let beta = self.rho_history[i]
                 * self.y_history[i]
                     .iter()
@@ -473,7 +502,7 @@ impl StandaloneLBFGS {
                     .map(|(&y, &r)| y * r)
                     .sum::<f64>();
             for (r_j, &s_ij) in r.iter_mut().zip(self.s_history[i].iter()) {
-                *r_j += s_ij * (alpha[i] - beta);
+                *r_j += s_ij * (alpha_i - beta);
             }
         }
 
@@ -554,7 +583,11 @@ impl StandaloneLBFGS {
                 continue;
             }
 
-            let dg_new: f64 = g_new.iter().zip(direction.iter()).map(|(&g, &d)| g * d).sum();
+            let dg_new: f64 = g_new
+                .iter()
+                .zip(direction.iter())
+                .map(|(&g, &d)| g * d)
+                .sum();
 
             // Check Armijo condition (sufficient decrease)
             if f_new > f0 + C1 * alpha * dg0 || (iter > 0 && f_new >= f_lo) {
@@ -608,17 +641,11 @@ impl StandaloneLBFGS {
         let direction = self.two_loop_recursion(&g0);
 
         // Line search
-        let (alpha, g_new, _f_new) = match self.strong_wolfe_line_search(
-            x,
-            f0,
-            &g0,
-            &direction,
-            &loss_fn,
-            &grad_fn,
-        ) {
-            Some(result) => result,
-            None => return f0,
-        };
+        let (alpha, g_new, _f_new) =
+            match self.strong_wolfe_line_search(x, f0, &g0, &direction, &loss_fn, &grad_fn) {
+                Some(result) => result,
+                None => return f0,
+            };
 
         // Update x
         let x_old: Vec<f64> = x.to_vec();
@@ -627,8 +654,16 @@ impl StandaloneLBFGS {
         }
 
         // Compute s and y for history
-        let s: Vec<f64> = x.iter().zip(x_old.iter()).map(|(&xn, &x0)| xn - x0).collect();
-        let y: Vec<f64> = g_new.iter().zip(g0.iter()).map(|(&gn, &g0)| gn - g0).collect();
+        let s: Vec<f64> = x
+            .iter()
+            .zip(x_old.iter())
+            .map(|(&xn, &x0)| xn - x0)
+            .collect();
+        let y: Vec<f64> = g_new
+            .iter()
+            .zip(g0.iter())
+            .map(|(&gn, &g0)| gn - g0)
+            .collect();
 
         self.update_history(s, y);
 
@@ -654,14 +689,14 @@ fn rosenbrock_grad_f64(params: &[f64]) -> Vec<f64> {
 }
 
 /// LBFGS Rosenbrock test with PyTorch reference values.
-/// 
+///
 /// PyTorch reference (from scripts/pytorch_reference_values.json):
 /// - Init: (-1.0, 1.0)
 /// - Loss trajectory: [4.0, 0.242, 8e-11, ...]
 /// - Final: (~1.0, ~1.0)
-/// 
+///
 /// L-BFGS should converge to the minimum (1,1) within a few steps.
-/// Note: Exact step-by-step parity with PyTorch is not expected due to 
+/// Note: Exact step-by-step parity with PyTorch is not expected due to
 /// implementation differences in line search. We verify convergence behavior.
 #[test]
 fn test_pytorch_lbfgs_rosenbrock_parity() {
@@ -669,43 +704,45 @@ fn test_pytorch_lbfgs_rosenbrock_parity() {
     const PYTORCH_INIT_LOSS: f64 = 4.0;
     const PYTORCH_FINAL_X: f64 = 1.0000066757202148;
     const PYTORCH_FINAL_Y: f64 = 1.000012755393982;
-    
+
     let mut lbfgs = StandaloneLBFGS::new(10);
     let mut x = vec![-1.0f64, 1.0];
-    
+
     // Verify initial loss
     let init_loss = rosenbrock_loss_f64(&x);
     assert!(
         (init_loss - PYTORCH_INIT_LOSS).abs() < 1e-10,
         "Initial loss mismatch: got {}, expected {}",
-        init_loss, PYTORCH_INIT_LOSS
+        init_loss,
+        PYTORCH_INIT_LOSS
     );
-    
+
     // Record losses for each step
     let mut losses = vec![init_loss];
-    
+
     // Run optimization steps
     for step in 0..20 {
         let loss = lbfgs.step(&mut x, rosenbrock_loss_f64, rosenbrock_grad_f64);
         losses.push(loss);
-        
+
         // Early exit if converged
         if loss < 1e-12 {
             println!("Converged at step {} with loss={:.2e}", step + 1, loss);
             break;
         }
     }
-    
+
     let final_loss = rosenbrock_loss_f64(&x);
-    
+
     // Key verification: Loss should decrease monotonically (mostly)
     // and converge to near zero
     assert!(
         final_loss < losses[0],
         "Loss should decrease: init={:.6}, final={:.2e}",
-        losses[0], final_loss
+        losses[0],
+        final_loss
     );
-    
+
     // Should converge to near (1, 1)
     assert!(
         (x[0] - PYTORCH_FINAL_X).abs() < 0.01,
@@ -722,20 +759,29 @@ fn test_pytorch_lbfgs_rosenbrock_parity() {
         "Final loss should be near zero: got {:.2e}",
         final_loss
     );
-    
+
     // Verify that L-BFGS converges faster than a threshold
     // (PyTorch converges in ~2 steps, we should too)
-    let steps_to_converge = losses.iter().position(|&l| l < 1e-6).unwrap_or(losses.len());
+    let steps_to_converge = losses
+        .iter()
+        .position(|&l| l < 1e-6)
+        .unwrap_or(losses.len());
     assert!(
         steps_to_converge <= 5,
         "Should converge within 5 steps, took {}",
         steps_to_converge
     );
-    
+
     println!("LBFGS Rosenbrock test passed:");
     println!("  Steps to converge: {}", steps_to_converge);
-    println!("  Init:  ({:.4}, {:.4}) loss={:.6}", -1.0, 1.0, PYTORCH_INIT_LOSS);
-    println!("  Final: ({:.6}, {:.6}) loss={:.2e}", x[0], x[1], final_loss);
+    println!(
+        "  Init:  ({:.4}, {:.4}) loss={:.6}",
+        -1.0, 1.0, PYTORCH_INIT_LOSS
+    );
+    println!(
+        "  Final: ({:.6}, {:.6}) loss={:.2e}",
+        x[0], x[1], final_loss
+    );
 }
 
 /// Test that L-BFGS converges faster than gradient descent on Rosenbrock.
@@ -745,7 +791,7 @@ fn test_lbfgs_vs_gradient_descent_rosenbrock() {
     let mut x_gd = vec![-1.0f64, 1.0];
     let lr = 0.001;
     let mut gd_losses = Vec::new();
-    
+
     for _ in 0..100 {
         let loss = rosenbrock_loss_f64(&x_gd);
         gd_losses.push(loss);
@@ -753,28 +799,29 @@ fn test_lbfgs_vs_gradient_descent_rosenbrock() {
         x_gd[0] -= lr * grad[0];
         x_gd[1] -= lr * grad[1];
     }
-    
+
     // L-BFGS
     let mut lbfgs = StandaloneLBFGS::new(10);
     let mut x_lbfgs = vec![-1.0f64, 1.0];
     let mut lbfgs_losses = Vec::new();
-    
+
     for _ in 0..10 {
         let loss = rosenbrock_loss_f64(&x_lbfgs);
         lbfgs_losses.push(loss);
         lbfgs.step(&mut x_lbfgs, rosenbrock_loss_f64, rosenbrock_grad_f64);
     }
-    
+
     let gd_final = gd_losses.last().unwrap();
     let lbfgs_final = lbfgs_losses.last().unwrap();
-    
+
     // L-BFGS should reach lower loss with fewer iterations
     assert!(
         lbfgs_final < gd_final,
         "L-BFGS should outperform GD: LBFGS={:.6}, GD={:.6}",
-        lbfgs_final, gd_final
+        lbfgs_final,
+        gd_final
     );
-    
+
     // L-BFGS should be at least 10x better after 10 vs 100 steps
     assert!(
         lbfgs_final * 10.0 < *gd_final,
@@ -789,7 +836,7 @@ fn test_lbfgs_vs_gradient_descent_rosenbrock() {
 #[test]
 fn test_arkan_adam_integration() {
     use arkan::{Adam, AdamConfig, KanConfig, KanNetwork, Optimizer};
-    
+
     let config = KanConfig {
         input_dim: 2,
         hidden_dims: vec![4],
@@ -800,7 +847,7 @@ fn test_arkan_adam_integration() {
         input_std: vec![1.0; 2],
         ..Default::default()
     };
-    
+
     let mut network = KanNetwork::new(config);
     let adam_config = AdamConfig {
         lr: 0.01,
@@ -810,31 +857,32 @@ fn test_arkan_adam_integration() {
         weight_decay: 0.0,
         ..Default::default()
     };
-    
+
     let mut adam = Adam::new(&network, adam_config);
-    
+
     // Get initial weights
     let initial_weights: Vec<f32> = network.layers[0].weights.clone();
-    
+
     // Perform forward/backward pass
     let mut workspace = network.create_workspace(1);
     let input = vec![0.5f32, 0.5];
     let target = vec![1.0f32, 0.0];
-    
+
     network.train_step(&input, &target, None, 1.0, &mut workspace);
-    
+
     // Extract gradients from workspace (they are already Vec<Vec<f32>>)
     let weight_grads: Vec<Vec<f32>> = workspace.weight_grads.clone();
     let bias_grads: Vec<Vec<f32>> = workspace.bias_grads.clone();
-    
+
     // Apply Adam step
-    adam.step(&mut network, &weight_grads, &bias_grads, None).unwrap();
-    
+    adam.step(&mut network, &weight_grads, &bias_grads, None)
+        .unwrap();
+
     // Weights should have changed
     let new_weights: Vec<f32> = network.layers[0].weights.clone();
-    
+
     assert_ne!(initial_weights, new_weights, "Weights should be updated");
-    
+
     // Verify no NaN/Inf
     for w in &new_weights {
         assert!(w.is_finite(), "Weight should be finite");
@@ -843,8 +891,8 @@ fn test_arkan_adam_integration() {
 
 #[test]
 fn test_arkan_sgd_integration() {
-    use arkan::{KanConfig, KanNetwork, Optimizer, SGD, SGDConfig};
-    
+    use arkan::{KanConfig, KanNetwork, Optimizer, SGDConfig, SGD};
+
     let config = KanConfig {
         input_dim: 2,
         hidden_dims: vec![4],
@@ -855,7 +903,7 @@ fn test_arkan_sgd_integration() {
         input_std: vec![1.0; 2],
         ..Default::default()
     };
-    
+
     let mut network = KanNetwork::new(config);
     let sgd_config = SGDConfig {
         lr: 0.1,
@@ -864,36 +912,37 @@ fn test_arkan_sgd_integration() {
         nesterov: false,
         ..Default::default()
     };
-    
+
     let mut sgd = SGD::new(&network, sgd_config);
-    
+
     // Get initial weights
     let initial_weights: Vec<f32> = network.layers[0].weights.clone();
-    
+
     // Perform forward/backward pass
     let mut workspace = network.create_workspace(1);
     let input = vec![0.5f32, 0.5];
     let target = vec![1.0f32, 0.0];
-    
+
     network.train_step(&input, &target, None, 1.0, &mut workspace);
-    
+
     // Extract gradients from workspace (they are already Vec<Vec<f32>>)
     let weight_grads: Vec<Vec<f32>> = workspace.weight_grads.clone();
     let bias_grads: Vec<Vec<f32>> = workspace.bias_grads.clone();
-    
+
     // Apply SGD step
-    sgd.step(&mut network, &weight_grads, &bias_grads, None).unwrap();
-    
+    sgd.step(&mut network, &weight_grads, &bias_grads, None)
+        .unwrap();
+
     // Weights should have changed
     let new_weights: Vec<f32> = network.layers[0].weights.clone();
-    
+
     assert_ne!(initial_weights, new_weights, "Weights should be updated");
 }
 
 #[test]
 fn test_arkan_sgd_nesterov_more_aggressive() {
-    use arkan::{KanConfig, KanNetwork, Optimizer, SGD, SGDConfig};
-    
+    use arkan::{KanConfig, KanNetwork, Optimizer, SGDConfig, SGD};
+
     let config = KanConfig {
         input_dim: 2,
         hidden_dims: vec![4],
@@ -904,17 +953,17 @@ fn test_arkan_sgd_nesterov_more_aggressive() {
         input_std: vec![1.0; 2],
         ..Default::default()
     };
-    
+
     // Create two networks with same initialization
     let mut network_std = KanNetwork::new(config.clone());
     let mut network_nes = KanNetwork::new(config);
-    
+
     // Copy weights from std to nes to ensure same starting point
     for (layer_std, layer_nes) in network_std.layers.iter().zip(network_nes.layers.iter_mut()) {
         layer_nes.weights.copy_from_slice(&layer_std.weights);
         layer_nes.bias.copy_from_slice(&layer_std.bias);
     }
-    
+
     let sgd_std = SGDConfig {
         lr: 0.1,
         momentum: 0.9,
@@ -929,76 +978,80 @@ fn test_arkan_sgd_nesterov_more_aggressive() {
         nesterov: true,
         ..Default::default()
     };
-    
+
     let mut sgd_standard = SGD::new(&network_std, sgd_std);
     let mut sgd_nesterov = SGD::new(&network_nes, sgd_nes);
-    
+
     let mut workspace_std = network_std.create_workspace(1);
     let mut workspace_nes = network_nes.create_workspace(1);
-    
+
     let input = vec![0.5f32, 0.5];
     let target = vec![1.0f32, 0.0];
-    
+
     // Multiple training steps
     for _ in 0..5 {
         network_std.train_step(&input, &target, None, 1.0, &mut workspace_std);
         let wg = workspace_std.weight_grads.clone();
         let bg = workspace_std.bias_grads.clone();
         sgd_standard.step(&mut network_std, &wg, &bg, None).unwrap();
-        
+
         network_nes.train_step(&input, &target, None, 1.0, &mut workspace_nes);
         let wg = workspace_nes.weight_grads.clone();
         let bg = workspace_nes.bias_grads.clone();
         sgd_nesterov.step(&mut network_nes, &wg, &bg, None).unwrap();
     }
-    
+
     // Get final weights
     let weights_std: Vec<f32> = network_std.layers[0].weights.clone();
     let weights_nes: Vec<f32> = network_nes.layers[0].weights.clone();
-    
+
     // Weights should be different (Nesterov typically moves more aggressively)
-    let diff: f32 = weights_std.iter()
+    let diff: f32 = weights_std
+        .iter()
         .zip(weights_nes.iter())
         .map(|(a, b)| (a - b).abs())
         .sum();
-    
-    assert!(diff > 1e-6, "Nesterov should produce different weights than standard momentum");
+
+    assert!(
+        diff > 1e-6,
+        "Nesterov should produce different weights than standard momentum"
+    );
 }
 
 #[test]
 fn test_arkan_adam_bias_correction() {
     // Verify bias correction is applied correctly
     // Early steps should show larger effective learning rate due to bias correction
-    
+
     // With beta1=0.9, beta2=0.999:
     // Step 1: bias_correction1 = 0.1, bias_correction2 = 0.001
     // m_hat = m / 0.1 = 10 * m
     // v_hat = v / 0.001 = 1000 * v
-    
+
     let mut m = 0.0f32;
     let mut v = 0.0f32;
     let beta1 = 0.9f32;
     let beta2 = 0.999f32;
     let grad = 1.0f32;
-    
+
     // Step 1
     m = beta1 * m + (1.0 - beta1) * grad; // m = 0.1
     v = beta2 * v + (1.0 - beta2) * grad * grad; // v = 0.001
-    
+
     let bc1 = 1.0 - beta1.powi(1); // 0.1
     let bc2 = 1.0 - beta2.powi(1); // 0.001
-    
+
     let m_hat = m / bc1; // 0.1 / 0.1 = 1.0
     let v_hat = v / bc2; // 0.001 / 0.001 = 1.0
-    
+
     assert!((m_hat - 1.0).abs() < 1e-5, "m_hat should be 1.0");
     assert!((v_hat - 1.0).abs() < 1e-5, "v_hat should be 1.0");
 }
 
 #[test]
 fn test_arkan_lbfgs_creation() {
-    use arkan::{KanConfig, KanNetwork, LBFGS, LBFGSConfig};
-    
+    use arkan::{KanConfig, KanNetwork, LBFGSConfig, LBFGS};
+
     let config = KanConfig {
         input_dim: 2,
         hidden_dims: vec![],
@@ -1008,10 +1061,10 @@ fn test_arkan_lbfgs_creation() {
         ..KanConfig::preset()
     };
     let network = KanNetwork::new(config);
-    
+
     // Initialize LBFGS
     let lbfgs = LBFGS::new(&network, LBFGSConfig::default());
-    
+
     // Verify it was created successfully
     assert_eq!(lbfgs.num_evals(), 0);
 }

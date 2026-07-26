@@ -353,7 +353,7 @@ fn test_batch_size_edge_cases() {
 
         let gpu_output = gpu_network
             .forward_batch(&input, batch_size, &mut gpu_workspace)
-            .expect(&format!("GPU forward failed for batch_size={}", batch_size));
+            .unwrap_or_else(|e| panic!("GPU forward failed for batch_size={batch_size}: {e}"));
 
         assert_approx_eq(&cpu_output, &gpu_output, EPSILON);
         println!("Batch size {} passed", batch_size);
@@ -928,7 +928,7 @@ fn test_gpu_softmax() {
         // Verify all values are in [0, 1]
         for (i, &p) in sample_probs.iter().enumerate() {
             assert!(
-                p >= 0.0 && p <= 1.0,
+                (0.0..=1.0).contains(&p),
                 "Sample {} probability[{}] = {} not in [0,1]",
                 batch_idx,
                 i,
@@ -1590,7 +1590,7 @@ fn test_multiple_spline_orders() {
         let mut cpu_workspace = cpu_network.create_workspace(4);
 
         let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)
-            .expect(&format!("Failed to create GPU network for order={}", order));
+            .unwrap_or_else(|e| panic!("Failed to create GPU network for order={order}: {e}"));
         let mut gpu_workspace = gpu_network
             .create_workspace(4)
             .expect("Failed to create workspace");
@@ -1638,10 +1638,9 @@ fn test_large_batch_forward() {
 
     // Test with progressively larger batches
     for batch_size in [1, 8, 64, 256, 1024] {
-        let mut workspace = gpu_network.create_workspace(batch_size).expect(&format!(
-            "Failed to create workspace for batch={}",
-            batch_size
-        ));
+        let mut workspace = gpu_network
+            .create_workspace(batch_size)
+            .unwrap_or_else(|e| panic!("Failed to create workspace for batch={batch_size}: {e}"));
 
         let input: Vec<f32> = (0..batch_size * config.input_dim)
             .map(|i| (i as f32 * 0.001).sin())

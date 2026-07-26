@@ -369,7 +369,7 @@ fn test_x_outside_range() {
         // Span should be clamped to valid range
         assert!(span >= order, "Span too small for x={}: span={}", x, span);
         assert!(
-            span <= grid_size + order - 1,
+            span < grid_size + order,
             "Span too large for x={}: span={}",
             x,
             span

@@ -541,8 +541,8 @@ fn test_backward_parallel_sparse_grad_output() {
     // Sparse grad_output: only first half non-zero
     let mut grad_output = vec![0.0f32; batch_size * 4];
     let mut rng = SmallRng::seed_from_u64(44444);
-    for i in 0..(batch_size / 2 * 4) {
-        grad_output[i] = rng.gen_range(-1.0..1.0);
+    for g in grad_output.iter_mut().take(batch_size / 2 * 4) {
+        *g = rng.gen_range(-1.0..1.0);
     }
 
     // Sequential

@@ -44,6 +44,9 @@ fn minimal_network() -> KanNetwork {
 ///   `theta -= lr * m_hat / (sqrt(v_hat) + eps)`
 /// where `m_hat = m / bc1` and `v_hat = v / bc2`.
 /// Epsilon is added to the bias-corrected `sqrt(v_hat)`, not to `sqrt(v)`.
+/// Wide on purpose: it takes the Adam hyper-parameters one by one so the call
+/// sites read like the paper's update rule.
+#[allow(clippy::too_many_arguments)]
 fn adam_step_reference(
     param: f32,
     grad: f32,

@@ -23,7 +23,6 @@
 
 use arkan::{KanConfig, KanNetwork};
 use serde::Deserialize;
-use serde_json;
 use std::fs;
 use std::path::Path;
 
@@ -92,8 +91,7 @@ fn load_reference() -> Reference {
     let data = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("Could not read reference file {:?}: {}", path, e));
 
-    serde_json::from_str(&data)
-        .unwrap_or_else(|e| panic!("Could not parse reference JSON: {}", e))
+    serde_json::from_str(&data).unwrap_or_else(|e| panic!("Could not parse reference JSON: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -323,9 +321,7 @@ fn layer2_gradient_parity() {
             &saved_inputs,
             &saved_indices,
             grad_out_slice,
-            grad_input_buf
-                .as_mut()
-                .map(|b| b.as_mut_slice()),
+            grad_input_buf.as_deref_mut(),
             &mut weight_grads[layer_idx],
             &mut bias_grads[layer_idx],
             &mut workspace,

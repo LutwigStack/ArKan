@@ -338,7 +338,7 @@ fn test_gpu_precision_f32_accumulation() {
 
     // Input that causes many small additions
     let input: Vec<f32> = (0..16 * config.input_dim)
-        .map(|i| ((i as f32 * 0.01).sin() * 0.1))
+        .map(|i| (i as f32 * 0.01).sin() * 0.1)
         .collect();
 
     let mut cpu_output = vec![0.0f32; 16 * config.output_dim];

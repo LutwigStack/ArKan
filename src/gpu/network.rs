@@ -134,6 +134,9 @@ impl GpuForwardHandle {
     /// # Note
     ///
     /// You should call `poll()` before `try_recv()` to check for completion.
+    // `Err(self)` hands the still-pending request back to the caller so it can
+    // retry; boxing it would move the same bytes to the heap for no gain.
+    #[allow(clippy::result_large_err)]
     pub fn try_recv(self) -> Result<Option<ArkanResult<Vec<f32>>>, Self> {
         // Do a non-blocking poll
         self.device.poll(wgpu::Maintain::Poll);

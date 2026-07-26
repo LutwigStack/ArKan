@@ -76,10 +76,10 @@ fn eval_basis_fixed(order: usize, t_q16: u32, out: &mut [u16]) {
             let t2 = t * t; // Q32
 
             // B0 = omt^2 / 2, in Q32 → Q15: shift by 32-15=17, divide by 2 so 18
-                // b0 = omt^2/(2 * 65536^2) * 32768 = omt^2 >> 18
-            let b0 = ((omt2 >> 18) as i64).clamp(0, SCALE) as u16;
+            // b0 = omt^2/(2 * 65536^2) * 32768 = omt^2 >> 18
+            let b0 = (omt2 >> 18).clamp(0, SCALE) as u16;
             // B2 = t^2 / 2
-            let b2 = ((t2 >> 18) as i64).clamp(0, SCALE) as u16;
+            let b2 = (t2 >> 18).clamp(0, SCALE) as u16;
             // B1 = SCALE - b0 - b2 (partition of unity)
             let b1 = (SCALE - b0 as i64 - b2 as i64).clamp(0, SCALE) as u16;
 
@@ -123,8 +123,8 @@ fn eval_basis_fixed(order: usize, t_q16: u32, out: &mut [u16]) {
             // B3 = t^3 / 6
             let b3 = (t3 / denom).clamp(0, SCALE as i128) as u16;
             // B2 = partition of unity remainder
-            let b2 = (SCALE as i128 - b0 as i128 - b1 as i128 - b3 as i128)
-                .clamp(0, SCALE as i128) as u16;
+            let b2 = (SCALE as i128 - b0 as i128 - b1 as i128 - b3 as i128).clamp(0, SCALE as i128)
+                as u16;
 
             out[0] = b0;
             out[1] = b1;
@@ -257,13 +257,9 @@ fn eval_basis_fixed(order: usize, t_q16: u32, out: &mut [u16]) {
             let b2 = (b2_num / denom).clamp(0, SCALE as i128) as u16;
 
             // b3 via partition of unity
-            let b3 = (SCALE as i128
-                - b0 as i128
-                - b1 as i128
-                - b2 as i128
-                - b4 as i128
-                - b5 as i128)
-                .clamp(0, SCALE as i128) as u16;
+            let b3 =
+                (SCALE as i128 - b0 as i128 - b1 as i128 - b2 as i128 - b4 as i128 - b5 as i128)
+                    .clamp(0, SCALE as i128) as u16;
 
             out[0] = b0;
             out[1] = b1;
@@ -540,22 +536,21 @@ impl BakedModel {
             // Compute per-channel max|w| and scales.
             let coeff_per_channel = in_dim * global_basis_size; // weights per output channel
             let mut s_w_per_channel = vec![1.0f32; out_dim];
-            for j in 0..out_dim {
-                let start = j * coeff_per_channel;
-                let end = start + coeff_per_channel;
-                let max_w = layer.weights[start..end]
-                    .iter()
-                    .map(|w| w.abs())
-                    .fold(0.0f32, f32::max);
-                s_w_per_channel[j] = if max_w > EPSILON { 127.0 / max_w } else { 1.0 };
+            for (s_w, chunk) in s_w_per_channel
+                .iter_mut()
+                .zip(layer.weights.chunks_exact(coeff_per_channel))
+            {
+                let max_w = chunk.iter().map(|w| w.abs()).fold(0.0f32, f32::max);
+                *s_w = if max_w > EPSILON { 127.0 / max_w } else { 1.0 };
             }
 
             // Quantize weights using per-channel scale.
             let mut weights_i8: Vec<i8> = Vec::with_capacity(layer.weights.len());
-            for j in 0..out_dim {
-                let sw_j = s_w_per_channel[j];
-                let start = j * coeff_per_channel;
-                for &w in &layer.weights[start..start + coeff_per_channel] {
+            for (&sw_j, chunk) in s_w_per_channel
+                .iter()
+                .zip(layer.weights.chunks_exact(coeff_per_channel))
+            {
+                for &w in chunk {
                     weights_i8.push((w * sw_j).round().clamp(-127.0, 127.0) as i8);
                 }
             }
@@ -572,8 +567,8 @@ impl BakedModel {
             // Represent M_real[j] as M0[j] / 2^S[j] where M0[j] in [2^28, 2^29).
             let mut requant_m0: Vec<i32> = Vec::with_capacity(out_dim);
             let mut requant_shift: Vec<u32> = Vec::with_capacity(out_dim);
-            for j in 0..out_dim {
-                let sw_j = s_w_per_channel[j] as f64;
+            for &sw_j in &s_w_per_channel {
+                let sw_j = sw_j as f64;
                 let m_real = s_act_l as f64 / (sw_j * basis_scale);
                 let (m0, shift) = if m_real <= 0.0 || !m_real.is_finite() {
                     (1i32, 0u32)
@@ -768,17 +763,16 @@ impl BakedModel {
             }
 
             // For each output j
-            for j in 0..out_dim {
+            for (j, act_out) in act_b[..out_dim].iter_mut().enumerate() {
                 let mut acc: i64 = layer.q_bias[j];
 
                 // For each input i
-                for i in 0..in_dim {
+                for (i, &q_z_raw) in act_a[..in_dim].iter().enumerate() {
                     // Extract span and t (Q0.16) from q_z = act_a[i] (Q15.16 = z * 65536).
                     // The clamps inside `extract_span_t` are what keep the weight read
                     // below in bounds — see its doc comment.
-                    let q_z = act_a[i].clamp(layer.q_rmin, layer.q_rmax);
-                    let (span, t_q16) =
-                        extract_span_t(q_z, layer.q_rmin, layer.h_q16, grid_size);
+                    let q_z = q_z_raw.clamp(layer.q_rmin, layer.q_rmax);
+                    let (span, t_q16) = extract_span_t(q_z, layer.q_rmin, layer.h_q16, grid_size);
 
                     // Evaluate basis functions → Q0.15 u16 values
                     eval_basis_fixed(order, t_q16, &mut basis_buf[..local_basis_size]);
@@ -793,17 +787,11 @@ impl BakedModel {
                     let start_idx = span; // = interval = global weight start index
 
                     // Accumulate: acc += sum_k( weight[j,i,start_idx+k] * basis[k] )
-                    for k in 0..local_basis_size {
-                        let w_idx = Self::weight_index(
-                            global_basis_size,
-                            in_dim,
-                            j,
-                            i,
-                            start_idx + k,
-                        );
+                    for (k, &q_b) in basis_buf[..local_basis_size].iter().enumerate() {
+                        let w_idx =
+                            Self::weight_index(global_basis_size, in_dim, j, i, start_idx + k);
                         let q_c = layer.weights_i8[w_idx] as i64;
-                        let q_b = basis_buf[k] as i64;
-                        acc += q_c * q_b;
+                        acc += q_c * q_b as i64;
                     }
                 }
 
@@ -814,10 +802,14 @@ impl BakedModel {
                 let m0_j = layer.requant_m0[j] as i128;
                 let shift_j = layer.requant_shift[j];
                 let product = (acc as i128) * m0_j;
-                let round_offset = if shift_j > 0 { 1i128 << (shift_j - 1) } else { 0 };
+                let round_offset = if shift_j > 0 {
+                    1i128 << (shift_j - 1)
+                } else {
+                    0
+                };
                 let q_out_i64 = ((product + round_offset) >> shift_j) as i64;
                 const ACT_CLAMP: i64 = 268_435_456; // 2^28 = ACT_TARGET
-                act_b[j] = q_out_i64.clamp(-ACT_CLAMP, ACT_CLAMP) as i32;
+                *act_out = q_out_i64.clamp(-ACT_CLAMP, ACT_CLAMP) as i32;
             }
 
             // INTER-LAYER: compute next layer's z values in Q15.16
@@ -860,7 +852,7 @@ impl BakedModel {
                 + l.requant_m0.len() * 4     // i32 per-channel M0
                 + l.requant_shift.len() * 4  // u32 per-channel shift
                 + l.norm_a_fixed.len() * 4 * 2  // i32 norm constants
-                + 40                         // fixed metadata
+                + 40 // fixed metadata
             })
             .sum()
     }
@@ -921,8 +913,7 @@ impl BakedModel {
             return Err(Box::new(bincode::ErrorKind::Custom(format!(
                 "BakedModel::from_bytes: wrong magic bytes (got {:?}, expected {:?}). \
                  Is this an ArKan baked-model file?",
-                magic_bytes,
-                MAGIC_BAKED
+                magic_bytes, MAGIC_BAKED
             ))));
         }
 
@@ -1450,7 +1441,7 @@ mod tests {
             // (3) The invariants a refactor must preserve.
             let (span, t_q16) = extract_span_t(l.q_rmax, l.q_rmin, l.h_q16, grid_size);
             assert!(
-                span <= grid_size - 1,
+                span < grid_size,
                 "grid_range={range:?}: span {span} exceeds grid_size-1 ({})",
                 grid_size - 1
             );

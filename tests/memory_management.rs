@@ -779,11 +779,11 @@ fn test_alignment_odd_element_counts() {
         let data: Vec<f32> = (0..size).map(|i| i as f32).collect();
 
         let tensor = GpuTensor::upload(&backend.device, &backend.queue, &data, vec![size])
-            .expect(&format!("Upload failed for size {}", size));
+            .unwrap_or_else(|e| panic!("Upload failed for size {size}: {e}"));
 
         let downloaded = tensor
             .download(&backend.device, &backend.queue)
-            .expect(&format!("Download failed for size {}", size));
+            .unwrap_or_else(|e| panic!("Download failed for size {size}: {e}"));
 
         assert_eq!(
             downloaded.len(),
@@ -829,11 +829,11 @@ fn test_alignment_2d_shapes() {
         let data: Vec<f32> = (0..total).map(|i| i as f32).collect();
 
         let tensor = GpuTensor::upload(&backend.device, &backend.queue, &data, vec![rows, cols])
-            .expect(&format!("Upload failed for shape [{}, {}]", rows, cols));
+            .unwrap_or_else(|e| panic!("Upload failed for shape [{rows}, {cols}]: {e}"));
 
         let downloaded = tensor
             .download(&backend.device, &backend.queue)
-            .expect(&format!("Download failed for shape [{}, {}]", rows, cols));
+            .unwrap_or_else(|e| panic!("Download failed for shape [{rows}, {cols}]: {e}"));
 
         assert_eq!(downloaded.len(), data.len());
         for (i, (&e, &g)) in data.iter().zip(downloaded.iter()).enumerate() {
@@ -866,7 +866,7 @@ fn test_alignment_f32_natural() {
         let data: Vec<f32> = (0..size).map(|i| i as f32 * 1.5).collect();
 
         let tensor = GpuTensor::upload(&backend.device, &backend.queue, &data, vec![size])
-            .expect(&format!("Upload failed for size {}", size));
+            .unwrap_or_else(|e| panic!("Upload failed for size {size}: {e}"));
 
         // Verify buffer size is correct (should be size * 4 bytes)
         let expected_bytes = size * 4;
@@ -880,7 +880,7 @@ fn test_alignment_f32_natural() {
 
         let downloaded = tensor
             .download(&backend.device, &backend.queue)
-            .expect(&format!("Download failed for size {}", size));
+            .unwrap_or_else(|e| panic!("Download failed for size {size}: {e}"));
 
         assert_eq!(downloaded, data, "Size {} data mismatch", size);
     }
@@ -909,7 +909,7 @@ fn test_stress_many_small_tensors() {
             .map(|j| (i * tensor_size + j) as f32)
             .collect();
         let tensor = GpuTensor::upload(&backend.device, &backend.queue, &data, vec![tensor_size])
-            .expect(&format!("Upload {} failed", i));
+            .unwrap_or_else(|e| panic!("Upload {i} failed: {e}"));
         tensors.push(tensor);
     }
 
@@ -923,7 +923,7 @@ fn test_stress_many_small_tensors() {
             .collect();
         let downloaded = tensors[i]
             .download(&backend.device, &backend.queue)
-            .expect(&format!("Download {} failed", i));
+            .unwrap_or_else(|e| panic!("Download {i} failed: {e}"));
         assert_eq!(downloaded, expected, "Tensor {} data mismatch", i);
     }
 
