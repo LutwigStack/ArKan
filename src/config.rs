@@ -170,6 +170,10 @@ pub struct KanConfig {
 
     /// Batch size threshold for multithreading.
     /// Batches smaller than this are processed single-threaded.
+    ///
+    /// Only consulted with the `parallel` feature enabled. Without it the
+    /// backward pass has no parallel branch to switch to and this value is
+    /// ignored.
     pub multithreading_threshold: usize,
 
     /// SIMD vector width for basis alignment (8 for AVX2, 16 for AVX-512).
@@ -599,6 +603,9 @@ impl KanConfigBuilder {
     ///
     /// Batches smaller than this are processed single-threaded.
     /// Default: 128.
+    ///
+    /// Ignored without the `parallel` feature — see
+    /// [`KanConfig::multithreading_threshold`].
     #[must_use]
     pub fn multithreading_threshold(mut self, threshold: usize) -> Self {
         self.multithreading_threshold = threshold;

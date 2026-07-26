@@ -61,12 +61,12 @@ arkan = { version = "0.4", features = ["serde"] } # + сериализация
 | Флаг | Что включает | По умолчанию | Доп. зависимости |
 |---|---|---|---|
 | — | Инференс и обучение на CPU, SIMD B-сплайны, `BakedModel` (int8) | ✅ | `wide`, `rand`, `thiserror` |
-| `parallel` | `KanLayer::backward_parallel`, `KanNetwork::forward_batch_parallel` и авто-параллельная ветка `KanNetwork::backward` при `batch >= multithreading_threshold` | ❌ | `rayon` |
+| `parallel` | `KanLayer::backward_parallel`, `KanNetwork::forward_batch_parallel` и авто-параллельная ветка backward-прохода в `train_step` при `batch >= multithreading_threshold` | ❌ | `rayon` |
 | `serde` | `to_bytes()` / `from_bytes()` для `KanNetwork` и `BakedModel` | ❌ | `serde`, `bincode` |
 | `gpu` | GPU бэкенд на `wgpu` (Vulkan/DX12/Metal/WebGPU) | ❌ | `wgpu`, `bytemuck`, `pollster`, `log` |
 
 SIMD — **не** флаг: векторизация B-сплайнов через `wide` работает всегда.
-Без `parallel` методы `*_parallel` не существуют, а `backward` всегда
+Без `parallel` методы `*_parallel` не существуют, а backward-проход всегда
 однопоточный: градиенты те же (паритет проверяется в
 `tests/backward_correctness.rs`), просто одно ядро.
 
@@ -369,13 +369,13 @@ arkan = { version = "0.4", features = ["serde"] } # + serialization
 | Flag | What it turns on | Default | Extra deps |
 |---|---|---|---|
 | — | CPU inference and training, SIMD B-splines, `BakedModel` (int8) | ✅ | `wide`, `rand`, `thiserror` |
-| `parallel` | `KanLayer::backward_parallel`, `KanNetwork::forward_batch_parallel`, and the automatic parallel branch of `KanNetwork::backward` for `batch >= multithreading_threshold` | ❌ | `rayon` |
+| `parallel` | `KanLayer::backward_parallel`, `KanNetwork::forward_batch_parallel`, and the automatic parallel branch of `train_step`'s backward pass for `batch >= multithreading_threshold` | ❌ | `rayon` |
 | `serde` | `to_bytes()` / `from_bytes()` for `KanNetwork` and `BakedModel` | ❌ | `serde`, `bincode` |
 | `gpu` | `wgpu` GPU backend (Vulkan/DX12/Metal/WebGPU) | ❌ | `wgpu`, `bytemuck`, `pollster`, `log` |
 
 SIMD is **not** a feature flag: B-spline vectorization via `wide` is always on.
-Without `parallel` the `*_parallel` methods do not exist and `backward` is always
-single-threaded — identical gradients (parity asserted in
+Without `parallel` the `*_parallel` methods do not exist and the backward pass is
+always single-threaded — identical gradients (parity asserted in
 `tests/backward_correctness.rs`), just one core.
 
 ## **GPU Backend (Optional)**

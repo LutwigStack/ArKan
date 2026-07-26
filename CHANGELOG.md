@@ -32,7 +32,9 @@ Four of the six declared features gated nothing at all — `grep -rn 'feature =
   `#[cfg(feature = "parallel")]`:
   - `KanLayer::backward_parallel` — **does not exist** without the feature.
   - `KanNetwork::forward_batch_parallel` — **does not exist** without the feature.
-  - the automatic parallel branch inside `KanNetwork::backward`.
+  - the automatic parallel branch of the backward pass inside
+    `KanNetwork::train_step` (and the rest of the `train_step` / `try_train_step`
+    family).
 
   Without `parallel`, `KanConfig::multithreading_threshold` is ignored and every
   batch size takes the sequential `KanLayer::backward` path. Gradients are

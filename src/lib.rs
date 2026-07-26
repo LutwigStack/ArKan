@@ -92,11 +92,12 @@
 //! unconditionally through the `wide` crate.
 //!
 //! `parallel` adds three things and nothing else:
-//! `KanLayer::backward_parallel`, `KanNetwork::forward_batch_parallel`, and
-//! the automatic parallel branch inside [`KanNetwork::backward`] for batches at
-//! or above [`KanConfig::multithreading_threshold`]. Without it those two
-//! methods do not exist and `backward` is always single-threaded — identical
-//! gradients, just one core.
+//! `KanLayer::backward_parallel`, `KanNetwork::forward_batch_parallel`, and the
+//! automatic parallel branch of the backward pass inside
+//! [`KanNetwork::train_step`] for batches at or above
+//! [`KanConfig::multithreading_threshold`]. Without it those two methods do not
+//! exist and the backward pass is always single-threaded — identical gradients,
+//! just one core.
 //!
 //! Enable features in `Cargo.toml`:
 //!

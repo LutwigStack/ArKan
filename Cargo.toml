@@ -41,8 +41,8 @@ serde = { version = "1.0", features = ["derive"] }
 [features]
 default = []
 # Rayon-backed multi-core paths: `KanLayer::backward_parallel`,
-# `KanNetwork::forward_batch_parallel`, and the automatic parallel branch in
-# `KanNetwork::backward` above `KanConfig::multithreading_threshold`.
+# `KanNetwork::forward_batch_parallel`, and the automatic parallel branch of
+# `train_step`'s backward pass above `KanConfig::multithreading_threshold`.
 parallel = ["dep:rayon"]
 serde = ["dep:serde", "dep:bincode"]
 gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster", "dep:log"]
