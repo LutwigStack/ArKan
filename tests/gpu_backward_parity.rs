@@ -15,6 +15,7 @@
 #![cfg(feature = "gpu")]
 #![allow(unused_imports)]
 
+use arkan::config::{MAX_GPU_SPLINE_ORDER, MIN_GPU_SPLINE_ORDER};
 use arkan::gpu::{GpuNetwork, WgpuBackend, WgpuOptions};
 use arkan::optimizer::{Adam, AdamConfig};
 use arkan::{KanConfig, KanConfigBuilder, KanLayer, KanNetwork, Workspace};
@@ -1037,6 +1038,260 @@ fn test_gpu_backward_spline_order_2_regression() {
         grad_weights_norm, grad_input_norm
     );
     println!("✓ Order=2 regression test passed");
+}
+
+// =============================================================================
+// TEST 8.6: Every Supported Spline Order Against CPU *And* Finite Differences
+// =============================================================================
+
+/// Multi-layer config at an arbitrary spline order.
+fn ordered_config(order: usize) -> KanConfig {
+    KanConfigBuilder::new()
+        .input_dim(4)
+        .output_dim(3)
+        .hidden_dims(vec![8, 6])
+        .spline_order(order)
+        .grid_size(5)
+        .grid_range(-1.0, 1.0)
+        .normalization(vec![0.0; 4], vec![1.0; 4])
+        .seed(42)
+        .build()
+        .expect("Config should be valid")
+}
+
+/// Mean squared error, accumulated in f64 so the finite differences below are
+/// limited by the f32 forward pass and not by the summation.
+fn mse_f64(pred: &[f32], target: &[f32]) -> f64 {
+    let n = pred.len() as f64;
+    pred.iter()
+        .zip(target)
+        .map(|(&p, &t)| {
+            let d = (p - t) as f64;
+            d * d
+        })
+        .sum::<f64>()
+        / n
+}
+
+/// GPU gradients must match the CPU for **every** order in
+/// `MIN_GPU_SPLINE_ORDER..=MAX_GPU_SPLINE_ORDER`, not just cubic.
+///
+/// This is the test whose absence let two separate order-specific backward bugs
+/// ship: first wrong quartic/quintic basis *values*, then a backward pipeline
+/// that ignored `spline_order` entirely and ran the cubic shader for everything.
+/// Both were invisible to a test that only checked "gradients are not all zero".
+///
+/// Three things are asserted per order, deliberately overlapping:
+///
+/// 1. Per-layer weight and bias gradients equal the CPU's, to f32 round-off.
+///    A tight tolerance is the point: the previous 1e-4 absolute bound is larger
+///    than most gradient entries in this network, so it passed while order 5 was
+///    pointing the wrong way. What is checked instead is `max|cpu - gpu|` divided
+///    by `max|cpu|` over the layer - a scale-free bound that stays meaningful for
+///    the near-zero entries an element-wise relative error blows up on.
+/// 2. Cosine similarity of the whole weight-gradient vector is 1. This catches a
+///    wrong *direction* even when a scale factor makes magnitudes look plausible.
+/// 3. The largest-|grad| weight of every layer agrees with a central finite
+///    difference of the loss through the forward pass. This anchors the test to
+///    the actual derivative rather than to the CPU, so a shared CPU/GPU error
+///    cannot hide here.
+///
+/// Because layer L's weight gradient consumes `grad_input` produced by layer
+/// L+1, checking all layers exercises the basis *derivative* shader too.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_cpu_gradient_parity_every_spline_order() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    // Same round-off budget order 3 already met before this test existed:
+    // max|cpu - gpu| must be a rounding error against the layer's largest
+    // gradient. Measured worst case here is 7.4e-7, and the broken cubic-only
+    // backward was off by 0.4-1.5 *whole* units of it, so this is nowhere near
+    // the "loose tolerance hid the bug" regime even with headroom for f32
+    // accumulation order differing between CPU and GPU.
+    const REL_TOL: f32 = 5e-6;
+    const MIN_COSINE: f64 = 1.0 - 1e-6;
+    // Central differences on an f32 forward: agreement to ~0.5% is all that is
+    // available, and it is two orders of magnitude tighter than every ratio the
+    // broken shader produced (worst was -0.10, best 1.03).
+    const FD_REL_TOL: f64 = 5e-3;
+
+    let batch_size = 16;
+
+    for order in MIN_GPU_SPLINE_ORDER..=MAX_GPU_SPLINE_ORDER {
+        let config = ordered_config(order);
+        let in_dim = config.input_dim;
+        let out_dim = config.output_dim;
+
+        let mut cpu_network = KanNetwork::new(config.clone());
+        let mut cpu_workspace = cpu_network.create_workspace(batch_size);
+
+        let mut rng = SmallRng::seed_from_u64(7);
+        // Keep inputs inside the grid: clamped samples have zero dz/dx, which
+        // would mask a wrong derivative instead of exposing it.
+        let input: Vec<f32> = (0..batch_size * in_dim)
+            .map(|_| rng.gen_range(-0.8..0.8))
+            .collect();
+        let target: Vec<f32> = (0..batch_size * out_dim)
+            .map(|_| rng.gen_range(-0.5..0.5))
+            .collect();
+
+        // CPU gradients. lr = 0 leaves the weights untouched, so the same
+        // network can be reused as the finite-difference probe below.
+        let _ = cpu_network.train_step(&input, &target, None, 0.0, &mut cpu_workspace);
+
+        // GPU gradients, driven by the same MSE gradient the CPU used.
+        let mut gpu_network =
+            GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+        let mut gpu_workspace = gpu_network
+            .create_workspace(batch_size)
+            .expect("Failed to create GPU workspace");
+        let gpu_pred = gpu_network
+            .forward_batch_training(&input, batch_size, &mut gpu_workspace)
+            .expect("GPU forward training failed");
+        let mse_scale = 2.0 / (batch_size * out_dim) as f32;
+        let grad_output: Vec<f32> = gpu_pred
+            .iter()
+            .zip(&target)
+            .map(|(&p, &t)| mse_scale * (p - t))
+            .collect();
+
+        let mut gpu_grad_weights = Vec::new();
+        let mut gpu_grad_biases = Vec::new();
+        gpu_network
+            .backward_batch(
+                &grad_output,
+                batch_size,
+                &mut gpu_workspace,
+                &mut gpu_grad_weights,
+                &mut gpu_grad_biases,
+            )
+            .expect("GPU backward failed");
+
+        let num_layers = cpu_network.layers.len();
+        assert_eq!(gpu_grad_weights.len(), num_layers, "order={}", order);
+
+        // Forward-only probe for finite differences.
+        let mut fd_network = cpu_network.clone();
+        let mut fd_workspace = fd_network.create_workspace(batch_size);
+        let mut fd_output = vec![0.0f32; batch_size * out_dim];
+
+        for layer_idx in 0..num_layers {
+            let cpu_gw = &cpu_workspace.weight_grads[layer_idx];
+            let gpu_gw = &gpu_grad_weights[layer_idx];
+            let cpu_gb = &cpu_workspace.bias_grads[layer_idx];
+            let gpu_gb = &gpu_grad_biases[layer_idx];
+
+            assert_eq!(
+                cpu_gw.len(),
+                gpu_gw.len(),
+                "order={} layer={}: weight gradient length mismatch",
+                order,
+                layer_idx
+            );
+
+            // (1) Scale-free agreement with the CPU over the whole layer.
+            let mut max_abs_diff = 0.0f32;
+            let mut worst_idx = 0usize;
+            for (i, (&c, &g)) in cpu_gw.iter().zip(gpu_gw.iter()).enumerate() {
+                let diff = (c - g).abs();
+                if diff > max_abs_diff {
+                    max_abs_diff = diff;
+                    worst_idx = i;
+                }
+            }
+            let max_abs_grad = cpu_gw.iter().fold(0.0f32, |m, g| m.max(g.abs()));
+            assert!(
+                max_abs_grad > 0.0,
+                "order={} layer={}: CPU weight gradients are all zero, \
+                 the test cannot distinguish anything",
+                order,
+                layer_idx
+            );
+            let normalized_err = max_abs_diff / max_abs_grad;
+            assert!(
+                normalized_err <= REL_TOL,
+                "order={} layer={}: max|cpu - gpu| / max|cpu| = {:.3e} exceeds {:.1e}; \
+                 worst at index {} (cpu={:.6e}, gpu={:.6e})",
+                order,
+                layer_idx,
+                normalized_err,
+                REL_TOL,
+                worst_idx,
+                cpu_gw[worst_idx],
+                gpu_gw[worst_idx]
+            );
+
+            assert_approx_eq(
+                cpu_gb,
+                gpu_gb,
+                BIAS_TOL,
+                &format!("order={} layer={}: bias gradients", order, layer_idx),
+            );
+
+            // (2) Direction of the whole gradient vector.
+            let (mut dot, mut n_cpu, mut n_gpu) = (0.0f64, 0.0f64, 0.0f64);
+            for (&c, &g) in cpu_gw.iter().zip(gpu_gw.iter()) {
+                dot += c as f64 * g as f64;
+                n_cpu += (c as f64) * (c as f64);
+                n_gpu += (g as f64) * (g as f64);
+            }
+            assert!(
+                n_gpu > 1e-20,
+                "order={} layer={}: GPU weight gradients are all zero",
+                order,
+                layer_idx
+            );
+            let cosine = dot / (n_cpu.sqrt() * n_gpu.sqrt());
+            assert!(
+                cosine >= MIN_COSINE,
+                "order={} layer={}: CPU/GPU weight gradient cosine similarity {:.6} < {:.6}",
+                order,
+                layer_idx,
+                cosine,
+                MIN_COSINE
+            );
+
+            // (3) Finite difference at the largest-|grad| weight of this layer.
+            let (probe_idx, _) = cpu_gw
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap())
+                .expect("layer has weights");
+            let w0 = fd_network.layers[layer_idx].weights[probe_idx];
+            let h = 2e-3f32;
+            fd_network.layers[layer_idx].weights[probe_idx] = w0 + h;
+            fd_network.forward_batch(&input, &mut fd_output, &mut fd_workspace);
+            let loss_plus = mse_f64(&fd_output, &target);
+            fd_network.layers[layer_idx].weights[probe_idx] = w0 - h;
+            fd_network.forward_batch(&input, &mut fd_output, &mut fd_workspace);
+            let loss_minus = mse_f64(&fd_output, &target);
+            fd_network.layers[layer_idx].weights[probe_idx] = w0;
+
+            let fd = (loss_plus - loss_minus) / (2.0 * h as f64);
+            let gpu_at_probe = gpu_gw[probe_idx] as f64;
+            let ratio = gpu_at_probe / fd;
+            assert!(
+                (ratio - 1.0).abs() <= FD_REL_TOL,
+                "order={} layer={}: GPU gradient / finite difference = {:.4} \
+                 (gpu={:.6e}, fd={:.6e}) at weight {}",
+                order,
+                layer_idx,
+                ratio,
+                gpu_at_probe,
+                fd,
+                probe_idx
+            );
+
+            println!(
+                "  order={} layer={}: max|cpu-gpu|/max|cpu| {:.2e}, cosine {:.6}, gpu/fd {:.4}",
+                order, layer_idx, normalized_err, cosine, ratio
+            );
+        }
+    }
+
+    println!("✓ GPU/CPU gradient parity holds for every supported spline order");
 }
 
 // =============================================================================
