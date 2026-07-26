@@ -89,8 +89,4 @@ name = "gpu_backward"
 harness = false
 required-features = ["gpu"]
 
-[[example]]
-name = "gpu_comprehensive_test"
-required-features = ["gpu"]
-
 # game2048 is a separate project with its own Cargo.toml in examples/game2048/
