@@ -27,7 +27,6 @@
 
 use crate::config::{KanConfig, EPSILON};
 use crate::network::KanNetwork;
-use crate::spline::compute_basis;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -36,6 +35,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// Returns `order+1` values as u16 in Q0.15 format, value ≈ q_b/32768.
 /// Uses closed-form expressions for orders 2–5 reused from gpu/shaders.rs.
+/// Orders outside 2..=5 have no fixed-point form and are rejected by
+/// [`BakedModel::from_network`], so this function is only ever called with 2..=5.
 /// t_q16 is in Q0.16 format: value = t_q16 / 65536.0, in [0, 65535].
 ///
 /// Every term of a numerator must be at the same Q scale as the leading power
@@ -271,24 +272,58 @@ fn eval_basis_fixed(order: usize, t_q16: u32, out: &mut [u16]) {
             out[4] = b4;
             out[5] = b5;
         }
-        _ => {
-            // Fallback: use the f32 spline code (compute_basis) and quantize
-            // Only reached for orders outside 2-5.
-            // Build a temporary knot vector. This path is not used in normal ops.
-            let t_f = t_q16 as f32 / 65536.0;
-            let n_order_plus_1 = order + 1;
-            // Simple uniform knots for t in [0,1): order knots at 0, 1 knot interval, order at 1
-            let knots: Vec<f32> = (0..=(order + 2))
-                .map(|i| i as f32 - order as f32)
-                .collect();
-            let span = order; // For t in [0,1) and this knot layout, span is always `order`
-            let mut basis_f = vec![0.0f32; n_order_plus_1];
-            compute_basis(t_f, span, &knots, order, &mut basis_f);
-            for (k, &b) in basis_f.iter().enumerate() {
-                out[k] = (b * 32768.0).round().clamp(0.0, 32768.0) as u16;
-            }
-        }
+        // The old `_` arm fell back to the f32 `compute_basis` with a knot vector
+        // of length `order + 3`, while `compute_basis` indexes up to `knots[2*order]`
+        // — an out-of-bounds panic inside spline.rs for order >= 3, first hit at
+        // order 6 (orders 2..=5 never reach here). It also quantized with `.round()`,
+        // which can round UP and so break the "basis sums to exactly 32768" lemma
+        // the requant/overflow proofs depend on. `from_network` now rejects those
+        // orders up front, so there is nothing left to fall back to.
+        other => panic!(
+            "eval_basis_fixed: spline order {other} has no fixed-point basis (baked \
+             supports 2..=5). BakedModel::from_network rejects it at bake time, so this \
+             is only reachable from a BakedModel deserialized from a file baked before \
+             that check existed — re-bake it."
+        ),
     }
+}
+
+/// Extracts the grid interval index and the position within that interval from a
+/// fixed-point z value.
+///
+/// `q_z` must already be clamped to `[q_rmin, q_rmax]`. Returns `(span, t_q16)`
+/// with `span <= grid_size - 1` and `t_q16 <= 65535`.
+///
+/// # Both upper clamps are load-bearing, NOT dead code
+///
+/// At the top of the grid range `q_z_off` is an exact (or near-exact) multiple of
+/// `h_q16`, so `span_raw` reaches `grid_size`:
+/// - `grid_range = (-3, 3)`, G=5 (library default): `q_z_off = 393215 = 5 * 78643`
+/// - `grid_range = (-1, 1)`, G=5 (every baked test): `q_z_off = 131071`, `h_q16 = 26214`
+///
+/// Unclamped, `start_idx + order == global_basis_size`, so the weight read in
+/// [`BakedModel::forward`] runs one element past each `(j, i)` weight block — a
+/// cross-channel read for every block but the last, and a genuine out-of-bounds
+/// index for the last one (verified: `index out of bounds: the len is 48 but the
+/// index is 48`). The `- 1` in `q_rmax` does not prevent it, so the span clamp is
+/// memory safety, not tidiness.
+///
+/// Clamping the span down then leaves `t_rem == h_q16` (or a hair above), so
+/// `t_q16` reaches 65536 / 65538 for those two configs (and ~131072 for a narrow
+/// range with a large grid). The second clamp keeps `eval_basis_fixed` inside its
+/// documented `[0, 65535]` domain, where its closed forms are valid.
+///
+/// `test_span_t_clamps_fire_at_grid_top` pins both.
+#[inline]
+fn extract_span_t(q_z: i32, q_rmin: i32, h_q16: i32, grid_size: usize) -> (usize, u32) {
+    // q_z_off = (z - r_min) * 65536 = position above grid start in Q16 z-units.
+    // Always >= 0 because the caller clamped q_z to [q_rmin, q_rmax].
+    let q_z_off = (q_z - q_rmin) as i64;
+    let h = h_q16 as i64; // one grid interval in Q16 z-units, >= 1 by construction
+    let span = (q_z_off / h).clamp(0, grid_size as i64 - 1) as usize;
+    let t_rem = q_z_off - span as i64 * h;
+    let t_q16 = ((t_rem * 65536) / h).clamp(0, 65535) as u32;
+    (span, t_q16)
 }
 
 /// Per-layer baked data for fixed-point inference.
@@ -369,9 +404,41 @@ impl BakedModel {
     ///   If provided, activation scales are set using 99.9th-percentile clipping
     ///   (stops outliers from wasting the i32 dynamic range). If None, a heuristic
     ///   scale is used and `uncalibrated` is set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any layer's `spline_order` is outside `2..=5`. Baked inference
+    /// only has fixed-point basis polynomials for those orders, even though
+    /// [`KanConfig::validate`](crate::KanConfig::validate) accepts
+    /// `1..=MAX_SPLINE_ORDER` (7) for the f32 CPU path. Use
+    /// [`KanNetwork::forward`](crate::KanNetwork::forward) for other orders.
     pub fn from_network(network: &KanNetwork, calibration: Option<&[f32]>) -> Self {
         let config = network.config.clone();
         let uncalibrated = calibration.is_none();
+
+        // Baked inference has closed-form fixed-point basis polynomials for orders
+        // 2..=5 only (see `eval_basis_fixed`). Orders 6/7 pass `KanConfig::validate`
+        // (MAX_SPLINE_ORDER = 7, sized for the f32 CPU path) but used to blow up as an
+        // out-of-bounds index deep inside spline.rs on the first `forward` call.
+        // ponytail: bake-time panic rather than making `from_network` return a Result
+        // — it returns `Self` and is called from tests, benches and the example, so a
+        // Result is a breaking API change for orders nobody ships (untested and
+        // unmeasured for baked). Ceiling: unrecoverable at bake time, but the message
+        // names the cause instead of pointing at spline.rs.
+        if let Some(bad) = network
+            .layers
+            .iter()
+            .map(|l| l.order)
+            .find(|o| !(2..=5).contains(o))
+        {
+            panic!(
+                "BakedModel::from_network: spline_order {bad} is not supported by baked \
+                 (fixed-point) inference; supported range is 2..=5. KanConfig::validate \
+                 accepts 1..={} (MAX_SPLINE_ORDER) for the f32 CPU path only. Re-configure \
+                 with spline_order in 2..=5, or use KanNetwork::forward for f32 inference.",
+                crate::config::MAX_SPLINE_ORDER
+            );
+        }
 
         // Compute activation scales s_act[L] for each layer output.
         // s_act[L] = ACT_TARGET / p99.9(|layer L output|) over calibration inputs.
@@ -572,7 +639,13 @@ impl BakedModel {
             // q_rmax = round(r_max * 2^16) - 1 (to mirror +EPSILON floor)
             // The z values in Q15.16 format: q_z represents z = q_z / 65536
             let q_rmin = (r_min * 65536.0).round() as i32;
-            let q_rmax = (r_max * 65536.0).round() as i32 - 1;
+            // `.max(q_rmin)`: for a range narrower than ~1.5e-5 (e.g. the
+            // validate-approved grid_range = (0.0, 0.000005)) both endpoints round to
+            // the same Q16 tick and the `- 1` puts q_rmax *below* q_rmin, which made
+            // `q_z.clamp(q_rmin, q_rmax)` in `forward` panic with "min > max".
+            // Collapsing to a single-tick interval keeps the clamp well-formed; such a
+            // range is degenerate anyway (every input maps to span 0, t 0).
+            let q_rmax = ((r_max * 65536.0).round() as i32 - 1).max(q_rmin);
 
             // inv_h_scaled: used to extract span and t from q_z (fixed-point z)
             // span = (q_z - q_rmin) * inv_h_scaled >> 16, clamped to [0, G-1]
@@ -700,20 +773,12 @@ impl BakedModel {
 
                 // For each input i
                 for i in 0..in_dim {
-                    // Extract span and t (Q0.16) from q_z = act_a[i] (Q15.16 = z * 65536)
-                    // q_z_off = (z - r_min) * 65536 = position above grid start in Q16 z-units
+                    // Extract span and t (Q0.16) from q_z = act_a[i] (Q15.16 = z * 65536).
+                    // The clamps inside `extract_span_t` are what keep the weight read
+                    // below in bounds — see its doc comment.
                     let q_z = act_a[i].clamp(layer.q_rmin, layer.q_rmax);
-                    let q_z_off = q_z - layer.q_rmin; // always >= 0 due to clamp
-
-                    // h_q16 = round(65536 * range / G) = one interval in Q16 z-units
-                    // span = q_z_off / h_q16 (integer div, gives interval index 0..G)
-                    // t_q16 = (q_z_off % h_q16) * 65536 / h_q16
-                    let h_q16 = layer.h_q16 as i64;
-                    let span_raw = q_z_off as i64 / h_q16;
-                    let span = span_raw.clamp(0, grid_size as i64 - 1) as usize;
-                    let t_rem = q_z_off as i64 - span as i64 * h_q16;
-                    // t_rem in [0, h_q16); t_q16 = t_rem * 65536 / h_q16 in [0, 65535]
-                    let t_q16 = ((t_rem * 65536) / h_q16).clamp(0, 65535) as u32;
+                    let (span, t_q16) =
+                        extract_span_t(q_z, layer.q_rmin, layer.h_q16, grid_size);
 
                     // Evaluate basis functions → Q0.15 u16 values
                     eval_basis_fixed(order, t_q16, &mut basis_buf[..local_basis_size]);
@@ -880,6 +945,7 @@ mod tests {
     use super::*;
     use crate::config::KanConfig;
     use crate::network::KanNetwork;
+    use crate::spline::compute_basis;
 
     fn make_network(
         input_dim: usize,
@@ -1299,4 +1365,159 @@ mod tests {
         );
     }
 
+    /// Builds a single-layer network with an explicit grid_range (`make_network`
+    /// hardcodes (-1, 1)).
+    fn make_network_ranged(grid_range: (f32, f32), grid_size: usize, order: usize) -> KanNetwork {
+        let input_dim = 3;
+        KanNetwork::new(KanConfig {
+            input_dim,
+            output_dim: 2,
+            hidden_dims: vec![],
+            grid_size,
+            spline_order: order,
+            grid_range,
+            input_mean: vec![0.0; input_dim],
+            input_std: vec![1.0; input_dim],
+            ..Default::default()
+        })
+    }
+
+    /// The upper clamps in `extract_span_t` look provably dead and are not: they
+    /// are the only thing keeping the weight read in `forward` in bounds.
+    ///
+    /// Pins the pre-clamp values (so the "can't happen" reading stays falsified)
+    /// *and* the post-clamp invariants, so a rewrite that drops either clamp fails
+    /// here instead of reading past `weights_i8`.
+    #[test]
+    fn test_span_t_clamps_fire_at_grid_top() {
+        let grid_size = 5;
+        let order = 3;
+        // (grid_range, expected h_q16, expected pre-clamp t_q16)
+        let cases: [((f32, f32), i32, i64); 2] = [
+            ((-3.0, 3.0), 78643, 65536), // library default KanConfig
+            ((-1.0, 1.0), 26214, 65538), // every baked test in this crate
+        ];
+
+        for (range, want_h_q16, want_t_q16_raw) in cases {
+            let network = make_network_ranged(range, grid_size, order);
+            let baked = BakedModel::from_network(&network, None);
+            let l = &baked.layers[0];
+            assert_eq!(l.h_q16, want_h_q16, "grid_range={range:?}: h_q16");
+
+            // Extreme input: z pinned at the very top of the grid range.
+            let q_z_off = (l.q_rmax - l.q_rmin) as i64;
+            let h = l.h_q16 as i64;
+
+            // (1) Pre-clamp span reaches grid_size, and the weight index it would
+            //     produce for the last (j, i) block is out of bounds. If this ever
+            //     stops holding, the test below guards nothing and must be revisited
+            //     rather than deleted.
+            let span_raw = q_z_off / h;
+            assert_eq!(
+                span_raw, grid_size as i64,
+                "grid_range={range:?}: span_raw must reach grid_size (q_z_off={q_z_off}, h={h})"
+            );
+            assert_eq!(
+                span_raw as usize + order,
+                l.global_basis_size,
+                "grid_range={range:?}: unclamped start_idx+order must equal global_basis_size"
+            );
+            let unclamped_w_idx = ((l.out_dim - 1) * l.in_dim + (l.in_dim - 1))
+                * l.global_basis_size
+                + span_raw as usize
+                + order;
+            assert!(
+                unclamped_w_idx >= l.weights_i8.len(),
+                "grid_range={range:?}: unclamped weight index {unclamped_w_idx} must be out of \
+                 bounds of weights_i8 (len {})",
+                l.weights_i8.len()
+            );
+
+            // (2) Once span is clamped down, t_rem reaches h_q16, so t_q16 leaves the
+            //     [0, 65535] domain that eval_basis_fixed's closed forms assume.
+            let t_rem = q_z_off - (grid_size as i64 - 1) * h;
+            assert_eq!(
+                (t_rem * 65536) / h,
+                want_t_q16_raw,
+                "grid_range={range:?}: pre-clamp t_q16"
+            );
+
+            // (3) The invariants a refactor must preserve.
+            let (span, t_q16) = extract_span_t(l.q_rmax, l.q_rmin, l.h_q16, grid_size);
+            assert!(
+                span <= grid_size - 1,
+                "grid_range={range:?}: span {span} exceeds grid_size-1 ({})",
+                grid_size - 1
+            );
+            assert!(
+                t_q16 <= 65535,
+                "grid_range={range:?}: t_q16 {t_q16} exceeds 65535"
+            );
+
+            // (4) Black-box: forward at an input that saturates the grid range must
+            //     not read out of bounds.
+            let mut out = vec![0.0f32; 2];
+            baked.forward(&[1e9, 1e9, 1e9], &mut out);
+        }
+    }
+
+    /// Orders 6/7 pass `KanConfig::validate` but have no fixed-point basis. They
+    /// used to surface as `index out of bounds: the len is 9 but the index is 9`
+    /// from inside spline.rs on the first `forward`; the bake must reject them with
+    /// a message that names the cause.
+    #[test]
+    #[should_panic(expected = "spline_order 6 is not supported by baked")]
+    fn test_bake_rejects_spline_order_6() {
+        let network = make_network_ranged((-1.0, 1.0), 5, 6);
+        assert!(
+            network.config.validate().is_ok(),
+            "order 6 must stay valid for the f32 CPU path"
+        );
+        let _ = BakedModel::from_network(&network, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "spline_order 7 is not supported by baked")]
+    fn test_bake_rejects_spline_order_7() {
+        let network = make_network_ranged((-1.0, 1.0), 5, 7);
+        assert!(
+            network.config.validate().is_ok(),
+            "order 7 must stay valid for the f32 CPU path"
+        );
+        let _ = BakedModel::from_network(&network, None);
+    }
+
+    #[test]
+    fn test_bake_and_forward_all_supported_orders() {
+        for order in 2..=5usize {
+            let network = make_network(3, vec![], 2, 5, order, 4);
+            let baked = BakedModel::from_network(&network, None);
+            let mut out = vec![0.0f32; 2];
+            baked.forward(&[0.4, -0.7, 0.9], &mut out);
+            assert!(
+                out.iter().all(|v| v.is_finite()),
+                "order {order}: non-finite output {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bake_narrow_grid_range_no_clamp_panic() {
+        // This range passes KanConfig::validate but used to bake to q_rmin = 0,
+        // q_rmax = -1 and panic in forward's clamp with "min > max".
+        let network = make_network_ranged((0.0, 0.000005), 5, 3);
+        let baked = BakedModel::from_network(&network, None);
+        let l = &baked.layers[0];
+        assert!(
+            l.q_rmax >= l.q_rmin,
+            "q_rmax ({}) must not fall below q_rmin ({})",
+            l.q_rmax,
+            l.q_rmin
+        );
+        assert!(l.h_q16 >= 1, "h_q16 must stay >= 1, got {}", l.h_q16);
+
+        let mut out = vec![0.0f32; 2];
+        baked.forward(&[0.1, 0.2, 0.3], &mut out); // must not panic
+        assert!(out.iter().all(|v| v.is_finite()), "non-finite {out:?}");
+    }
 }
