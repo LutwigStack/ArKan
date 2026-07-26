@@ -111,6 +111,51 @@ speed.
 
 ### Fixed
 
+- **A grid narrower than 1e-6 produced an all-zero basis, so the layer was a
+  constant with no gradient.** `compute_basis` skipped any Cox-de Boor
+  denominator with `denom.abs() <= EPSILON` (1e-6, *absolute*). That denominator
+  is `j · h` on a uniform grid, so on such a grid the guard fired on every
+  division and the whole recursion collapsed: partition of unity read 0 instead
+  of 1, `KanLayer::forward_*` returned exactly `bias` for every input, every
+  gradient through the layer was 0, and `KanConfig::validate` accepted all of it.
+  30 of the swept `(grid_range, grid_size, order)` combinations were affected.
+  `find_span` had the same bug hiding behind it — it floored the grid *width* at
+  `EPSILON`, so on `(1e-30, 2e-30)` every input landed in the first interval and
+  `compute_basis` extrapolated; that one was only visible per-channel (errors up
+  to 2e2 while the sum still read 1.0 to 4.5e-5). Both guards now test the actual
+  degeneracy. Worst per-channel error against an independent `f64` Cox-de Boor on
+  the previously-broken grids is now 1e-7, the same as the ordinary ranges.
+  Nothing changes on a grid that already worked.
+- **`KanConfig::validate` accepted a grid whose knots collide in `f32`.**
+  `grid_range = (1e6, 1e6 + 1.0)` with `grid_size = 64` asks for a spacing of
+  1.5625e-2 where the ULP at 1e6 is 0.0625, so consecutive knots are literally
+  the same number and no arithmetic fix exists. Now rejected with
+  `ConfigError::InvalidGridRange`, whose message covers both causes.
+- **`Workspace::new` sized every workspace from `multithreading_threshold`**, a
+  field documented as consulted only with the `parallel` feature. Two
+  consequences: `try_create_workspace` *panicked* out of its own `Result` on a
+  config `validate` accepts (`multithreading_threshold = 1 << 30` on a 784 →
+  [64,32] → 10 net), because the infallible `Workspace::new` reserved before the
+  `try_reserve` that would have reported the overflow; and `create_workspace(1)`
+  came back with capacity 128 at the default, i.e. ~13 MB of basis buffers on the
+  latency path. The eager reservation bought nothing — `try_create_workspace`
+  reserves the real `max_batch` on the next line and the forward paths reserve on
+  demand. `multithreading_threshold` now has exactly one reader and it is behind
+  `cfg!(feature = "parallel")`, so the doc comment is true.
+- **`init_seed: Some(s)` gave identically-shaped layers bit-identical weights.**
+  Each `KanLayer` reseeded its own `SmallRng` from the shared seed, so all four
+  8×8 layers of an `[8, 8, 8, 8, 8]` network compared equal, and a seeded run
+  started from a layer-to-layer symmetric point. `KanLayer::try_new_at` offsets
+  the seed by the layer's position and `KanNetwork::try_new` passes it;
+  `try_new` delegates with index 0, so first layers are unchanged. The
+  `init_seed: None` path already seeded per layer from entropy.
+- **`examples/mnist` shipped a recipe reaching 63.98% under a comment claiming
+  92.76%.** Plain SGD at lr 0.03, a hand-rolled cosine schedule that hit exactly
+  0.0 on the final epoch (so every run wasted its last epoch), and `grid_size` 12.
+  Now Adam(0.003) with the library's `CosineAnnealingLR` and a 5% floor, 8
+  epochs, `grid_size` 5: ~93.6% in the same wall time, no digit below 87% (digit
+  5 went from 19.06% to 89.91%). Library bug: none — the same architecture always
+  could do this.
 - **`BakedModel` could not return an output magnitude above the calibration
   set's 99.9th percentile.** Every requantized activation saturated at ±2^28 and
   the exit scale is `2^28 / p99.9`, so `|output[j]| <= p99.9` held by
@@ -281,9 +326,24 @@ of the library as shipped.
   so a hidden layer's input is the previous layer's *raw* activation, clamped to
   the shared `grid_range`. Nothing bounds a KAN layer's output to its own grid
   range. Choose `grid_range` for the activations, not for the inputs.
-- **Saturation is silent.** There is no `out_of_grid_fraction`, no drift
-  warning, no configurable extrapolation and no grid recalibration. Distribution
-  drift shows up as unexplained accuracy loss, not as a diagnostic.
+- **The clamp is an absorbing state and training can walk into it.** Saturation
+  is not only an initialization-time trap. On `[2, 16, 16, 1]` at Adam `lr = 0.1`
+  a run starts at 0% saturation everywhere and, by epoch 35, has a fully clamped
+  layer boundary; from there every upstream gradient is exactly zero, the network
+  is a constant, and no learning rate recovers it. Widening `grid_range` and
+  clipping gradients do not prevent it, and Adam is riskier than SGD here because
+  its normalized step moves activations out of range regardless of gradient
+  magnitude. The only escape measured is decoupled weight decay
+  (`AdamConfig::weight_decay`), which moves a parameter without consulting its
+  gradient — see `docs/ARCHITECTURE.md` and `tests/training_dynamics.rs`. The
+  structural fix (a residual base branch, or running normalization on hidden
+  layers) is a model-class change and is **not implemented**.
+- **Saturation is reported, but nothing checks it for you.**
+  `KanNetwork::clamped_fraction` returns the clamped fraction per layer from the
+  `SPAN_CLAMPED_FLAG` bits a *training* forward pass already records. There is
+  still no drift warning, no configurable extrapolation, no grid recalibration,
+  and `forward_batch` (the inference path) does not record the flag at all — so
+  drift in deployment still shows up as unexplained accuracy loss.
 
 ---
 
