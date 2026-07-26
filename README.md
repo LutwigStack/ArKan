@@ -46,9 +46,29 @@ x[l+1, j] = Σᵢ φ[l,j,i](x[l, i])      где i = 1..N_in
 * **Zero-Allocation Training:** Полный training step (forward + backward + SGD/Adam) также работает без аллокаций при прогретом Workspace.
 * **SIMD-Optimized B-Splines:** Вычисление базисных функций B-сплайнов векторизовано (AVX2/AVX-512 через крейт `wide`).  
 * **Cache-Friendly Layout:** Веса хранятся в формате `[Output][Input][Basis]` для последовательного доступа к памяти и минимизации промахов кэша.  
-* **Standalone:** Минимальные зависимости (`rayon`, `wide`). Не тянет за собой `torch` или `burn`, идеально для встраивания.  
+* **Standalone:** Сборка по умолчанию тянет только `wide`, `rand` и `thiserror`. Никаких `torch` или `burn`, идеально для встраивания.  
 * **Baked (int8) Inference:** `BakedModel` — рабочий путь квантизованного инференса (per-channel int8 веса + int16 базис). 2.5–3.2× меньше памяти, NRMSE ~1%, подходит для ранжирования/argmax. Подробности — в разделе ниже.
 * **GPU-ускорение (wgpu):** Опциональный GPU бэкенд с WGSL compute шейдерами для параллельного forward/backward.
+
+## **Cargo features**
+
+```toml
+[dependencies]
+arkan = "0.4"                                    # только wide + rand + thiserror
+arkan = { version = "0.4", features = ["serde"] } # + сериализация
+```
+
+| Флаг | Что включает | По умолчанию | Доп. зависимости |
+|---|---|---|---|
+| — | Инференс и обучение на CPU, SIMD B-сплайны, `BakedModel` (int8) | ✅ | `wide`, `rand`, `thiserror` |
+| `parallel` | `KanLayer::backward_parallel`, `KanNetwork::forward_batch_parallel` и авто-параллельная ветка `KanNetwork::backward` при `batch >= multithreading_threshold` | ❌ | `rayon` |
+| `serde` | `to_bytes()` / `from_bytes()` для `KanNetwork` и `BakedModel` | ❌ | `serde`, `bincode` |
+| `gpu` | GPU бэкенд на `wgpu` (Vulkan/DX12/Metal/WebGPU) | ❌ | `wgpu`, `bytemuck`, `pollster`, `log` |
+
+SIMD — **не** флаг: векторизация B-сплайнов через `wide` работает всегда.
+Без `parallel` методы `*_parallel` не существуют, а `backward` всегда
+однопоточный: градиенты те же (паритет проверяется в
+`tests/backward_correctness.rs`), просто одно ядро.
 
 ## **Baked (int8) Inference**
 
@@ -120,7 +140,7 @@ ArKan включает опциональный GPU бэкенд на основ
 
 ```toml
 [dependencies]
-arkan = { version = "0.3.0", features = ["gpu"] }
+arkan = { version = "0.4", features = ["gpu"] }
 ```
 
 ### **Использование**
@@ -250,7 +270,7 @@ ArKan занимает нишу **специализированного выс�
 
 ```toml
 [dependencies]
-arkan = "0.3.0"
+arkan = "0.4"
 ```
 
 Пример использования (смотрите также `examples/basic.rs` и `examples/training.rs`):
@@ -334,9 +354,29 @@ Equation for a specific weight in ArKan:
 * **Zero-Allocation Training:** The full training step (forward + backward + SGD/Adam) also runs without allocations on a warmed-up Workspace.
 * **SIMD-Optimized B-Splines:** B-spline basis evaluation is vectorized (AVX2/AVX-512 via `wide` crate).  
 * **Cache-Friendly Layout:** Weights are stored in `[Output][Input][Basis]` format for sequential memory access and minimal cache misses.  
-* **Standalone:** Minimal dependencies (`rayon`, `wide`). No `torch` or `burn` bloat, ideal for embedding.  
+* **Standalone:** A default build pulls only `wide`, `rand` and `thiserror`. No `torch` or `burn` bloat, ideal for embedding.  
 * **Quantization (planned):** `BakedModel` is a deprecated stub (`forward()` panics); full implementation planned for v0.4.0. Use `KanNetwork` directly in the meantime.
 * **GPU Acceleration (wgpu):** Optional GPU backend with WGSL compute shaders for parallel forward/backward passes.
+
+## **Cargo features**
+
+```toml
+[dependencies]
+arkan = "0.4"                                     # wide + rand + thiserror only
+arkan = { version = "0.4", features = ["serde"] } # + serialization
+```
+
+| Flag | What it turns on | Default | Extra deps |
+|---|---|---|---|
+| — | CPU inference and training, SIMD B-splines, `BakedModel` (int8) | ✅ | `wide`, `rand`, `thiserror` |
+| `parallel` | `KanLayer::backward_parallel`, `KanNetwork::forward_batch_parallel`, and the automatic parallel branch of `KanNetwork::backward` for `batch >= multithreading_threshold` | ❌ | `rayon` |
+| `serde` | `to_bytes()` / `from_bytes()` for `KanNetwork` and `BakedModel` | ❌ | `serde`, `bincode` |
+| `gpu` | `wgpu` GPU backend (Vulkan/DX12/Metal/WebGPU) | ❌ | `wgpu`, `bytemuck`, `pollster`, `log` |
+
+SIMD is **not** a feature flag: B-spline vectorization via `wide` is always on.
+Without `parallel` the `*_parallel` methods do not exist and `backward` is always
+single-threaded — identical gradients (parity asserted in
+`tests/backward_correctness.rs`), just one core.
 
 ## **GPU Backend (Optional)**
 
@@ -346,7 +386,7 @@ ArKan includes an optional GPU backend using `wgpu` for WebGPU/Vulkan/Metal/DX12
 
 ```toml
 [dependencies]
-arkan = { version = "0.3.0", features = ["gpu"] }
+arkan = { version = "0.4", features = ["gpu"] }
 ```
 
 ### **Usage**
@@ -533,7 +573,7 @@ Install from crates.io:
 
 ```toml
 [dependencies]
-arkan = "0.3.0"
+arkan = "0.4"
 ```
 
 Usage Example (see also `examples/basic.rs` and `examples/training.rs`):

@@ -1,8 +1,8 @@
 [package]
 name = "arkan"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "High-performance KAN (Kolmogorov-Arnold Network) for poker solver"
+description = "Embeddable Kolmogorov-Arnold Networks: SIMD B-spline inference, int8 quantized deployment, optional wgpu GPU backend"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/LutwigStack/ArKan"
 documentation = "https://docs.rs/arkan"

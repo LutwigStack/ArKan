@@ -5,7 +5,58 @@ All notable changes to ArKan will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - Unreleased
+
+Pre-1.0, so a minor bump carries the breaking changes below.
+
+### Breaking
+
+#### Feature flags
+
+Four of the six declared features gated nothing at all — `grep -rn 'feature =
+"X"' src/` returned zero hits for `simd`, `parallel`, `nightly` and
+`quantization`. The declared set now matches what the code actually does.
+
+- **Removed `simd`.** It was a **no-op**: B-spline vectorization goes through the
+  `wide` crate unconditionally (`src/layer.rs`, `src/spline.rs`) and the flag
+  gated nothing. If you passed `features = ["simd"]`, drop it — **nothing about
+  your build changes**, the SIMD paths were and remain always on.
+- **Removed `nightly`.** No-op, zero uses. Stable Rust only.
+- **Removed `quantization` and the `half` dependency.** No-op: `half::` was never
+  referenced anywhere in the crate. `BakedModel` has its own int8/int16
+  fixed-point scheme and never used `f16`. If you passed
+  `features = ["quantization"]`, drop it — baked inference is available in a
+  default build.
+- **`parallel` is now real** and `rayon` is an optional dependency behind it
+  (`parallel = ["dep:rayon"]`). Everything that used rayon is now
+  `#[cfg(feature = "parallel")]`:
+  - `KanLayer::backward_parallel` — **does not exist** without the feature.
+  - `KanNetwork::forward_batch_parallel` — **does not exist** without the feature.
+  - the automatic parallel branch inside `KanNetwork::backward`.
+
+  Without `parallel`, `KanConfig::multithreading_threshold` is ignored and every
+  batch size takes the sequential `KanLayer::backward` path. Gradients are
+  unchanged (parity is asserted in `tests/backward_correctness.rs`); large
+  batches simply run on one core instead of the thread pool. **If you call
+  `backward_parallel` or `forward_batch_parallel`, or train with large batches
+  and want multi-core, add `features = ["parallel"]`.**
+
+  Rationale: ArKan's niche is embeddable, low-latency, batch=1 inference. Those
+  users should not have to pull `rayon` → `rayon-core` → `crossbeam-*` +
+  `either`. A default build's normal dependency edges are now exactly `rand`,
+  `thiserror` and `wide`.
+
+#### Behaviour
+
+- `KanLayer::backward` / `backward_parallel` now report `grad_input = 0` for
+  inputs where normalization saturates against `grid_range`, instead of scaling
+  the spline derivative by `1 / std` as if the clamp were not there. This is the
+  mathematically correct gradient, but the numbers you get out of `backward`
+  change for any saturated input.
+- `BakedModel::from_network` now **panics** with a descriptive message for a
+  layer whose `spline_order` is outside `2..=5`, instead of reading out of
+  bounds. Orders 4 and 5 also produce different (correct) values now — the
+  fixed-point basis Q scales were wrong.
 
 ### Added
 
@@ -48,6 +99,10 @@ or per-channel activation scales for per-output precision requirements.
   wrapped in `#[allow(deprecated)]`).
 - `MAGIC_SPLINE` constant removed from `lib.rs` — no spline file format exists
   in this library; the constant was dead code.
+- `package.description` no longer says "for poker solver". That was a leftover
+  from where this library started; it is a general-purpose KAN crate.
+- `examples/game2048` now depends on `arkan` with `features = ["gpu", "parallel"]`
+  because it calls `forward_batch_parallel`.
 
 ---
 
