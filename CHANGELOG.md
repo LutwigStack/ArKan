@@ -65,7 +65,8 @@ Four of the six declared features gated nothing at all — `grep -rn 'feature =
 #### BakedModel — working int8 quantized inference path
 
 - **`BakedModel`** is now a fully functional quantized inference path (was a
-  non-functional stub that panicked on `forward()`).
+  non-functional stub that panicked on `forward()`). It is **no longer
+  deprecated**.
 - **Per-channel int8 weights** — each output neuron has its own scale
   `s_w[j] = 127 / max|w[j,*,*]|`, maximizing range utilization per channel.
 - **int16 basis** — B-spline bases stored in Q0.15 (`u16`); accumulator `i64`.
@@ -81,19 +82,81 @@ Four of the six declared features gated nothing at all — `grep -rn 'feature =
 - **`examples/baked_inference.rs`** — runnable end-to-end example: build,
   train briefly, calibrate, bake, compare outputs, print size ratio.
 
-#### Accuracy (post per-channel quantization)
+#### Accuracy — measured, including the tail
 
-NRMSE vs f32 on randomly-initialized networks:
+`cargo test --test baked_parity -- --nocapture`, random-init networks,
+256 calibration samples and 2000 test samples in `[-0.9, 0.9]`, `grid_range =
+(-1, 1)`. "Worst-case" is `max |baked − f32| / |f32|` restricted to outputs
+above the given multiple of the per-output std.
 
-| Architecture | NRMSE |
-|---|---|
-| Single-layer (4→2) | ~0.60% |
-| 1-hidden (4→8→2) | ~0.64% |
-| 2-hidden (8→16→8→4) | ~1.29% |
+| Architecture | order | NRMSE | worst @0.1σ | @0.5σ | @1.0σ |
+|---|---|---|---|---|---|
+| 4→2 | 3 | 0.60% | 9.2% | 8.3% | 8.3% |
+| 4→[8]→2 | 3 | 0.64% | 8.7% | 8.7% | 8.7% |
+| 8→[16,8]→4 | 3 | 1.29% | 114.7% | 27.1% | 18.7% |
+| 8→[16,8]→4 (seed 4242) | 2 | 2.65% | 474.5% | 62.3% | **34.6%** |
+| 8→[16,8]→4 (seed 4242) | 3 | 1.71% | 53.9% | 53.9% | **53.9%** |
+| 8→[16,8]→4 (seed 4242) | 4 | 2.26% | 149.5% | 63.1% | **50.0%** |
+| 8→[16,8]→4 (seed 4242) | 5 | 2.28% | 326.1% | 78.3% | **35.1%** |
 
-Suitable for ranking / argmax workloads. Deep networks (3+ layers) can show
-higher per-output tail error due to inter-layer requant noise; use int16 weights
-or per-channel activation scales for per-output precision requirements.
+The aggregate NRMSE (0.6–2.7%) is good; the **per-output tail is not**. On a
+2-hidden net the worst-case error on decision-relevant outputs (≥1σ) is
+**34.6–53.9%**. Baked is therefore suitable for **ranking / argmax /
+classification** and unsuitable for per-output absolute accuracy. See
+`docs/BENCHMARKS.md` for the two identified, still-unfixed causes.
+
+**Baked is slower than f32 at batch=1** (1.4× on 4→[8]→2, 2.1× on
+8→[16,8]→4, re-measured 2026-07-26). Its win today is size (2.2–3.0×), not
+speed.
+
+### Fixed
+
+- **Order-4 and order-5 baked B-spline basis were numerically wrong**
+  (`576fbc7`). `eval_basis_fixed` summed numerator terms at inconsistent
+  fixed-point Q scales: order 4 (Q64) left `12*t3` and `4*t3` at Q48; order 5
+  (Q80) was short by one to two factors of 65536 in nine terms. Max absolute
+  basis error vs the f32 reference dropped from **0.208 → 0.000117** (order 4)
+  and **0.775 → 0.000143** (order 5), over all 65536 `t_q16` values. End-to-end
+  NRMSE on a 4→[8]→2 net went **13.98% → 0.98%** (order 4) and **89.30% →
+  1.21%** (order 5). Order 3 is bit-identical.
+  **Any published baked accuracy number for orders 4 or 5 predating this commit
+  was measured on broken arithmetic and is void.**
+- **Two panics reachable through `BakedModel`** (`8f0c44d`).
+  `BakedModel::from_network` now panics with a descriptive message for a layer
+  whose `spline_order` is outside `2..=5`, instead of reading out of bounds —
+  `KanConfig::validate()` accepts up to `MAX_SPLINE_ORDER = 7`, but baked only
+  implements 2..=5. And a `grid_range` narrower than ~1.5e-5 (e.g. the
+  validate-approved `(0.0, 0.000005)`) no longer panics with `min > max`;
+  `q_rmax` is floored at `q_rmin`. Deleting the fallback arm also drops baked
+  support for `spline_order = 1`.
+- **`grad_input` was non-zero where the clamp had saturated** — forward and
+  backward disagreed (`186fd75`, CPU and GPU). Forward computes
+  `z = clamp((x − mean)/std, grid_min, grid_max)`, so `dz/dx` is exactly 0
+  outside the range; backward scaled the spline derivative by `1/std`
+  unconditionally. Hidden layers are where this bites, because their inputs are
+  the previous layer's raw activations and routinely leave the grid (50% of them
+  in `tests/clamp_gradient_parity.rs`'s fixture). Finite differences on layer-0
+  weights showed gaps up to **1.6e-2 against true gradients of ~5e-4 — roughly
+  30× too large, several with the wrong sign**. GPU `grad_input` on saturated
+  inputs went from 5.7e-1 to 0. Forward now records the clamp in the high bit of
+  the stored span index (`SPAN_CLAMPED_FLAG`) and backward reads it; no new
+  buffer, no signature change.
+- **`examples/game2048` starved both of its hidden layers** (`f614b50`). It used
+  `grid_range(0.0, 1.0)` reasoning "one-hot values are 0 or 1" — true of the
+  inputs, false of everything downstream. Measured on the shipped config
+  (256 → [64, 32] → 4): layer 0 0% saturated, **layer 1 43.6%, layer 2 48.9%**.
+  Now `(-1.0, 1.0)`, which measures 0% on all three.
+  `tests/hidden_layer_saturation.rs` pins both directions.
+- **`benches/optimizer.rs` did not compile** (`f06296e`) —
+  `SGD::new(&network, 0.001, 0.9, 0.0)` against the real
+  `SGD::new(&KanNetwork, SGDConfig)`. `docs/BENCHMARKS.md` was citing numbers
+  from a bench that could not be built. CI now type-checks benches
+  (`--all-targets`).
+- Two deny-by-default `clippy::erasing_op` errors in
+  `tests/forward_correctness.rs` (`0317a1b`), the ~70-warning clippy backlog
+  (`a175247`) and `cargo fmt` across the repo (`029ad82`).
+- `clippy::incompatible_msrv` false positives on `Option::is_none_or` in the
+  `gpu` module, which can never build at 1.73 anyway (`876099b`).
 
 ### Changed
 
@@ -105,6 +168,17 @@ or per-channel activation scales for per-output precision requirements.
   from where this library started; it is a general-purpose KAN crate.
 - `examples/game2048` now depends on `arkan` with `features = ["gpu", "parallel"]`
   because it calls `forward_batch_parallel`.
+- **Test coverage that would have caught the order-4/5 defect** (`1ab2a5d`).
+  The basis sweep used `step_by(64)`, visiting 1.56% of the domain — now
+  exhaustive. Every baked test, bench and example hard-coded `order = 3`, so
+  orders 4 and 5 had zero end-to-end coverage; `baked_parity_all_orders` now
+  covers 2..=5.
+- **Removed `examples/comprehensive_test.rs` and
+  `examples/gpu_comprehensive_test.rs`** (`445a020`, 549 lines). Both counted
+  failures into local integers and then returned `Ok(())` unconditionally, so
+  they exited 0 whether they passed or not. Every check they made is already
+  covered by `tests/`.
+- `.claude/` added to `.gitignore` (`fa26d28`).
 
 #### Declared MSRV
 
@@ -141,6 +215,34 @@ run across a feature matrix (`--no-default-features`, `serde`, `parallel`,
 `serde,parallel`, `gpu`, `--all-features`), plus `cargo package` and a pinned
 1.73 MSRV job. Benches are type-checked (`--all-targets`) and `gpu` test code is
 compile-checked (`--no-run`, since GPU tests need an adapter no runner has).
+
+### Known limitations (not fixed in 0.4.0)
+
+Documented rather than hidden. None of these are regressions; they are the state
+of the library as shipped.
+
+- **`BakedModel` is slower than `KanNetwork` at batch=1** (1.4–2.1× on the two
+  shipped bench configs). A design that reverses this — the win is a weight
+  **layout** change to output-innermost plus hoisting the basis evaluation out
+  of the `j` loop, *not* SIMD — has been prototyped and measured at roughly
+  1.5–2.8× **faster** than f32 depending on shape. It is **not implemented**.
+- **`BakedModel` cannot return an output magnitude above the calibration set's
+  99.9th percentile.** `ACT_CLAMP` (2^28) is applied to the output layer's
+  activations too, and the exit scale is `2^28 / p99.9`, so the clamp becomes a
+  hard ceiling on the dequantized output. Unfixed.
+- **`norm_a_fixed` carries only ~3 bits.** The inter-layer scale
+  `A_FIXED[i] = round(2^32 / (s_act_prev · std_i))` lands on small integers
+  (measured 5–10 on the parity fixtures), so rounding it costs a systematic
+  2.6–6.7% per inter-layer hop. Together with the ceiling above, this is the
+  likely origin of the ≥1σ tail. Unfixed.
+- **Only layer 0 receives `input_mean` / `input_std`.** Every hidden layer is
+  built with identity normalization and there is no running-statistics update,
+  so a hidden layer's input is the previous layer's *raw* activation, clamped to
+  the shared `grid_range`. Nothing bounds a KAN layer's output to its own grid
+  range. Choose `grid_range` for the activations, not for the inputs.
+- **Saturation is silent.** There is no `out_of_grid_fraction`, no drift
+  warning, no configurable extrapolation and no grid recalibration. Distribution
+  drift shows up as unexplained accuracy loss, not as a diagnostic.
 
 ---
 
@@ -274,11 +376,20 @@ compile-checked (`--no-run`, since GPU tests need an adapter no runner has).
 
 ## Roadmap
 
-### v0.4.0 (Planned)
-- [ ] `BakedModel` quantized inference (INT8)
+Nothing below is implemented. Items are listed only where a concrete design or
+measurement exists; see "Known limitations" under 0.4.0 for what they would fix.
+
+### Next
+- [ ] `BakedModel` fast path — output-innermost weight layout + hoisted basis
+      evaluation. Prototyped and measured at ~1.5–2.8× faster than f32 at
+      batch=1; not implemented.
+- [ ] Grid-domain observability — `out_of_grid_fraction`, drift warning,
+      configurable extrapolation, grid recalibration. Saturation is silent today.
+- [ ] Close the baked ≥1σ tail — stop applying `ACT_CLAMP` to the output layer,
+      and give `norm_a_fixed` more than ~3 bits.
+
+### Unscheduled
 - [ ] ONNX export
 - [ ] Model pruning utilities
-
-### v0.5.0 (Planned)
 - [ ] Async GPU pipeline for overlapped compute
 - [ ] Multi-GPU support
