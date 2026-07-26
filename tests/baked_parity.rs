@@ -5,9 +5,14 @@
 //!   (b) Worst-case = max per-element |b - f| / |f| restricted to outputs whose
 //!       |f| > tau, where tau = 0.1 × per-output std over the test set.
 //!
-//! Asserts NRMSE ≤ 5% (small config) / ≤ 10% (medium config).
-//! Worst-case on significant outputs is printed but NOT gated — it is the
-//! honest tail number that WS02's aggregate NRMSE concealed.
+//! Asserts NRMSE ≤ 5% (small config) / ≤ 10% (medium config), and gates the
+//! worst case at the 1.0σ significance cut at 15%.
+//!
+//! The 1.0σ gate exists because NRMSE alone is not enough: this suite once read
+//! 1.3% NRMSE with a 34–53% worst case on ≥1σ outputs, and a change that trades
+//! the tail for the aggregate would have passed. The 0.1σ figure stays printed and
+//! ungated — dividing a few-LSB absolute error by a near-noise reference explodes
+//! by construction, so it is a diagnostic, not a gate.
 
 use arkan::{BakedModel, KanConfig, KanNetwork};
 
@@ -70,14 +75,14 @@ fn f32_weight_bytes(network: &KanNetwork) -> usize {
 
 /// Compute NRMSE and worst-case-on-significant-outputs for a given config.
 ///
-/// Returns (nrmse, worst_case_significant).
+/// Returns (nrmse, worst_case at 0.1σ, worst_case at 1.0σ).
 fn measure_accuracy(
     network: &KanNetwork,
     baked: &BakedModel,
     test_inputs: &[f32],
     input_dim: usize,
     output_dim: usize,
-) -> (f32, f32) {
+) -> (f32, f32, f32) {
     let n = test_inputs.len() / input_dim;
 
     // Collect all (f32_out, baked_out) pairs
@@ -135,15 +140,21 @@ fn measure_accuracy(
     };
 
     let worst_case = worst_at(0.1);
+    let worst_1sigma = worst_at(1.0);
     println!(
         "    worst-case by significance: 0.1σ={:.1}%  0.5σ={:.1}%  1.0σ={:.1}%",
         worst_case * 100.0,
         worst_at(0.5) * 100.0,
-        worst_at(1.0) * 100.0
+        worst_1sigma * 100.0
     );
 
-    (nrmse, worst_case)
+    (nrmse, worst_case, worst_1sigma)
 }
+
+/// Gate on the ≥1σ worst case. Measured 0.8–7.9% across every config in this
+/// file; 15% is ~2x the worst of those and ~1/4 of what it read before the
+/// output-layer and `norm_a_fixed` fixes (34.6–53.9%).
+const TAIL_GATE_1SIGMA: f32 = 0.15;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -169,7 +180,8 @@ fn baked_parity_small() {
     let f32_bytes = f32_weight_bytes(&network);
     let baked_bytes = baked.size_bytes();
 
-    let (nrmse, worst_case) = measure_accuracy(&network, &baked, &test, input_dim, output_dim);
+    let (nrmse, worst_case, worst_1s) =
+        measure_accuracy(&network, &baked, &test, input_dim, output_dim);
 
     println!("\n[baked_parity_small] config=4→[8]→2, grid=5, order=3");
     println!(
@@ -195,6 +207,12 @@ fn baked_parity_small() {
         nrmse,
         nrmse * 100.0
     );
+    assert!(
+        worst_1s <= TAIL_GATE_1SIGMA,
+        "TAIL GATE FAILED: worst case on >=1sigma outputs = {:.2}% exceeds {:.0}% for small config",
+        worst_1s * 100.0,
+        TAIL_GATE_1SIGMA * 100.0
+    );
 }
 
 /// Config 2 (medium): 8 → [16, 8] → 4, grid=5, order=3
@@ -215,7 +233,8 @@ fn baked_parity_medium() {
     let f32_bytes = f32_weight_bytes(&network);
     let baked_bytes = baked.size_bytes();
 
-    let (nrmse, worst_case) = measure_accuracy(&network, &baked, &test, input_dim, output_dim);
+    let (nrmse, worst_case, worst_1s) =
+        measure_accuracy(&network, &baked, &test, input_dim, output_dim);
 
     println!("\n[baked_parity_medium] config=8→[16,8]→4, grid=5, order=3");
     println!(
@@ -241,6 +260,13 @@ fn baked_parity_medium() {
         nrmse,
         nrmse * 100.0
     );
+    assert!(
+        worst_1s <= TAIL_GATE_1SIGMA,
+        "TAIL GATE FAILED: worst case on >=1sigma outputs = {:.2}% exceeds {:.0}% for medium \
+         config",
+        worst_1s * 100.0,
+        TAIL_GATE_1SIGMA * 100.0
+    );
 }
 
 /// Config 3 (single-layer): 4 → 2, grid=5, order=3 (exercises no inter-layer path)
@@ -259,7 +285,8 @@ fn baked_parity_single_layer() {
 
     let baked = BakedModel::from_network(&network, Some(&cal));
 
-    let (nrmse, worst_case) = measure_accuracy(&network, &baked, &test, input_dim, output_dim);
+    let (nrmse, worst_case, worst_1s) =
+        measure_accuracy(&network, &baked, &test, input_dim, output_dim);
 
     println!("\n[baked_parity_single_layer] config=4→2, grid=5, order=3");
     println!(
@@ -278,6 +305,13 @@ fn baked_parity_single_layer() {
         "GATE FAILED: NRMSE={:.4} ({:.2}%) exceeds 5% for single-layer config",
         nrmse,
         nrmse * 100.0
+    );
+    assert!(
+        worst_1s <= TAIL_GATE_1SIGMA,
+        "TAIL GATE FAILED: worst case on >=1sigma outputs = {:.2}% exceeds {:.0}% for \
+         single-layer config",
+        worst_1s * 100.0,
+        TAIL_GATE_1SIGMA * 100.0
     );
 }
 
@@ -306,7 +340,8 @@ fn baked_parity_all_orders() {
         let test = random_inputs_in_range(2000, input_dim, 222, -0.9, 0.9);
 
         let baked = BakedModel::from_network(&network, Some(&cal));
-        let (nrmse, worst) = measure_accuracy(&network, &baked, &test, input_dim, output_dim);
+        let (nrmse, worst, worst_1s) =
+            measure_accuracy(&network, &baked, &test, input_dim, output_dim);
 
         println!(
             "[baked_parity_all_orders] order={order}: NRMSE={:.4} ({:.2}%), worst(0.1s)={:.4}",
@@ -318,6 +353,13 @@ fn baked_parity_all_orders() {
         // Same 10% gate as the medium config, which shares this shape.
         if nrmse > 0.10 {
             failures.push(format!("order={order}: NRMSE={nrmse:.4} exceeds 10%"));
+        }
+        if worst_1s > TAIL_GATE_1SIGMA {
+            failures.push(format!(
+                "order={order}: worst case on >=1sigma outputs = {:.2}% exceeds {:.0}%",
+                worst_1s * 100.0,
+                TAIL_GATE_1SIGMA * 100.0
+            ));
         }
     }
 

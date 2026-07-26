@@ -12,9 +12,10 @@
 //! - Bias: i64 (folded with per-channel weight scale and basis scale)
 //! - Inter-layer activations: i32 with target range ~2^28 (wider than i16 to reduce
 //!   inter-layer error amplification)
-//! - Output-layer activations: same i32 scale, but saturated at i32::MAX rather than
-//!   2^28 — nothing downstream depends on the p99.9 ceiling there
-//! - Activation calibration: 99.9th-percentile clip to stop outliers wasting range
+//! - Activations saturate only at the i32 they are stored in. The 99.9th
+//!   percentile sets the SCALE, not a clip — see `forward` for why clipping there
+//!   only ever added error
+//! - Activation calibration: 99.9th percentile sets s_act so outliers do not waste range
 //! - Requant: per-output-channel `M0[j]`/`shift[j]` derived from `s_act/(s_w[j]·32768)`
 //! - No f32 between entry normalization and final dequantization
 //!
@@ -447,8 +448,9 @@ impl BakedModel {
 
         // Compute activation scales s_act[L] for each layer output.
         // s_act[L] = ACT_TARGET / p99.9(|layer L output|) over calibration inputs.
-        // Activations are clamped to ±ACT_TARGET at requant time so outliers saturate
-        // instead of stealing dynamic range from the bulk of values.
+        // Using the percentile rather than the max stops a handful of outliers from
+        // stealing dynamic range from the bulk of values. Values above it are NOT
+        // clipped — see the saturation comment in `forward`.
         let n_layers = network.layers.len();
         let mut s_act = vec![1.0f32; n_layers];
 
@@ -796,28 +798,31 @@ impl BakedModel {
                 basis_buf.resize(local_basis_size, 0);
             }
 
-            // Saturation bound for this layer's requantized activations.
+            // Requantized activations saturate at the i32 they are stored in, and
+            // nothing tighter.
             //
-            // A HIDDEN layer clamps at ACT_TARGET because its output is the next
-            // layer's input, and that next layer's `norm_a_fixed` was derived from
-            // p99.9 of the calibration set: letting an outlier through would push
-            // `q_z` far outside the grid range and cost more than saturating does.
+            // They used to saturate at ACT_TARGET (2^28) on every layer, which — since
+            // the exit scale is s_act_last = 2^28 / p99.9 — is exactly p99.9 of the
+            // calibration set. On the OUTPUT layer that capped every value the model
+            // could ever return: on a calibrated 4->2 net, 2 of the 2000 *calibration*
+            // samples already sat above the ceiling, worst case f32 -0.520944 vs baked
+            // -0.471458, 9.50% error from clipping alone.
             //
-            // The OUTPUT layer has no next layer. Its only consumer is the f32
-            // dequant at the bottom of `forward`, so the argument does not apply and
-            // the sole real bound is the i32 `act_b` is stored in. Clamping it at
-            // ACT_TARGET capped every value the model can ever return at p99.9 of
-            // the calibration set — on a calibrated 4->2 net, 2 of the 2000
-            // *calibration* samples already sat above the ceiling, worst case f32
-            // -0.520944 vs baked -0.471458, 9.50% error from clipping alone.
-            // i32::MAX keeps `as i32` well-defined while leaving ~3 bits (8x p99.9)
-            // of headroom.
-            const ACT_CLAMP: i64 = 268_435_456; // 2^28 = ACT_TARGET
-            let clamp_hi: i64 = if l + 1 < self.layers.len() {
-                ACT_CLAMP
-            } else {
-                i32::MAX as i64
-            };
+            // On a HIDDEN layer the stated justification was that an outlier would
+            // otherwise wreck the next layer's fixed-point z scale. Measured, it does
+            // not: `q_z` is clamped to [q_rmin, q_rmax] in the inter-layer step below,
+            // and that IS the grid range — the same range the f32 path clamps z to
+            // (`KanLayer::forward_single`). Both paths saturate an outlier the same
+            // way. ACT_TARGET was a *second*, tighter saturation at p99.9 that the f32
+            // path does not have, so it could only add error, and it was most of the
+            // remaining tail: on 8->[16,8]->4 the worst case on >=1 sigma outputs went
+            // 25.2 / 51.8 / 33.7 / 29.5% -> 7.9 / 3.1 / 3.4 / 6.4% for orders 2/3/4/5
+            // when it was dropped.
+            //
+            // The calibration percentile still sets the *scale* (`s_act`), which is
+            // what stops outliers wasting dynamic range. Only the clip is gone.
+            const ACT_LO: i64 = i32::MIN as i64;
+            const ACT_HI: i64 = i32::MAX as i64;
 
             // For each output j
             for (j, act_out) in act_b[..out_dim].iter_mut().enumerate() {
@@ -854,8 +859,6 @@ impl BakedModel {
 
                 // Per-channel requant: q_out[j] = ((acc * M0[j]) + round) >> S[j].
                 // Using i32 output (wider than old i16) to preserve inter-layer precision.
-                // Saturate to `clamp_hi` (see above — ACT_TARGET on hidden layers,
-                // i32::MAX on the output layer).
                 let m0_j = layer.requant_m0[j] as i128;
                 let shift_j = layer.requant_shift[j];
                 let product = (acc as i128) * m0_j;
@@ -865,7 +868,7 @@ impl BakedModel {
                     0
                 };
                 let q_out_i64 = ((product + round_offset) >> shift_j) as i64;
-                *act_out = q_out_i64.clamp(-clamp_hi, clamp_hi) as i32;
+                *act_out = q_out_i64.clamp(ACT_LO, ACT_HI) as i32;
             }
 
             // INTER-LAYER: compute next layer's z values in Q15.16
@@ -879,15 +882,17 @@ impl BakedModel {
                 //      B_FIXED = round(-mean_i / std_i * 2^16),
                 //      SH      = next_layer.norm_shift.
                 //
-                // Overflow bound. This branch only runs for a HIDDEN layer, so
-                // |act_b[i]| <= ACT_CLAMP = 2^28 (the i32::MAX bound above applies to
-                // the output layer, which never reaches here). from_network clamps
-                // A_FIXED to [1, 2^30 - 1] and SH to [0, 62], so
-                //   |q_in * A_FIXED| < 2^28 * 2^30 = 2^58,
+                // Overflow bound. act_b[i] is an i32, so |act_b[i]| <= 2^31.
+                // from_network clamps A_FIXED to [1, 2^30 - 1] and SH to [0, 62], so
+                //   |q_in * A_FIXED| < 2^31 * 2^30 = 2^61,
                 //   round = 2^(SH-1) <= 2^61,
-                //   |sum| < 2^58 + 2^61 < 2^62 < i64::MAX.
+                //   |sum| < 2^62 < i64::MAX.
                 // The final clamp is done in i64 against two i32 bounds, so the `as
                 // i32` cannot truncate even when B_FIXED pushes the sum out of range.
+                // Note that clamp is to the GRID RANGE, which is what makes the
+                // ACT_TARGET saturation above unnecessary: an activation far past
+                // p99.9 lands outside [q_rmin, q_rmax] and saturates here instead,
+                // exactly as the f32 path saturates z.
                 let sh = next_layer.norm_shift;
                 let round = if sh > 0 { 1i64 << (sh - 1) } else { 0 };
                 for i in 0..next_in_dim {
