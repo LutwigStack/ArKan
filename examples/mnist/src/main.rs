@@ -13,7 +13,10 @@
 //! cargo run --release --features gpu -- --gpu
 //! ```
 
-use arkan::{KanConfigBuilder, KanNetwork, Workspace, TrainOptions};
+use arkan::{
+    Adam, AdamConfig, CosineAnnealingLR, KanConfigBuilder, KanNetwork, LrScheduler, Optimizer,
+    TrainOptions, Workspace,
+};
 use mnist::{Mnist, MnistBuilder};
 use rand::seq::SliceRandom;
 use std::time::Instant;
@@ -110,12 +113,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .hidden_dims(vec![64, 32])         // Two hidden layers (best so far)
         .output_dim(10)                    // 10 digit classes
         .spline_order(3)                   // Cubic splines (optimal)
-        .grid_size(12)                     // Grid 12 (best result: 92.76%)
+        // Grid 5, not 12. Measured with the recipe below (Adam 0.003, 8 epochs): grid
+        // 5 gave 93.75% / 93.53% in ~200s over two runs, grid 12 gave 93.20% in 221s.
+        // The finer grid has 2.4x the coefficients to fit from the same 60k samples,
+        // costs more per step, and does not win. The shuffle is unseeded, so expect
+        // this much run-to-run spread. This line used to read `.grid_size(12)  // Grid
+        // 12 (best result: 92.76%)` above a recipe that delivered 63.98%.
+        .grid_size(5)
         .grid_range(-3.0, 3.0)             // Z-score range
         .build()?;
 
     println!("  Architecture: 784 -> 64 -> 32 -> 10");
-    println!("  Grid size:    12, Spline order: 3");
+    println!("  Grid size:    {}, Spline order: {}", config.grid_size, config.spline_order);
     println!();
 
     let mut network = KanNetwork::new(config.clone());
@@ -127,16 +136,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Training parameters
-    let epochs = if use_gpu { 50 } else { 5 };
+    let epochs = if use_gpu { 50 } else { 8 };
     let batch_size = if use_gpu { 256 } else { 512 };
-    let initial_lr = if use_gpu { 0.02f32 } else { 0.03f32 };
+    // Adam on the CPU path, not raw SGD. The shipped recipe was SGD at lr 0.03 for
+    // 5 epochs and reached 63.98%, with digit 5 at 19.06%; this reaches ~93.6% in
+    // about the same wall time, with no digit below 87%.
+    let initial_lr = if use_gpu { 0.02f32 } else { 0.003f32 };
     let num_batches = train_size / batch_size;
+
+    // The library's own scheduler, with a nonzero floor. The hand-rolled cosine
+    // this replaces was `cos(pi * epoch / epochs)` over `epoch in 1..=epochs`,
+    // which hits exactly 0.0 on the final epoch - the last epoch of every run
+    // trained at lr = 0 and changed nothing.
+    let schedule = CosineAnnealingLR::new(initial_lr, epochs, initial_lr * 0.05);
+
+    let mut optimizer = Adam::new(&network, AdamConfig::with_lr(initial_lr));
 
     println!("🎯 Training configuration:");
     println!("  Epochs:      {}", epochs);
     println!("  Batch size:  {}", batch_size);
     println!("  Batches/epoch: {}", num_batches);
-    println!("  Initial LR:  {} (cosine decay)", initial_lr);
+    println!("  Optimizer:   Adam, lr {} (cosine decay)", initial_lr);
     println!();
 
     // GPU setup if enabled
@@ -179,9 +199,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for epoch in 1..=epochs {
         let epoch_start = Instant::now();
         
-        // Cosine annealing learning rate
-        let lr = initial_lr * 0.5 * (1.0 + (std::f32::consts::PI * epoch as f32 / epochs as f32).cos());
-        
+        // Cosine annealing learning rate. `epoch - 1` so the first epoch gets the
+        // full initial_lr and the last still gets the floor, not zero.
+        let lr = schedule.get_lr(epoch - 1, 0.0);
+        optimizer
+            .set_lr(0, lr as f64)
+            .expect("Adam has one param group");
+
         // Update LR for GPU optimizer
         #[cfg(feature = "gpu")]
         if use_gpu {
@@ -221,16 +245,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             #[cfg(feature = "gpu")]
             if !use_gpu {
-                network.train_step_with_options(
-                    &batch_inputs, &batch_targets, None, lr, &mut workspace, &train_opts,
-                );
+                network.train_step_with_optimizer(
+                    &batch_inputs, &batch_targets, None, &mut workspace, &mut optimizer,
+                    &train_opts,
+                )?;
             }
-            
+
             #[cfg(not(feature = "gpu"))]
             {
-                network.train_step_with_options(
-                    &batch_inputs, &batch_targets, None, lr, &mut workspace, &train_opts,
-                );
+                network.train_step_with_optimizer(
+                    &batch_inputs, &batch_targets, None, &mut workspace, &mut optimizer,
+                    &train_opts,
+                )?;
             }
         }
 
