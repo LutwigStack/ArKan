@@ -24,11 +24,19 @@
 use arkan::config::{EPSILON, MAX_GRID_SIZE, MAX_SPLINE_ORDER};
 use arkan::spline::{compute_basis, compute_basis_and_deriv, compute_knots, find_span};
 
-/// Orders under test. CPU maximum is [`MAX_SPLINE_ORDER`]; order 1 is excluded
-/// because its basis is only C^0, so the derivative is a step function and a
-/// central difference across a knot converges to the average of two different
-/// one-sided limits. Order 0 has no derivative at all.
-const ORDERS: std::ops::RangeInclusive<usize> = 2..=MAX_SPLINE_ORDER;
+/// Orders under test: the whole range `KanConfig::validate` accepts, 1 to
+/// [`MAX_SPLINE_ORDER`]. Order 0 is rejected by `validate` and has no derivative.
+///
+/// Order 1 used to be excluded here on the grounds that its basis is only C^0, so
+/// a central difference across a knot converges to the average of two different
+/// one-sided limits. That argument is real but it does not apply: the
+/// finite-difference derivative test probes at [`interior_points`], which sit at
+/// 0.09..0.91 of a knot interval and step by `h * 1e-3`, so no probe ever crosses a
+/// knot. Every other property here - partition of unity, non-negativity,
+/// per-channel Cox-de Boor, `find_span` bracketing, `sum(B') = 0` - holds at order 1
+/// unconditionally. Excluding it left `spline_order = 1`, a supported and
+/// `validate()`-accepted configuration, with no per-channel coverage at all.
+const ORDERS: std::ops::RangeInclusive<usize> = 1..=MAX_SPLINE_ORDER;
 
 /// Grid sizes spanning the supported range 1..=[`MAX_GRID_SIZE`], including both
 /// endpoints and both parities around the SIMD width.
@@ -45,6 +53,22 @@ const RANGES: [(f32, f32); 7] = [
     (-0.25, 4.0),
     (-10.0, -2.0),
 ];
+
+/// Every `(grid_size, grid_range)` pair under test: the full `GRID_SIZES x RANGES`
+/// product, plus the four narrow grids of [`NARROW_RANGES`], which carry their own
+/// `grid_size` because what makes them narrow is the knot *spacing*.
+///
+/// The derivative tests iterate this rather than `GRID_SIZES x RANGES`. They used
+/// not to, and that is why an absolute-EPSILON guard reintroduced into
+/// `compute_basis_and_deriv`'s denominators - the exact bug that was fixed in
+/// `compute_basis` - went undetected: the narrow grids were reachable only by tests
+/// that never call the derivative.
+fn all_grids() -> impl Iterator<Item = (usize, (f32, f32))> {
+    GRID_SIZES
+        .into_iter()
+        .flat_map(|g| RANGES.into_iter().map(move |r| (g, r)))
+        .chain(NARROW_RANGES.into_iter().map(|(r, g)| (g, r)))
+}
 
 /// Naive Cox-de Boor recursion in `f64`, written straight from the definition.
 ///
@@ -90,6 +114,28 @@ fn ulp_step(x: f32, up: bool) -> f32 {
     let toward_infinity = up == (x > 0.0);
     let bits = x.to_bits();
     f32::from_bits(if toward_infinity { bits + 1 } else { bits - 1 })
+}
+
+/// How far a basis channel at `x` can legitimately sit outside `[0, 1]`, or away
+/// from the textbook value, purely because of `find_span`'s knot snap.
+///
+/// `find_span` computes `(x - t_min) / h` in `f32` and floors it with a small
+/// positive fudge, so when that ratio rounds up to an integer it hands back the
+/// interval *starting* at the next knot even though `x` can sit up to one ULP below
+/// it. `compute_basis` then evaluates that interval's polynomial pieces a hair
+/// outside their interval. A channel's slope is at most `order / h`, so the
+/// resulting error is at most `order * ULP(x) / h` - roughly
+/// `order * 1.2e-7 * |x| / h`, i.e. it grows with how many knot widths the grid sits
+/// away from zero, not with `h` alone.
+///
+/// Order 1 is where this became visible, because there the bound is tight: on
+/// `(0.5, 2.5)` at `grid_size = 63` the measured error is 3.76e-6 and the companion
+/// channel is exactly that negative, against `ULP(1.26) / h = 3.75e-6`. At order 2
+/// and up the same points are an order of magnitude inside the flat tolerance, which
+/// is why a flat tolerance was enough while order 1 was excluded.
+fn snap_floor(x: f32, order: usize, h: f32) -> f64 {
+    let mag = x.abs();
+    f64::from(order as f32 * (ulp_step(mag, true) - mag) / h)
 }
 
 /// Evaluation points: every interior knot exactly, one ULP either side of it, a
@@ -162,15 +208,33 @@ fn partition_of_unity_holds_across_the_configuration_space() {
     );
 }
 
+/// Both entry points that produce basis values - `compute_basis` and the
+/// `basis_out` half of `compute_basis_and_deriv` - against the independent `f64`
+/// recursion.
+///
+/// `compute_basis_and_deriv` is included here rather than in its own test because
+/// the obvious own test is worthless. It used to exist: it asserted that
+/// `compute_basis_and_deriv`'s `basis_out` equals `compute_basis`'s output, with
+/// `assert_eq!(worst, 0.0)`. `compute_basis_and_deriv`'s first statement *is*
+/// `compute_basis(x, span, knots, order, basis_out)` and it never writes `basis_out`
+/// again, so that assertion was guaranteed by the implementation's structure and
+/// could not fail. Verified: the left/right swap in `compute_basis` that this test
+/// catches left the delegation test reporting `worst = 0.0`. An assertion the
+/// implementation guarantees is not a test - which is the same lesson as the
+/// fixed-point partition-of-unity check in `src/baked.rs` that passed while order 4
+/// was off by 0.208. Checked against the independent reference, the contract
+/// ("backward's weight gradient comes from these values") is actually pinned.
 #[test]
 fn every_basis_channel_matches_an_independent_cox_de_boor() {
     let mut worst = 0.0f64;
+    let mut worst_ratio = 0.0f64;
     let mut worst_at = String::new();
     let mut cases = 0usize;
 
     for order in ORDERS {
         for grid_size in GRID_SIZES {
             for gr in RANGES {
+                let h = (gr.1 - gr.0) / grid_size as f32;
                 let knots = compute_knots(grid_size, order, gr);
                 let knots64: Vec<f64> = knots.iter().map(|&k| f64::from(k)).collect();
                 for x in sample_points(gr, &knots, order, grid_size) {
@@ -184,18 +248,35 @@ fn every_basis_channel_matches_an_independent_cox_de_boor() {
                     let span = find_span(x, &knots, order, grid_size);
                     let mut basis = [0.0f32; MAX_SPLINE_ORDER + 1];
                     compute_basis(x, span, &knots, order, &mut basis[..=order]);
+                    let mut with_deriv = [0.0f32; MAX_SPLINE_ORDER + 1];
+                    let mut deriv = [0.0f32; MAX_SPLINE_ORDER + 1];
+                    compute_basis_and_deriv(
+                        x,
+                        span,
+                        &knots,
+                        order,
+                        &mut with_deriv[..=order],
+                        &mut deriv[..=order],
+                    );
 
-                    for (k, &got) in basis[..=order].iter().enumerate() {
+                    let tol = 5e-6 + snap_floor(x, order, h);
+                    for k in 0..=order {
                         let j = span - order + k;
                         let want = ref_basis(j as isize, order, f64::from(x), &knots64);
-                        let err = (want - f64::from(got)).abs();
-                        cases += 1;
-                        if err > worst {
-                            worst = err;
-                            worst_at = format!(
-                                "order={order} grid_size={grid_size} range={gr:?} x={x:e} \
-                                 channel={k} (global {j}): want={want} got={got}"
-                            );
+                        for (entry, got) in
+                            [("compute_basis", basis[k]), ("and_deriv", with_deriv[k])]
+                        {
+                            let err = (want - f64::from(got)).abs();
+                            cases += 1;
+                            worst = worst.max(err);
+                            if err / tol > worst_ratio {
+                                worst_ratio = err / tol;
+                                worst_at = format!(
+                                    "{entry}: order={order} grid_size={grid_size} range={gr:?} \
+                                     x={x:e} channel={k} (global {j}): want={want} got={got} \
+                                     err={err:e} tol={tol:e}"
+                                );
+                            }
                         }
                     }
                 }
@@ -203,31 +284,44 @@ fn every_basis_channel_matches_an_independent_cox_de_boor() {
         }
     }
 
-    println!("per-channel basis: {cases} channels, worst error = {worst:e} at {worst_at}");
+    println!(
+        "per-channel basis: {cases} channels, worst error = {worst:e}, \
+         worst error/tolerance = {worst_ratio:.3} at {worst_at}"
+    );
     assert!(
-        worst < 5e-6,
-        "a basis channel disagrees with the textbook recursion: {worst:e} at {worst_at}"
+        worst_ratio < 1.0,
+        "a basis channel disagrees with the textbook recursion by more than the \
+         f32 knot-snap floor: {worst_at}"
     );
 }
 
 #[test]
 fn basis_values_are_never_negative() {
     let mut worst = 0.0f32;
+    let mut worst_ratio = 0.0f64;
     let mut worst_at = String::new();
 
     for order in ORDERS {
         for grid_size in GRID_SIZES {
             for gr in RANGES {
+                let h = (gr.1 - gr.0) / grid_size as f32;
                 let knots = compute_knots(grid_size, order, gr);
                 for x in sample_points(gr, &knots, order, grid_size) {
                     let span = find_span(x, &knots, order, grid_size);
                     let mut basis = [0.0f32; MAX_SPLINE_ORDER + 1];
                     compute_basis(x, span, &knots, order, &mut basis[..=order]);
+                    // A channel may be negative by at most the knot-snap floor: the
+                    // snapped interval's polynomial, evaluated one ULP outside it, is
+                    // slightly negative at the end where it should reach exactly 0.
+                    let allowed = 1e-6 + snap_floor(x, order, h);
                     for (k, &b) in basis[..=order].iter().enumerate() {
-                        if b < worst {
-                            worst = b;
+                        worst = worst.min(b);
+                        let ratio = -f64::from(b) / allowed;
+                        if ratio > worst_ratio {
+                            worst_ratio = ratio;
                             worst_at = format!(
-                                "order={order} grid={grid_size} range={gr:?} x={x:e} k={k}"
+                                "order={order} grid={grid_size} range={gr:?} x={x:e} k={k}: \
+                                 b={b:e} allowed={allowed:e}"
                             );
                         }
                     }
@@ -236,10 +330,13 @@ fn basis_values_are_never_negative() {
         }
     }
 
-    println!("most negative basis value = {worst:e} at {worst_at}");
+    println!(
+        "most negative basis value = {worst:e}; worst negativity/allowance = \
+         {worst_ratio:.3} at {worst_at}"
+    );
     assert!(
-        worst > -1e-6,
-        "basis went meaningfully negative: {worst:e} at {worst_at}"
+        worst_ratio < 1.0,
+        "basis went negative by more than the f32 knot-snap floor: {worst_at}"
     );
 }
 
@@ -274,93 +371,51 @@ fn find_span_brackets_x_and_stays_in_range() {
 }
 
 #[test]
-fn compute_basis_and_deriv_reproduces_compute_basis() {
-    // Documented contract: `compute_basis_and_deriv` fills `basis_out` with exactly
-    // what `compute_basis` would. Backward relies on it - the weight gradient comes
-    // from these values, not from the ones the forward pass stored.
-    let mut worst = 0.0f32;
-    let mut worst_at = String::new();
-    for order in ORDERS {
-        for grid_size in GRID_SIZES {
-            for gr in RANGES {
-                let knots = compute_knots(grid_size, order, gr);
-                for x in sample_points(gr, &knots, order, grid_size) {
-                    let span = find_span(x, &knots, order, grid_size);
-                    let mut a = [0.0f32; MAX_SPLINE_ORDER + 1];
-                    let mut b = [0.0f32; MAX_SPLINE_ORDER + 1];
-                    let mut d = [0.0f32; MAX_SPLINE_ORDER + 1];
-                    compute_basis(x, span, &knots, order, &mut a[..=order]);
-                    compute_basis_and_deriv(
-                        x,
-                        span,
-                        &knots,
-                        order,
-                        &mut b[..=order],
-                        &mut d[..=order],
-                    );
-                    for k in 0..=order {
-                        let e = (a[k] - b[k]).abs();
-                        if e > worst {
-                            worst = e;
-                            worst_at = format!(
-                                "order={order} grid={grid_size} range={gr:?} x={x:e} k={k}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-    println!("basis from compute_basis_and_deriv: worst delta = {worst:e} at {worst_at}");
-    assert_eq!(worst, 0.0, "basis values diverge at {worst_at}");
-}
-
-#[test]
 fn every_derivative_channel_matches_a_central_difference() {
     // Central difference of the *independent* f64 reference basis, taken strictly
-    // inside a knot interval so the probe never straddles a knot. Relative
-    // tolerance is against `order / h`, the natural scale of a B-spline derivative.
+    // inside a knot interval so the probe never straddles a knot - which is also
+    // what makes this valid at order 1, whose derivative jumps at every knot and
+    // nowhere else. Relative tolerance is against `order / h`, the natural scale of
+    // a B-spline derivative.
     let mut worst = 0.0f64;
     let mut worst_at = String::new();
     let mut cases = 0usize;
 
     for order in ORDERS {
-        for grid_size in GRID_SIZES {
-            for gr in RANGES {
-                let knots = compute_knots(grid_size, order, gr);
-                let knots64: Vec<f64> = knots.iter().map(|&k| f64::from(k)).collect();
-                let h = f64::from(gr.1 - gr.0) / grid_size as f64;
-                let step = h * 1e-3;
+        for (grid_size, gr) in all_grids() {
+            let knots = compute_knots(grid_size, order, gr);
+            let knots64: Vec<f64> = knots.iter().map(|&k| f64::from(k)).collect();
+            let h = f64::from(gr.1 - gr.0) / grid_size as f64;
+            let step = h * 1e-3;
 
-                for x in interior_points(&knots, order, grid_size) {
-                    let span = find_span(x, &knots, order, grid_size);
-                    let mut basis = [0.0f32; MAX_SPLINE_ORDER + 1];
-                    let mut deriv = [0.0f32; MAX_SPLINE_ORDER + 1];
-                    compute_basis_and_deriv(
-                        x,
-                        span,
-                        &knots,
-                        order,
-                        &mut basis[..=order],
-                        &mut deriv[..=order],
-                    );
+            for x in interior_points(&knots, order, grid_size) {
+                let span = find_span(x, &knots, order, grid_size);
+                let mut basis = [0.0f32; MAX_SPLINE_ORDER + 1];
+                let mut deriv = [0.0f32; MAX_SPLINE_ORDER + 1];
+                compute_basis_and_deriv(
+                    x,
+                    span,
+                    &knots,
+                    order,
+                    &mut basis[..=order],
+                    &mut deriv[..=order],
+                );
 
-                    let xf = f64::from(x);
-                    for (k, &got) in deriv[..=order].iter().enumerate() {
-                        let j = (span - order + k) as isize;
-                        let plus = ref_basis(j, order, xf + step, &knots64);
-                        let minus = ref_basis(j, order, xf - step, &knots64);
-                        let want = (plus - minus) / (2.0 * step);
-                        // Scale-free: derivatives live on the 1/h scale.
-                        let err = (want - f64::from(got)).abs() * h / order as f64;
-                        cases += 1;
-                        if err > worst {
-                            worst = err;
-                            worst_at = format!(
-                                "order={order} grid={grid_size} range={gr:?} x={x:e} channel={k}: \
-                                 finite_diff={want} analytic={got}"
-                            );
-                        }
+                let xf = f64::from(x);
+                for (k, &got) in deriv[..=order].iter().enumerate() {
+                    let j = (span - order + k) as isize;
+                    let plus = ref_basis(j, order, xf + step, &knots64);
+                    let minus = ref_basis(j, order, xf - step, &knots64);
+                    let want = (plus - minus) / (2.0 * step);
+                    // Scale-free: derivatives live on the 1/h scale.
+                    let err = (want - f64::from(got)).abs() * h / order as f64;
+                    cases += 1;
+                    if err > worst {
+                        worst = err;
+                        worst_at = format!(
+                            "order={order} grid={grid_size} range={gr:?} x={x:e} channel={k}: \
+                             finite_diff={want} analytic={got}"
+                        );
                     }
                 }
             }
@@ -370,8 +425,11 @@ fn every_derivative_channel_matches_a_central_difference() {
     println!(
         "per-channel derivative: {cases} channels, worst scaled error = {worst:e} at {worst_at}"
     );
+    // Measured worst over the whole sweep, narrow grids and order 1 included, is
+    // 2.1e-7 - the tolerance is not what limits this check, the f64 reference's own
+    // `O(step^2)` truncation is.
     assert!(
-        worst < 1e-4,
+        worst < 1e-5,
         "a derivative channel disagrees with the finite difference of the basis: \
          {worst:e} at {worst_at}"
     );
@@ -386,35 +444,36 @@ fn derivatives_sum_to_zero() {
     let mut worst_at = String::new();
 
     for order in ORDERS {
-        for grid_size in GRID_SIZES {
-            for gr in RANGES {
-                let knots = compute_knots(grid_size, order, gr);
-                let h = (gr.1 - gr.0) / grid_size as f32;
-                for x in sample_points(gr, &knots, order, grid_size) {
-                    let span = find_span(x, &knots, order, grid_size);
-                    let mut basis = [0.0f32; MAX_SPLINE_ORDER + 1];
-                    let mut deriv = [0.0f32; MAX_SPLINE_ORDER + 1];
-                    compute_basis_and_deriv(
-                        x,
-                        span,
-                        &knots,
-                        order,
-                        &mut basis[..=order],
-                        &mut deriv[..=order],
-                    );
-                    let sum: f32 = deriv[..=order].iter().sum();
-                    let scaled = sum.abs() * h / order as f32;
-                    if scaled > worst {
-                        worst = scaled;
-                        worst_at = format!("order={order} grid={grid_size} range={gr:?} x={x:e}");
-                    }
+        for (grid_size, gr) in all_grids() {
+            let knots = compute_knots(grid_size, order, gr);
+            let h = (gr.1 - gr.0) / grid_size as f32;
+            for x in sample_points(gr, &knots, order, grid_size) {
+                let span = find_span(x, &knots, order, grid_size);
+                let mut basis = [0.0f32; MAX_SPLINE_ORDER + 1];
+                let mut deriv = [0.0f32; MAX_SPLINE_ORDER + 1];
+                compute_basis_and_deriv(
+                    x,
+                    span,
+                    &knots,
+                    order,
+                    &mut basis[..=order],
+                    &mut deriv[..=order],
+                );
+                let sum: f32 = deriv[..=order].iter().sum();
+                let scaled = sum.abs() * h / order as f32;
+                if scaled > worst {
+                    worst = scaled;
+                    worst_at = format!("order={order} grid={grid_size} range={gr:?} x={x:e}");
                 }
             }
         }
     }
 
     println!("derivative sum: worst scaled |sum| = {worst:e} at {worst_at}");
-    assert!(worst < 1e-4, "derivatives do not sum to zero at {worst_at}");
+    // Measured worst is 5e-8. It was 1e-4 while order 1 was excluded and the
+    // derivative window could disagree with `find_span` by a whole `1/h`; deriving
+    // the order-0 term from `span` (see `src/spline.rs`) made this exact.
+    assert!(worst < 1e-6, "derivatives do not sum to zero at {worst_at}");
 }
 
 // ===========================================================================
@@ -450,8 +509,9 @@ const NARROW_RANGES: [((f32, f32), usize); 4] = [
 /// Partition of unity on grids narrower than the old absolute guard.
 ///
 /// Regression pin for the collapse described on [`NARROW_RANGES`]: before the fix
-/// this reported `|sum - 1| = 1.0` exactly - the basis was all zeros - on all 24
-/// (range, order) pairs.
+/// this reported `|sum - 1| = 1.0` exactly - the basis was all zeros - on all 28
+/// (range, order) pairs. Re-measured after order 1 joined [`ORDERS`], by putting the
+/// `denom > EPSILON` guard back: still all 28.
 #[test]
 fn partition_of_unity_survives_narrow_grid_ranges() {
     let mut failures = Vec::new();
