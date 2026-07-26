@@ -340,10 +340,17 @@ pub struct BakedLayer {
     /// Per-output-channel requant shift `S[j]`
     /// (so that `requant[j] = (acc * M0[j] + 2^(S[j]-1)) >> S[j]`).
     pub requant_shift: Vec<u32>,
-    /// Per-input fixed-point scale: `A_FIXED[i] = round(2^16 / (s_act_prev * std_i))`.
+    /// Per-input fixed-point scale:
+    /// `A_FIXED[i] = round(2^(16 + norm_shift) / (s_act_prev * std_i))`, in
+    /// `[1, 2^30 - 1]`. Consumed as `(q_in * A_FIXED) >> norm_shift`.
     pub norm_a_fixed: Vec<i32>,
-    /// Per-input fixed-point offset: `B_FIXED[i] = round(-mean_i / std_i * 2^16)`.
+    /// Per-input fixed-point offset: `B_FIXED[i] = round(-mean_i / std_i * 2^16)`,
+    /// i.e. a plain Q15.16 z offset added *after* the `norm_shift` right-shift.
     pub norm_b_fixed: Vec<i32>,
+    /// Right-shift applied to `q_in * A_FIXED` in the inter-layer step. Chosen per
+    /// layer so the largest `A_FIXED` fills the i32 rather than landing on a
+    /// single-digit integer. See `from_network` for the derivation.
+    pub norm_shift: u32,
     /// Quantized grid range lower bound: round(r_min * 2^16).
     pub q_rmin: i32,
     /// Quantized grid range upper bound: round(r_max * 2^16) - 1.
@@ -585,48 +592,72 @@ impl BakedModel {
                 requant_shift.push(shift);
             }
 
-            // Per-input fixed-point normalization constants
-            // For layer 0: the raw inputs are f32 and we normalize in the entry step.
-            //   norm_a_fixed and norm_b_fixed are used only for inter-layer (layers 1+).
-            //   For layer 0, they are unused but we still compute them for consistency.
-            // For layer L > 0: inputs are i32 activations scaled by 1/s_act_prev.
-            //   The i32 value q_out satisfies: z_actual = (q_out/s_act_prev - mean_i) / std_i
-            //   We need q_z = z_actual * 2^16 for span/t extraction.
-            //   q_z = (q_out/s_act_prev - mean_i) / std_i * 2^16
-            //       = q_out * (2^16 / (s_act_prev * std_i)) + (-mean_i/std_i) * 2^16
-            //       = q_out * A_FIXED[i] + B_FIXED[i]
-            // Note: s_act_prev is now ~ACT_TARGET/p999 (much larger than 32767),
-            // so A_FIXED will be smaller (often < 1 in f32, stored as i32 fraction).
-            // To preserve precision, we scale A_FIXED by 2^16 (stored as i32 fraction
-            // of 2^16), and divide by 2^16 in the hot path using i64 arithmetic.
-            // This avoids losing sub-1 precision in A_FIXED for i32 activations.
-            // Encoding: norm_a_fixed[i] = round(2^32 / (s_act_prev * std_i))
-            // Hot path: q_z = (q_in * A_FIXED + B_FIXED_shifted) >> 16
-            // where B_FIXED_shifted = round(-mean_i/std_i * 2^32)
-            // NOTE: we still store the old scale (2^16 / ...) and shift by 0 when
-            // s_act_prev == 1.0 (layer 0, which is unused anyway).
-            // For layers > 0 with wide i32 activations, we use Q16 scaling:
-            //   A_FIXED = round(2^32 / (s_act_prev * std_i))
-            //   B_FIXED = round(-mean_i / std_i * 2^32)
-            //   q_z = (q_in * A_FIXED + B_FIXED) >> 16
-            // This maps i32 activations in range ±ACT_TARGET to q_z in Q15.16.
+            // Per-input fixed-point normalization constants.
+            //
+            // For layer 0 the raw inputs are f32 and `forward` normalizes them in the
+            // entry step, so these are computed but never read. For layer L > 0 the
+            // inputs are i32 activations scaled by 1/s_act_prev, and
+            //   q_z = z * 2^16 = ((q_in/s_act_prev) - mean_i)/std_i * 2^16
+            //       = q_in * a_z[i] + b_z[i],  where
+            //   a_z[i] = 2^16 / (s_act_prev * std_i),  b_z[i] = -mean_i/std_i * 2^16.
+            //
+            // `a_z` is a small fraction — s_act_prev is ~2^28/p99.9, so with std = 1
+            // (every hidden layer) a_z = p99.9 * 2^-12, around 1e-4. The old encoding
+            // stored `round(a_z * 2^16)` and shifted by a hardcoded 16, which put
+            // A_FIXED on the integers 7..9 on ordinary freshly-built nets (4x8x2,
+            // 8x16x4, 16x32x8, 32x64x16 measured 8, 7, 8, 9): THREE bits of mantissa,
+            // a systematic 5.6-7.1% error on the inter-layer z scale, compounding with
+            // depth. Worse, p99.9 < std/32 made A_FIXED round to 0 and collapsed the
+            // next layer's inputs to a constant — verified reachable, see
+            // `test_norm_a_fixed_survives_a_tiny_previous_layer`.
+            //
+            // So the shift is chosen per layer instead of hardcoded: pick the largest
+            // `norm_shift` that keeps every A_FIXED inside i32, which lands the biggest
+            // one just under 2^30 and gives it ~30 bits instead of 3.
+            //
+            // ponytail: ONE shift per layer, sized off the largest a_z, not one per
+            // input. Ceiling: an input whose std is 2^k above the layer's smallest
+            // gets 30-k bits instead of 30. Every hidden layer has std = 1 for all
+            // inputs (KanLayer::new), so k = 0 unless a caller has hand-set
+            // per-input normalization on a hidden layer; even k = 20 still beats the
+            // 3 bits this replaces by a factor of 128.
+            let norm_shift: u32 = {
+                let a_z_max = (0..in_dim)
+                    .map(|i| 65536.0 / (s_act_prev as f64 * layer.std[i].max(EPSILON) as f64))
+                    .fold(0.0f64, f64::max);
+                if a_z_max > 0.0 && a_z_max.is_finite() {
+                    // Target A_FIXED in [2^29, 2^30) for the largest a_z.
+                    (29i32 - a_z_max.log2().floor() as i32).clamp(0, 62) as u32
+                } else {
+                    0
+                }
+            };
+
+            // A_FIXED[i] = round(a_z[i] * 2^norm_shift), clamped to [1, 2^30 - 1].
+            //
+            // The upper clamp bounds the hot-path product (see `forward`). The lower
+            // clamp makes A_FIXED == 0 — the silent-collapse mode — impossible by
+            // construction rather than by luck. It only binds when
+            // a_z < 2^-norm_shift <= 2^-62, i.e. s_act_prev * std > 2^78, i.e.
+            // p99.9(|previous layer output|) < 2^-50 ~ 1e-15. At that point the
+            // previous layer really is numerically zero and A_FIXED = 1 yields
+            // q_z = q_in >> 62 = 0, which is the right answer, not a collapse.
             let norm_a_fixed: Vec<i32> = (0..in_dim)
                 .map(|i| {
                     let std_i = layer.std[i].max(EPSILON) as f64;
-                    let s_prev = s_act_prev as f64;
-                    // Use 2^32 scale for i32 activations; for layer 0 (s_prev=1.0),
-                    // this is unused but we compute it for consistency.
-                    let a = (1u64 << 32) as f64 / (s_prev * std_i);
-                    // Clamp to i32 range (a can be very small for large s_act_prev)
-                    a.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32
+                    let a = 65536.0 / (s_act_prev as f64 * std_i) * (1u64 << norm_shift) as f64;
+                    (a.round() as i64).clamp(1, (1i64 << 30) - 1) as i32
                 })
                 .collect();
 
+            // B_FIXED[i] = round(b_z[i]) — a plain Q15.16 z offset, added AFTER the
+            // shift. Keeping it at Q16 rather than at 2^(16+norm_shift) is what stops
+            // it overflowing now that norm_shift can reach 62; its rounding error is
+            // half a Q16 tick, ~2e-5 of a grid interval at grid_range (-1,1), G = 5.
             let norm_b_fixed: Vec<i32> = (0..in_dim)
                 .map(|i| {
                     let std_i = layer.std[i].max(EPSILON) as f64;
-                    // Match the 2^32 scaling used in norm_a_fixed (then >> 16 in hot path).
-                    let b = -layer.mean[i] as f64 / std_i * (1u64 << 32) as f64;
+                    let b = -layer.mean[i] as f64 / std_i * 65536.0;
                     b.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32
                 })
                 .collect();
@@ -660,6 +691,7 @@ impl BakedModel {
                 requant_shift,
                 norm_a_fixed,
                 norm_b_fixed,
+                norm_shift,
                 q_rmin,
                 q_rmax,
                 h_q16,
@@ -841,17 +873,28 @@ impl BakedModel {
             if l + 1 < self.layers.len() {
                 let next_layer = &self.layers[l + 1];
                 let next_in_dim = next_layer.in_dim;
-                // act_b[i] is now an i32 output scaled by s_act.
-                // A_FIXED[i] = round(2^32 / (s_act_prev * std_i))  (stored in norm_a_fixed)
-                // B_FIXED[i] = round(-mean_i / std_i * 2^32)        (stored in norm_b_fixed)
-                // q_z = (q_in * A_FIXED + B_FIXED) >> 16
-                // This maps i32 activations → Q15.16 z value.
-                // q_in * A_FIXED can be up to 2^28 * 2^31 = 2^59 — fits in i64.
+                // act_b[i] is an i32 output scaled by s_act; map it to a Q15.16 z:
+                //   q_z = ((q_in * A_FIXED[i] + round) >> SH) + B_FIXED[i]
+                // with A_FIXED = round(2^(16+SH) / (s_act_prev * std_i)),
+                //      B_FIXED = round(-mean_i / std_i * 2^16),
+                //      SH      = next_layer.norm_shift.
+                //
+                // Overflow bound. This branch only runs for a HIDDEN layer, so
+                // |act_b[i]| <= ACT_CLAMP = 2^28 (the i32::MAX bound above applies to
+                // the output layer, which never reaches here). from_network clamps
+                // A_FIXED to [1, 2^30 - 1] and SH to [0, 62], so
+                //   |q_in * A_FIXED| < 2^28 * 2^30 = 2^58,
+                //   round = 2^(SH-1) <= 2^61,
+                //   |sum| < 2^58 + 2^61 < 2^62 < i64::MAX.
+                // The final clamp is done in i64 against two i32 bounds, so the `as
+                // i32` cannot truncate even when B_FIXED pushes the sum out of range.
+                let sh = next_layer.norm_shift;
+                let round = if sh > 0 { 1i64 << (sh - 1) } else { 0 };
                 for i in 0..next_in_dim {
                     let a_fixed = next_layer.norm_a_fixed[i] as i64;
                     let b_fixed = next_layer.norm_b_fixed[i] as i64;
-                    let q_z = (((act_b[i] as i64) * a_fixed + b_fixed) >> 16) as i32;
-                    act_a[i] = q_z.clamp(next_layer.q_rmin, next_layer.q_rmax);
+                    let q_z = (((act_b[i] as i64) * a_fixed + round) >> sh) + b_fixed;
+                    act_a[i] = q_z.clamp(next_layer.q_rmin as i64, next_layer.q_rmax as i64) as i32;
                 }
             }
         }
@@ -876,7 +919,7 @@ impl BakedModel {
                 + l.requant_m0.len() * 4     // i32 per-channel M0
                 + l.requant_shift.len() * 4  // u32 per-channel shift
                 + l.norm_a_fixed.len() * 4 * 2  // i32 norm constants
-                + 40 // fixed metadata
+                + 44 // fixed metadata (incl. u32 norm_shift)
             })
             .sum()
     }
@@ -885,14 +928,14 @@ impl BakedModel {
     ///
     /// Bump this whenever the bincode layout changes in a breaking way.
     #[cfg(feature = "serde")]
-    const FORMAT_VERSION: u32 = 1;
+    const FORMAT_VERSION: u32 = 2;
 
     /// Serializes the baked model to a self-describing byte vector.
     ///
     /// Layout:
     /// ```text
     /// [0..12]  magic   — MAGIC_BAKED (b"KAN_BAKED_v1")
-    /// [12..16] version — u32 little-endian format version (currently 1)
+    /// [12..16] version — u32 little-endian format version (currently 2)
     /// [16..]   body    — bincode-encoded BakedModel
     /// ```
     ///
@@ -1303,6 +1346,97 @@ mod tests {
         );
     }
 
+    /// `norm_a_fixed` must carry real mantissa, not 3 bits.
+    ///
+    /// The old encoding was `round(2^32 / (s_act_prev * std_i))` consumed with a
+    /// hardcoded `>> 16`. On these four ordinary freshly-built nets that landed on
+    /// the integers 8, 7, 8, 9 — a systematic 5.6-7.1% error on the inter-layer z
+    /// scale, at every hop. The per-layer shift puts A_FIXED in [2^29, 2^30), so
+    /// its rounding error is at most 0.5/2^29 < 1e-9.
+    #[test]
+    fn test_norm_a_fixed_uses_the_full_i32() {
+        for (in_dim, hidden) in [(4usize, 8usize), (8, 16), (16, 32), (32, 64)] {
+            let out_dim = in_dim / 2;
+            let network = make_network(in_dim, vec![hidden], out_dim, 5, 3, 7);
+            let cal = random_inputs(2000, in_dim, 1234);
+            let baked = BakedModel::from_network(&network, Some(&cal));
+
+            for (li, layer) in baked.layers.iter().enumerate() {
+                for (i, &a) in layer.norm_a_fixed.iter().enumerate() {
+                    assert!(
+                        (1 << 28..1 << 30).contains(&a),
+                        "{in_dim}x{hidden}x{out_dim} layer {li} input {i}: norm_a_fixed = {a} \
+                         (shift {}), want [2^28, 2^30) — the old encoding produced 7..9 here",
+                        layer.norm_shift
+                    );
+                }
+            }
+        }
+    }
+
+    /// `norm_a_fixed == 0` collapsed the next layer's inputs to a constant, silently.
+    ///
+    /// Reachability, since "can that happen?" was open: under the old encoding
+    /// `A_FIXED = round(2^32 / (s_act_prev * std_i)) = round(16 * p99.9 / std_i)`,
+    /// so any layer whose outputs have `p99.9 < std/32` rounds it to 0. Scaling one
+    /// layer's weights by 1e-3 is enough — measured: every `norm_a_fixed` of the
+    /// next layer became 0 and the model returned the SAME pair of values
+    /// (0.12060832, 0.3845482) for every input while f32 varied.
+    ///
+    /// The fix makes 0 unreachable by construction (the shift chases the magnitude,
+    /// and A_FIXED is clamped to >= 1), so this pins behaviour, not just the value.
+    #[test]
+    fn test_norm_a_fixed_survives_a_tiny_previous_layer() {
+        let mut network = make_network(4, vec![8], 2, 5, 3, 7);
+        for w in network.layers[0].weights.iter_mut() {
+            *w *= 0.001;
+        }
+        for b in network.layers[0].bias.iter_mut() {
+            *b *= 0.001;
+        }
+
+        let cal = random_inputs(2000, 4, 1234);
+        let baked = BakedModel::from_network(&network, Some(&cal));
+        for (i, &a) in baked.layers[1].norm_a_fixed.iter().enumerate() {
+            assert!(
+                a > 0,
+                "norm_a_fixed[{i}] = {a}: a zero scale collapses layer 1's inputs to a constant"
+            );
+        }
+
+        let test = random_inputs(64, 4, 42);
+        let mut workspace = network.create_workspace(1);
+        let mut f32_out = vec![0.0f32; 2];
+        let mut baked_out = vec![0.0f32; 2];
+        let mut distinct = std::collections::BTreeSet::new();
+        let mut worst_rel = 0.0f32;
+        for s in 0..64 {
+            let inp = &test[s * 4..(s + 1) * 4];
+            network.forward_single(inp, &mut f32_out, &mut workspace);
+            baked.forward(inp, &mut baked_out);
+            distinct.insert(baked_out[0].to_bits());
+            worst_rel = worst_rel.max((baked_out[0] - f32_out[0]).abs() / f32_out[0].abs());
+        }
+
+        println!(
+            "[tiny prev layer] shift={}, {} distinct baked outputs over 64 inputs, worst rel err \
+             {:.3}%",
+            baked.layers[1].norm_shift,
+            distinct.len(),
+            worst_rel * 100.0
+        );
+        assert!(
+            distinct.len() > 32,
+            "baked output collapsed: only {} distinct values over 64 inputs",
+            distinct.len()
+        );
+        assert!(
+            worst_rel < 0.01,
+            "worst rel err {:.3}% — layer 1 is not tracking f32",
+            worst_rel * 100.0
+        );
+    }
+
     #[test]
     fn test_baked_size_bytes() {
         let network = make_network(4, vec![8], 2, 5, 3, 0);
@@ -1323,7 +1457,11 @@ mod tests {
         // Verify header is present: magic (12) + version (4)
         assert!(bytes.len() >= 16, "serialized output too short");
         assert_eq!(&bytes[..12], b"KAN_BAKED_v1", "magic bytes wrong");
-        assert_eq!(&bytes[12..16], &1u32.to_le_bytes(), "version bytes wrong");
+        assert_eq!(
+            &bytes[12..16],
+            &BakedModel::FORMAT_VERSION.to_le_bytes(),
+            "version bytes wrong"
+        );
 
         let baked2 = BakedModel::from_bytes(&bytes).expect("deserialization failed");
 
