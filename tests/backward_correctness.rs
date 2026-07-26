@@ -12,11 +12,15 @@
 //! 3. **Wide layer tests**: Layers with 1000+ neurons
 //! 4. **Masking tests**: Verify zero grad_output → zero contribution
 
-use arkan::{KanConfig, KanConfigBuilder, KanLayer, KanNetwork, Workspace};
+use arkan::{KanConfigBuilder, KanNetwork, Workspace};
+// Only the `backward_parallel` tests build layers directly.
+#[cfg(feature = "parallel")]
+use arkan::{KanConfig, KanLayer};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 /// Helper: create config for tests
+#[cfg(feature = "parallel")]
 fn test_config(in_dim: usize, out_dim: usize, hidden: &[usize]) -> KanConfig {
     KanConfigBuilder::new()
         .input_dim(in_dim)
@@ -33,6 +37,7 @@ fn test_config(in_dim: usize, out_dim: usize, hidden: &[usize]) -> KanConfig {
 }
 
 /// Helper: create layer and fill with random data
+#[cfg(feature = "parallel")]
 fn setup_layer_test(
     in_dim: usize,
     out_dim: usize,
@@ -82,6 +87,7 @@ fn setup_layer_test(
 // =============================================================================
 
 /// Test that sequential and parallel backward produce identical gradients.
+#[cfg(feature = "parallel")]
 #[test]
 fn test_backward_vs_parallel_parity_small_batch() {
     let batch_size = 16;
@@ -158,6 +164,7 @@ fn test_backward_vs_parallel_parity_small_batch() {
 }
 
 /// Test parity with larger batch (above multithreading threshold).
+#[cfg(feature = "parallel")]
 #[test]
 fn test_backward_vs_parallel_parity_large_batch() {
     let batch_size = 256;
@@ -240,6 +247,7 @@ fn test_backward_vs_parallel_parity_large_batch() {
 // =============================================================================
 
 /// Test backward_parallel with wide hidden layer (1024 neurons).
+#[cfg(feature = "parallel")]
 #[test]
 fn test_backward_parallel_wide_layer_1024() {
     let batch_size = 64;
@@ -319,6 +327,7 @@ fn test_backward_parallel_wide_layer_1024() {
 }
 
 /// Test backward_parallel with very wide input (1024 input neurons).
+#[cfg(feature = "parallel")]
 #[test]
 fn test_backward_parallel_wide_input_1024() {
     let batch_size = 32;
@@ -405,7 +414,9 @@ fn test_backward_parallel_wide_input_1024() {
 // NETWORK-LEVEL TESTS
 // =============================================================================
 
-/// Test that network uses parallel backward when batch >= threshold.
+/// Test that a batch above `multithreading_threshold` trains. With the
+/// `parallel` feature this exercises the parallel branch of
+/// `KanNetwork::backward`; without it, the sequential fallback.
 #[test]
 fn test_network_train_step_uses_parallel() {
     let config = KanConfigBuilder::new()
@@ -488,6 +499,7 @@ fn test_network_train_step_uses_sequential() {
 // =============================================================================
 
 /// Test that zero grad_output produces zero gradients.
+#[cfg(feature = "parallel")]
 #[test]
 fn test_backward_parallel_zero_grad_output() {
     let (layer, _workspace, norm_input, grid_indices, _) = setup_layer_test(8, 4, 32, 33333);
@@ -519,6 +531,7 @@ fn test_backward_parallel_zero_grad_output() {
 }
 
 /// Test backward with masked (sparse) grad_output.
+#[cfg(feature = "parallel")]
 #[test]
 fn test_backward_parallel_sparse_grad_output() {
     let batch_size = 64;
@@ -570,6 +583,7 @@ fn test_backward_parallel_sparse_grad_output() {
 }
 
 /// Test backward with batch_size = 1.
+#[cfg(feature = "parallel")]
 #[test]
 fn test_backward_parallel_batch_size_1() {
     let (layer, mut workspace, norm_input, grid_indices, grad_output) =
@@ -619,6 +633,7 @@ fn test_backward_parallel_batch_size_1() {
 // =============================================================================
 
 /// Test backward_parallel across different spline orders.
+#[cfg(feature = "parallel")]
 #[test]
 fn test_backward_parallel_spline_orders() {
     let orders = [2, 3, 4, 5, 6];
@@ -700,6 +715,7 @@ fn test_backward_parallel_spline_orders() {
 // =============================================================================
 
 /// Test that backward_parallel produces deterministic results.
+#[cfg(feature = "parallel")]
 #[test]
 fn test_backward_parallel_deterministic() {
     let (layer, _, norm_input, grid_indices, grad_output) = setup_layer_test(16, 8, 128, 77777);

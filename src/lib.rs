@@ -83,17 +83,26 @@
 //!
 //! | Flag | Description | Default |
 //! |------|-------------|---------|
-//! | `gpu` | GPU backend via wgpu (Vulkan/DX12/Metal) | Off |
+//! | `parallel` | Rayon multi-core paths (see below) | Off |
 //! | `serde` | Serialization via `serde` + `bincode` | Off |
-//! | `quantization` | Half-precision (f16) support | Off |
-//! | `parallel` | Rayon parallelization | Off |
-//! | `simd` | Explicit SIMD intrinsics | Off |
+//! | `gpu` | GPU backend via wgpu (Vulkan/DX12/Metal) | Off |
+//!
+//! A default build pulls only `wide`, `rand` and `thiserror` — no `rayon`, no
+//! `wgpu`. SIMD is **not** a feature flag: B-spline evaluation is vectorized
+//! unconditionally through the `wide` crate.
+//!
+//! `parallel` adds three things and nothing else:
+//! `KanLayer::backward_parallel`, `KanNetwork::forward_batch_parallel`, and
+//! the automatic parallel branch inside [`KanNetwork::backward`] for batches at
+//! or above [`KanConfig::multithreading_threshold`]. Without it those two
+//! methods do not exist and `backward` is always single-threaded — identical
+//! gradients, just one core.
 //!
 //! Enable features in `Cargo.toml`:
 //!
 //! ```toml
 //! [dependencies]
-//! arkan = { version = "0.1", features = ["gpu"] }
+//! arkan = { version = "0.4", features = ["serde"] }
 //! ```
 //!
 //! ## Modules

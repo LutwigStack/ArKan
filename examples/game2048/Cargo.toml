@@ -5,8 +5,9 @@ edition = "2021"
 publish = false
 
 [dependencies]
-# ArKan from parent
-arkan = { path = "../..", features = ["gpu"] }
+# ArKan from parent. `parallel` is needed for `forward_batch_parallel`
+# (src/train/gpu.rs) — it does not exist without the feature.
+arkan = { path = "../..", features = ["gpu", "parallel"] }
 
 # CLI and progress
 clap = { version = "4.5", features = ["derive"] }

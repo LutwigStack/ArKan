@@ -58,6 +58,13 @@ fn directional_loss(layer: &KanLayer, inputs: &[f32], g_out: &[f32], ws: &mut Wo
     out.iter().zip(g_out).map(|(y, g)| y * g).sum()
 }
 
+/// Backward implementations to probe: both when `parallel` is on, sequential only
+/// otherwise (`backward_parallel` does not exist without the feature).
+#[cfg(feature = "parallel")]
+const PARALLEL_MODES: [bool; 2] = [false, true];
+#[cfg(not(feature = "parallel"))]
+const PARALLEL_MODES: [bool; 1] = [false];
+
 /// Analytic `dL/dx` from the layer's own backward pass, driven exactly the way
 /// `KanNetwork` drives it: forward stores `z` + spans, backward consumes them.
 fn analytic_grad_input(
@@ -80,6 +87,9 @@ fn analytic_grad_input(
     let mut grad_b = vec![0.0f32; layer.bias.len()];
 
     if parallel {
+        // ponytail: `backward_parallel` only exists with the `parallel` feature;
+        // PARALLEL_MODES never yields `true` without it, so this branch is dead.
+        #[cfg(feature = "parallel")]
         layer.backward_parallel(
             &z,
             &spans,
@@ -133,7 +143,7 @@ fn compare(label: &str, layer: &KanLayer, inputs: &[f32], g_out: &[f32]) -> f32 
     let mut worst_at = 0usize;
     let mut failures = Vec::new();
 
-    for parallel in [false, true] {
+    for parallel in PARALLEL_MODES {
         let ana = analytic_grad_input(layer, inputs, g_out, parallel);
         for i in 0..inputs.len() {
             let gap = (ana[i] - fd[i]).abs();
@@ -317,6 +327,7 @@ fn input_layer_saturates_through_std_scaling() {
     compare("input layer, saturated via std", &layer, &inputs, &g_out);
 }
 
+#[cfg(feature = "parallel")]
 #[test]
 fn backward_and_backward_parallel_agree_on_saturated_inputs() {
     let cfg = config(4, 3, 5);

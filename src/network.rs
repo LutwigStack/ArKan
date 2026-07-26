@@ -601,6 +601,10 @@ impl KanNetwork {
 
     /// Parallel forward pass for batch inference.
     ///
+    /// **Requires the `parallel` feature.** Without it use
+    /// [`forward_batch`](Self::forward_batch), which produces identical output
+    /// on a single thread.
+    ///
     /// This method processes samples in parallel using rayon, which is faster
     /// for large batches on multi-core CPUs. Each sample gets its own workspace
     /// allocated via thread-local storage.
@@ -629,6 +633,7 @@ impl KanNetwork {
     ///
     /// network.forward_batch_parallel(&input, &mut output);
     /// ```
+    #[cfg(feature = "parallel")]
     pub fn forward_batch_parallel(&self, input: &[f32], output: &mut [f32]) {
         use rayon::prelude::*;
         use std::cell::RefCell;
@@ -1222,9 +1227,17 @@ impl KanNetwork {
 
             let layer_in_size = checked_buffer_size(batch_size, in_dim)?;
 
-            // Choose between sequential and parallel backward based on batch size
-            if batch_size >= self.config.multithreading_threshold {
+            // Choose between sequential and parallel backward based on batch size.
+            // ponytail: without the `parallel` feature there is only the sequential
+            // path, so `multithreading_threshold` is ignored and every batch size
+            // takes the single-threaded branch. Same gradients (parity is asserted
+            // in tests/backward_correctness.rs), just not multi-core.
+            let use_parallel =
+                cfg!(feature = "parallel") && batch_size >= self.config.multithreading_threshold;
+
+            if use_parallel {
                 // Parallel backward: uses thread-local gradient accumulation
+                #[cfg(feature = "parallel")]
                 layer.backward_parallel(
                     layer_input_buf.as_slice(),
                     &layer_grid_buf,

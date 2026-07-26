@@ -357,6 +357,7 @@ fn test_mse_loss_example() {
 // =============================================================================
 
 /// Tests parallel batch forward.
+#[cfg(feature = "parallel")]
 #[test]
 fn test_parallel_forward() {
     let config = KanConfig::preset();

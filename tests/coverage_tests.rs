@@ -19,6 +19,7 @@ use rand::{Rng, SeedableRng};
 // ============================================================================
 
 /// Test that forward_batch_parallel produces identical results to forward_batch
+#[cfg(feature = "parallel")]
 #[test]
 fn test_forward_batch_parallel_parity() {
     let config = KanConfig {
@@ -70,6 +71,7 @@ fn test_forward_batch_parallel_parity() {
 }
 
 /// Test forward_batch_parallel with various batch sizes
+#[cfg(feature = "parallel")]
 #[test]
 fn test_forward_batch_parallel_various_sizes() {
     let config = KanConfig {

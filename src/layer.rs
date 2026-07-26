@@ -935,6 +935,10 @@ impl KanLayer {
 
     /// Parallel backward pass using thread-local gradient accumulation.
     ///
+    /// **Requires the `parallel` feature.** Without it only the sequential
+    /// [`backward`](Self::backward) exists; the two are numerically equivalent
+    /// (see `tests/backward_correctness.rs`).
+    ///
     /// # Algorithm (Thread-Local Gradients + Reduce)
     ///
     /// 1. **Parallel basis computation**: Each thread computes basis values and
@@ -987,6 +991,7 @@ impl KanLayer {
     ///     &mut grad_bias,
     /// );
     /// ```
+    #[cfg(feature = "parallel")]
     #[allow(clippy::too_many_arguments)]
     pub fn backward_parallel(
         &self,

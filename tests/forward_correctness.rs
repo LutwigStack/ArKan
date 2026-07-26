@@ -245,6 +245,7 @@ fn test_forward_single_vs_batch_parity() {
 }
 
 /// Test that forward_batch and forward_batch_parallel produce identical results
+#[cfg(feature = "parallel")]
 #[test]
 fn test_forward_batch_vs_parallel_parity() {
     let config = KanConfig::builder()
