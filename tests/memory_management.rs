@@ -3,7 +3,7 @@
 //! Tests for GPU memory management: async downloads, large tensors,
 //! alignment requirements, and stress testing.
 //!
-//! Closes dead zones from FUNCTIONALITY_AUDIT.md:
+//! Closes these dead zones:
 //! - Async download correctness
 //! - Large tensor handling (100MB+)
 //! - Alignment requirements

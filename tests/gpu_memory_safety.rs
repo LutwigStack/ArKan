@@ -493,7 +493,7 @@ fn test_f16_not_supported_documented() {
     // This test exists purely for documentation purposes
     // f16 is not supported - this is a known limitation
     println!("ℹ️  f16 (half precision) is NOT supported - f32 only");
-    println!("   This is documented in FUNCTIONALITY_AUDIT.md");
+    println!("   See the GPU limitations section of README.md");
 }
 
 /// Documents that Multi-GPU is NOT supported.

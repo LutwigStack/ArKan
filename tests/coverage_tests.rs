@@ -1,6 +1,6 @@
 //! Additional test coverage for ArKan
 //!
-//! This file addresses missing test coverage identified in FUNCTIONALITY_AUDIT.md:
+//! This file closes gaps the rest of the suite left open:
 //! - forward_batch_parallel parity with forward_batch
 //! - GPU backward correctness (GPU == CPU gradients)
 //! - Multi-layer gradient flow (3+ layers)

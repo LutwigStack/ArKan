@@ -12,9 +12,13 @@
 //!
 //! | Feature | ArKan | PyTorch KAN |
 //! |---------|-------|-------------|
-//! | Single inference | **30 µs** | 990 µs |
+//! | Single inference, `[21,64,64,24]` | **~15 µs** (`forward_single`) | ~1.5 ms (estimated) |
 //! | Memory allocation | Zero (hot path) | Dynamic |
-//! | Dependencies | Minimal | Heavy |
+//! | Dependencies | `wide`, `rand`, `thiserror` | Heavy |
+//!
+//! The PyTorch figure is extrapolated, not measured at this shape, and ArKan
+//! *loses* to PyTorch's BLAS kernels at batch 256+. See `docs/BENCHMARKS.md`
+//! for the full picture, including what this library is bad at.
 //!
 //! ## Quick Start
 //!
@@ -33,7 +37,7 @@
 // This lint may not exist in older clippy versions, so we allow unknown lints
 #![allow(unknown_lints)]
 #![allow(clippy::manual_is_multiple_of)]
-//! // Single inference (~30 µs)
+//! // Single inference (~15 µs on the preset config)
 //! let input = vec![0.5f32; config.input_dim];
 //! let mut output = vec![0.0f32; config.output_dim];
 //! network.forward_single(&input, &mut output, &mut workspace);
@@ -115,14 +119,20 @@
 //! - [`spline`] — SIMD-optimized B-spline basis functions
 //! - [`optimizer`] — [`Adam`] and [`SGD`] optimizers
 //! - [`loss`] — Loss functions with masking support
-//! - [`baked`] — [`BakedModel`]: int8 quantized inference path (per-channel weights, int16 basis)
+//! - [`baked`] — [`BakedModel`]: int8 quantized inference path (per-channel
+//!   weights, int16 basis). Smaller than f32, **not** faster; see
+//!   `docs/BENCHMARKS.md` for the latency and the per-output tail before using it
 //!
 //! ## Performance Tips
 //!
 //! 1. **Reuse [`Workspace`]**: Create once, use for all forward/backward calls
-//! 2. **Use [`KanNetwork::forward_single`]** for real-time play (2x faster than batch=1)
+//! 2. **Use [`KanNetwork::forward_single`]** for real-time play (~1.8x faster than `forward_batch(1)`)
 //! 3. **Batch training**: Group samples for better cache utilization
 //! 4. **Grid size 5, order 3**: Best speed/accuracy tradeoff for most tasks
+//! 5. **Size `grid_range` for the activations, not the inputs**: it is shared by
+//!    every layer, but only layer 0 receives `input_mean`/`input_std`. A range
+//!    picked from the input distribution can saturate ~45% of every hidden layer,
+//!    which zeroes their gradients. See `docs/ARCHITECTURE.md`.
 //!
 //! ## Example: Poker Solver Integration
 //!
@@ -136,7 +146,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
-#![doc(html_root_url = "https://docs.rs/arkan/0.3.0")]
+#![doc(html_root_url = "https://docs.rs/arkan/0.4.0")]
 
 pub mod baked;
 pub mod buffer;

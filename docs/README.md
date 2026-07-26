@@ -4,8 +4,8 @@ Technical documentation for the ArKan KAN (Kolmogorov-Arnold Network) library.
 
 ## Contents
 
-- [**ARCHITECTURE.md**](ARCHITECTURE.md) — System architecture, module structure, and design decisions
-- [**BENCHMARKS.md**](BENCHMARKS.md) — Performance benchmarks, CPU vs GPU comparisons
+- [**ARCHITECTURE.md**](ARCHITECTURE.md) — System architecture, module structure, and design decisions, including the [constraints that will bite you first](ARCHITECTURE.md#design-constraints)
+- [**BENCHMARKS.md**](BENCHMARKS.md) — Performance benchmarks, CPU vs GPU comparisons, and the [baked int8 accuracy and latency numbers](BENCHMARKS.md#baked-int8-inference)
 
 ## Quick Links
 
@@ -15,7 +15,7 @@ Technical documentation for the ArKan KAN (Kolmogorov-Arnold Network) library.
 
 ## GPU Backend
 
-ArKan v0.3.0 includes a GPU backend using wgpu. See [ARCHITECTURE.md](ARCHITECTURE.md#gpu-backend) for details on:
+ArKan includes an optional GPU backend using wgpu, behind `features = ["gpu"]`. See [ARCHITECTURE.md](ARCHITECTURE.md#gpu-backend-srcgpu) for details on:
 
 - Hybrid training (GPU forward/backward + CPU optimizer)
 - Native GPU training with GpuAdam

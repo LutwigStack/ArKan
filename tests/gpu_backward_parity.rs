@@ -1,8 +1,7 @@
 //! GPU Backward Pass Parity and Correctness Tests.
 //!
 //! These tests verify that GPU backward pass produces identical (or nearly identical)
-//! gradients compared to CPU implementation. This addresses the dead zones identified
-//! in FUNCTIONALITY_AUDIT.md:
+//! gradients compared to CPU implementation. It covers:
 //!
 //! - Direct comparison of weight/bias/input gradients GPU vs CPU
 //! - Isolated bias gradient tests
