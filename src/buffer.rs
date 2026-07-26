@@ -1148,6 +1148,15 @@ impl Workspace {
         self.batch_capacity
     }
 
+    /// Batch size of the history recorded by the last training forward pass.
+    ///
+    /// Zero before any `forward_batch_training` / `train_step` call. This is the
+    /// row count that [`crate::KanNetwork::clamped_fraction`] reads.
+    #[inline]
+    pub fn history_batch_size(&self) -> usize {
+        self.history_batch_size
+    }
+
     /// Checks that workspace history matches the expected batch size.
     ///
     /// Returns `Ok(())` if `history_batch_size == batch_size`, otherwise

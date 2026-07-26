@@ -55,6 +55,7 @@ use crate::config::KanConfig;
 use crate::error::{ArkanError, ArkanResult};
 use crate::layer::KanLayer;
 use crate::optimizer::Optimizer;
+use crate::spline::SPAN_CLAMPED_FLAG;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -704,6 +705,66 @@ impl KanNetwork {
     ) {
         self.try_forward_batch_training(input, output, workspace)
             .expect("forward_batch_training failed");
+    }
+
+    /// Fraction of `(sample, feature)` pairs that the last training forward pass
+    /// clamped to `grid_range`, one entry per layer, each in `0.0..=1.0`.
+    ///
+    /// Reads the [`SPAN_CLAMPED_FLAG`] bits that
+    /// [`forward_batch_training`](Self::forward_batch_training) and
+    /// [`train_step`](Self::train_step) already record, so it costs one pass over
+    /// the span indices and no extra forward pass. Returns all zeros if no
+    /// training forward pass has run on `workspace` yet.
+    ///
+    /// # Why you want this
+    ///
+    /// `z = clamp((x - mean) / std, lo, hi)` has `dz/dx == 0` outside the grid, so
+    /// a layer boundary where *every* pair is clamped passes exactly zero gradient
+    /// to everything upstream of it - zero, not small. Nothing bounds a layer's
+    /// output to the next layer's `grid_range`, and hidden layers normalize with a
+    /// fixed mean 0 / std 1 that never adapts, so a run can walk into that state
+    /// from a perfectly healthy start and then sit there: the loss stops moving and
+    /// no learning rate brings it back, because there is no gradient to scale.
+    ///
+    /// A number near 1.0 at any layer is the warning. See
+    /// `tests/training_dynamics.rs` for the full characterization and the one
+    /// escape that works (decoupled weight decay - it moves weights without a
+    /// gradient).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let net = KanNetwork::new(KanConfig::preset());
+    /// let mut ws = net.create_workspace(4);
+    /// let mut out = vec![0.0f32; 4 * 24];
+    /// net.forward_batch_training(&vec![0.5f32; 4 * 21], &mut out, &mut ws);
+    ///
+    /// let clamped = net.clamped_fraction(&ws);
+    /// assert_eq!(clamped.len(), net.layers.len());
+    /// assert!(clamped.iter().all(|f| (0.0..=1.0).contains(f)));
+    /// ```
+    #[must_use]
+    pub fn clamped_fraction(&self, workspace: &Workspace) -> Vec<f32> {
+        let batch = workspace.history_batch_size();
+        self.layers
+            .iter()
+            .enumerate()
+            .map(|(li, layer)| {
+                let count = batch * layer.in_dim;
+                match workspace.layers_grid_indices.get(li) {
+                    Some(spans) if count > 0 && spans.len() >= count => {
+                        let clamped = spans[..count]
+                            .iter()
+                            .filter(|s| *s & SPAN_CLAMPED_FLAG != 0)
+                            .count();
+                        clamped as f32 / count as f32
+                    }
+                    _ => 0.0,
+                }
+            })
+            .collect()
     }
 
     /// Fallible version of [`forward_batch_training`](Self::forward_batch_training).

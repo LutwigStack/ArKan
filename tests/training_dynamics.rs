@@ -26,6 +26,29 @@
 //!    into a constant function for the rest of the run. Lowering the learning rate
 //!    afterwards cannot recover it, because there is no gradient left to follow.
 //!
+//! 3. **There is exactly one way out, and it is not the learning rate.** Decoupled
+//!    weight decay applies `w *= 1 - lr * decay` whether or not there is a
+//!    gradient, so it is the only knob that can move a parameter whose gradient is
+//!    zero. Shrinking the weights shrinks the activations back inside the grid and
+//!    the boundary un-clamps. Measured on the collapsed `[2, 16, 16, 1]` network
+//!    below (mean-predictor baseline 0.2572), 200 epochs at `lr = 1e-3`:
+//!
+//!    | `AdamConfig::weight_decay` | test MSE | saturation per layer |
+//!    |---|---|---|
+//!    | 0.0  | 0.257128 | `[0%, 90.9%, 100%]` |
+//!    | 0.01 | 0.257128 | `[0%, 90.5%, 100%]` |
+//!    | 0.1  | 0.257128 | `[0%, 80.6%, 100%]` |
+//!    | 0.5  | 0.000026 | `[0%, 0%, 29.7%]`   |
+//!
+//!    It is `lr * decay * steps` that has to be large enough to shrink the weights
+//!    by ~10x, not `decay` crossing some threshold. Note this must go on the
+//!    *optimizer* config: `TrainOptions::weight_decay` is documented as ignored by
+//!    `train_step_with_optimizer`, and passing it there does nothing at all.
+//!
+//! [`KanNetwork::clamped_fraction`] reports the saturation per layer from the
+//! spans a training forward pass already recorded - that is how you see this
+//! coming in your own run, instead of watching a loss mysteriously stop moving.
+//!
 //! `tests/hidden_layer_saturation.rs` pins the *initialization-time* version of
 //! trap 2 (a badly chosen `grid_range` starves hidden layers from step 0). This
 //! file pins the version that arrives *during* training from a config that looked
@@ -176,7 +199,21 @@ fn saturation_percent(net: &KanNetwork, x: &[f32], in_dim: usize, out_dim: usize
 
 /// Fixed-order minibatch training with Adam. Deterministic.
 fn train_adam(net: &mut KanNetwork, d: &Data, lr: f32, epochs: usize, batch: usize) {
-    let mut adam = Adam::new(net, AdamConfig::with_lr(lr));
+    train_adam_decayed(net, d, lr, 0.0, epochs, batch);
+}
+
+/// As [`train_adam`], with decoupled weight decay on the *optimizer* config.
+/// `TrainOptions::weight_decay` is ignored by `train_step_with_optimizer`, so it
+/// has to go here to have any effect at all.
+fn train_adam_decayed(
+    net: &mut KanNetwork,
+    d: &Data,
+    lr: f32,
+    decay: f32,
+    epochs: usize,
+    batch: usize,
+) {
+    let mut adam = Adam::new(net, AdamConfig::with_decay(lr, decay));
     let mut ws = net.create_workspace(batch);
     let opts = TrainOptions {
         max_grad_norm: None,
@@ -327,6 +364,102 @@ fn a_saturated_layer_boundary_is_not_recoverable_by_training() {
     assert!(
         spread < 1e-6,
         "saturated network should output a constant, got spread {spread:.3e}"
+    );
+}
+
+/// The collapse must be *visible*, not just survivable. `clamped_fraction` is the
+/// library's own report of the saturation, read off the spans a training forward
+/// pass already recorded, and it is the difference between "my loss stopped
+/// moving" and "layer 1's input is 100% clamped".
+#[test]
+fn clamped_fraction_reports_the_dead_boundary() {
+    let mut net = KanNetwork::new(config(2, 1, vec![16, 16], (-1.5, 1.5)));
+
+    let d = sincos(64, 1);
+    let mut ws = net.create_workspace(d.n());
+    let mut out = vec![0.0f32; d.n()];
+
+    // Healthy: nothing clamped anywhere.
+    net.forward_batch_training(&d.x, &mut out, &mut ws);
+    let healthy = net.clamped_fraction(&ws);
+    assert_eq!(healthy.len(), net.layers.len());
+    assert!(
+        healthy.iter().all(|f| *f < 0.01),
+        "a fresh network on in-range data should barely clamp, got {healthy:?}"
+    );
+
+    // Same forced saturation as the two tests above.
+    for w in net.layers[0].weights.iter_mut() {
+        *w = 100.0;
+    }
+    net.forward_batch_training(&d.x, &mut out, &mut ws);
+    let dead = net.clamped_fraction(&ws);
+    println!("clamped_fraction healthy={healthy:?} dead={dead:?}");
+    assert_eq!(
+        dead[1], 1.0,
+        "layer 1's boundary is fully clamped, so clamped_fraction must say 1.0, got {dead:?}"
+    );
+
+    // And it agrees with reading the flag by hand, which is what every caller had
+    // to do before this method existed.
+    let by_hand = saturation_percent(&net, &d.x, 2, 1);
+    for (i, (a, b)) in dead.iter().zip(&by_hand).enumerate() {
+        assert!(
+            (a * 100.0 - b).abs() < 1e-3,
+            "layer {i}: clamped_fraction {a} disagrees with the hand-rolled {b}%"
+        );
+    }
+}
+
+/// The one escape from the absorbing state, and the reason it is the only one:
+/// decoupled weight decay moves a parameter *without* consulting its gradient.
+///
+/// This is the test that fails if `Adam`'s decay stops being decoupled (i.e. if it
+/// ever becomes an L2 term folded into the gradient, which is exactly zero here).
+#[test]
+fn decoupled_weight_decay_escapes_the_absorbing_state() {
+    let train = sincos(512, 0x0BAD_F00D);
+    let test = sincos(256, 0x5EED_1234);
+    let baseline = mean_baseline(&train, &test);
+
+    // 3.0 in every coefficient makes layer 0 emit `bias + 2 * 3.0`, so layer 1's
+    // input is 100% clamped - the same dead boundary as the two tests above, at a
+    // magnitude a realistic decay budget can actually walk back. Recovery needs
+    // `lr * decay * steps` big enough to shrink the weights by ~4x; at 100.0 it
+    // needs ~130x and the test would only be measuring how patient it is.
+    let mut collapsed = KanNetwork::new(config(2, 1, vec![12, 12], (-1.5, 1.5)));
+    for w in collapsed.layers[0].weights.iter_mut() {
+        *w = 3.0;
+    }
+
+    // No decay: frozen, exactly as `a_saturated_layer_boundary_is_not_recoverable`
+    // shows at a range of learning rates.
+    let mut stuck = collapsed.clone();
+    train_adam_decayed(&mut stuck, &train, 0.01, 0.0, 60, 64);
+    let stuck_mse = mse(&stuck, &test);
+
+    // With decay: the weights shrink whether or not there is a gradient, the
+    // activations come back inside the grid, and learning resumes.
+    let mut rescued = collapsed.clone();
+    train_adam_decayed(&mut rescued, &train, 0.01, 1.0, 60, 64);
+    let rescued_mse = mse(&rescued, &test);
+
+    println!(
+        "baseline {baseline:.6} | no decay {stuck_mse:.6} sat {:?} | decay 1.0 {rescued_mse:.6} sat {:?}",
+        saturation_percent(&stuck, &train.x[..256 * 2], 2, 1),
+        saturation_percent(&rescued, &train.x[..256 * 2], 2, 1)
+    );
+
+    assert!(
+        stuck_mse > 0.9 * baseline,
+        "without decay the collapsed net must stay at the mean predictor, got {stuck_mse:.6}"
+    );
+    assert!(
+        rescued_mse < 0.5 * baseline,
+        "decoupled weight decay should pull the network back out of the clamp: \
+         got {rescued_mse:.6} vs baseline {baseline:.6}. If this fails, Adam's \
+         weight_decay is no longer decoupled - it cannot be an L2 term added to \
+         the gradient, because the gradient here is exactly zero."
     );
 }
 

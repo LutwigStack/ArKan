@@ -441,12 +441,65 @@ A saturated input has zero derivative, so those features emit a constant and —
 correctly, since the clamp/gradient fix — a zero gradient. They stop learning.
 Prefer a symmetric range sized for the *activations*.
 
-### Saturation is silent
+### The clamp is an absorbing state, and training can walk into it
 
-There is no `out_of_grid_fraction`, no drift warning, no configurable
-extrapolation and no grid recalibration. `SPAN_CLAMPED_FLAG` records saturation
-per element for the backward pass, but nothing surfaces it to the caller.
-Distribution drift shows up as unexplained accuracy loss, not as a diagnostic.
+The table above is the *initialization-time* version: a bad `grid_range` starves
+hidden layers from step 0. The worse version arrives during training from a
+config that looked fine at step 0.
+
+Saturation is not static. Weights grow, activations grow with them, and nothing
+bounds a layer's output to the next layer's `grid_range`. Once **every**
+`(sample, feature)` pair at a boundary is clamped, `grad_input` upstream of it is
+exactly zero — not small — so every layer before it is frozen. Only the output
+layer can still move, and all it can learn is a constant.
+
+Measured on `[2, 16, 16, 1]`, grid 8, order 3, `grid_range = (-1.5, 1.5)`, Adam
+`lr = 0.1`, batch 64, `sin(pi a) cos(pi b)` (`tests/training_dynamics.rs`):
+
+| epoch | test MSE | saturation per layer |
+|---|---|---|
+| 25 | 0.0139 | `[0%, 26%, 96%]` — healthy, still learning |
+| 35 | 0.2800 | `[0%, 86%, 100%]` — boundary fully clamped |
+| 40+ | 0.2616 frozen | `[0%, 86%, 100%]` — every prediction identical |
+
+Three things that do **not** help, all measured:
+
+- **Lowering the learning rate.** 400 epochs at 1e-3 / 1e-4 / 1e-2 from the dead
+  state give 0.2548 / 0.2548 / 0.2634; the mean-predictor baseline is 0.2548.
+  There is no gradient to scale.
+- **Widening `grid_range`.** `[2, 16×6, 1]` at Adam `lr = 0.01` with `(-6, 6)`
+  never learned at all — 0.2575 at epoch 0, 0.2504 at epoch 119.
+- **Gradient clipping.** Every run in the 216-run frequency grid used
+  `max_grad_norm = 1.0`; 18.5% still ended dead.
+
+Adam is the risky optimizer here, not the safe one: its normalized step drives
+activations out of range regardless of gradient magnitude. Same net and task,
+200 epochs, as a ratio against the mean baseline / peak saturation — Adam 0.01 →
+7512× / 61%, Adam 0.07 → 138× / 95%, Adam 0.1 → 0.9× / 100%; SGD 0.1 → 5917× /
+0%, SGD 0.5 → 2.5× / 28%, SGD 2.0 → 0.0× / 100%. SGD degrades gracefully, Adam
+falls off a cliff. Depth sharpens it: 1 hidden layer never died in 54 runs, 4
+hidden layers died at Adam 0.03, an entirely ordinary learning rate.
+
+**The one thing that does work** is decoupled weight decay
+(`AdamConfig::weight_decay`, applied as `w *= 1 - lr * decay` *before* the
+gradient update). It is the only knob that moves a parameter whose gradient is
+zero. What matters is `lr * decay * steps` being large enough to shrink the
+weights back inside the grid, not `decay` crossing a threshold. On the collapsed
+network above, 200 epochs at `lr = 1e-3`: `decay = 0.1` leaves it at 0.2571 and
+100% saturated, `decay = 0.5` reaches 0.000026 and 29.7%. Note this has to go on
+the optimizer config — `TrainOptions::weight_decay` is ignored by
+`train_step_with_optimizer` by design, to avoid double-counting.
+
+### Saturation is reported, but only if you ask
+
+[`KanNetwork::clamped_fraction`] returns the clamped fraction per layer from the
+`SPAN_CLAMPED_FLAG` bits a training forward pass already records, so watching for
+the collapse above costs one pass over the span indices and no extra forward.
+
+Nothing calls it for you. There is still no drift warning, no configurable
+extrapolation and no grid recalibration, and `forward_batch` (the inference path)
+does not record the flag at all — so distribution drift *in deployment* still
+shows up as unexplained accuracy loss rather than as a diagnostic.
 
 ### `BakedModel` accuracy still has a per-output tail
 
