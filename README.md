@@ -52,6 +52,11 @@ x[l+1, j] = Σᵢ φ[l,j,i](x[l, i])      где i = 1..N_in
 
 ## **Cargo features**
 
+> **Установка.** `arkan` пока **не опубликован** на crates.io — `cargo add arkan` вернёт
+> `could not be found in registry index`. До публикации подключайте через git:
+> `arkan = { git = "https://github.com/LutwigStack/ArKan" }`.
+> Версии в примерах ниже — то, чем станет ближайший релиз.
+
 ```toml
 [dependencies]
 arkan = "0.4"                                    # только wide + rand + thiserror
@@ -448,6 +453,11 @@ Equation for a specific weight in ArKan:
 * **GPU Acceleration (wgpu):** Optional GPU backend with WGSL compute shaders for parallel forward/backward passes.
 
 ## **Cargo features**
+
+> **Installation.** `arkan` is **not published** on crates.io yet — `cargo add arkan`
+> returns `could not be found in registry index`. Until it is, depend on it via git:
+> `arkan = { git = "https://github.com/LutwigStack/ArKan" }`.
+> The versions in the snippets below are what the next release will be.
 
 ```toml
 [dependencies]
