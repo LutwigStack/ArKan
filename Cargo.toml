@@ -2,6 +2,16 @@
 name = "arkan"
 version = "0.4.0"
 edition = "2021"
+# Determined empirically, not guessed: 1.72 fails on our own `div_ceil`
+# (`int_roundings`, stable since 1.73) at src/config.rs:287; 1.73 builds the lib
+# with default features and with `serde`. Optional features need more, because
+# their dependencies do: `parallel` needs 1.80 (rayon-core), `gpu` needs 1.85
+# (indexmap, via wgpu 23 -> naga). CI pins the default-feature MSRV; see
+# .github/workflows/ci.yml and the MSRV table in README.md.
+# ponytail: no Cargo.lock is committed (it is in .gitignore), so CI always
+# resolves the newest compatible dependencies and this floor drifts upward on
+# its own. The `msrv` job is what tells us it moved; the fix is to bump this line.
+rust-version = "1.73"
 description = "Embeddable Kolmogorov-Arnold Networks: SIMD B-spline inference, int8 quantized deployment, optional wgpu GPU backend"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/LutwigStack/ArKan"

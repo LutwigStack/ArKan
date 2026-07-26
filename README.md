@@ -70,6 +70,22 @@ SIMD — **не** флаг: векторизация B-сплайнов чере
 однопоточный: градиенты те же (паритет проверяется в
 `tests/backward_correctness.rs`), просто одно ядро.
 
+### Минимальная версия Rust (MSRV)
+
+`rust-version` в `Cargo.toml` — **1.73**. Это сборка по умолчанию и с `serde`;
+именно её пинует CI. Опциональные фичи требуют больше — не из-за нашего кода,
+а из-за их зависимостей:
+
+| Сборка | MSRV | Чем задан |
+|---|---|---|
+| по умолчанию, `serde` | **1.73** | наш `div_ceil` (`int_roundings`, стабилен с 1.73) |
+| `parallel` | **1.80** | `rayon-core` |
+| `gpu` | **1.85** | `indexmap` (через `wgpu` 23 → `naga`) |
+
+Числа получены прогоном тулчейнов, а не на глаз: 1.72 падает, 1.73 собирается.
+`Cargo.lock` не коммитится, поэтому нижняя граница ползёт вверх сама собой
+вместе с релизами зависимостей; за этим следит джоба `msrv` в CI.
+
 ## **Baked (int8) Inference**
 
 `BakedModel` is a quantized, fixed-point inference-only representation of a trained
@@ -377,6 +393,23 @@ SIMD is **not** a feature flag: B-spline vectorization via `wide` is always on.
 Without `parallel` the `*_parallel` methods do not exist and the backward pass is
 always single-threaded — identical gradients (parity asserted in
 `tests/backward_correctness.rs`), just one core.
+
+### Minimum Supported Rust Version (MSRV)
+
+`rust-version` in `Cargo.toml` is **1.73** — the default build and the `serde`
+build, and the toolchain CI pins. The optional features need more, not because of
+our code but because of theirs:
+
+| Build | MSRV | Set by |
+|---|---|---|
+| default, `serde` | **1.73** | our own `div_ceil` (`int_roundings`, stable since 1.73) |
+| `parallel` | **1.80** | `rayon-core` |
+| `gpu` | **1.85** | `indexmap`, via `wgpu` 23 → `naga` |
+
+These were measured by running the toolchains, not guessed: 1.72 fails, 1.73
+builds. No `Cargo.lock` is committed, so dependency resolution always picks the
+newest compatible versions and this floor drifts upward on its own as they
+release. The `msrv` CI job is what tells us when it moved.
 
 ## **GPU Backend (Optional)**
 
