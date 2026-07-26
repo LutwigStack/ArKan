@@ -13,7 +13,7 @@
 //! - Inter-layer activations: i32 with target range ~2^28 (wider than i16 to reduce
 //!   inter-layer error amplification)
 //! - Activation calibration: 99.9th-percentile clip to stop outliers wasting range
-//! - Requant: per-output-channel M0[j]/shift[j] derived from s_act/(s_w[j]·32768)
+//! - Requant: per-output-channel `M0[j]`/`shift[j]` derived from `s_act/(s_w[j]·32768)`
 //! - No f32 between entry normalization and final dequantization
 //!
 //! # Accuracy (post per-channel quantization, WS02)
@@ -327,20 +327,20 @@ fn extract_span_t(q_z: i32, q_rmin: i32, h_q16: i32, grid_size: usize) -> (usize
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct BakedLayer {
     /// Quantized weights in i8. Layout: [out_dim, in_dim, global_basis_size].
-    /// Each output channel j uses its own scale s_w[j] = 127/max|w[j,*,*]|.
+    /// Each output channel `j` uses its own scale `s_w[j] = 127/max|w[j,*,*]|`.
     pub weights_i8: Vec<i8>,
     /// Folded quantized bias per output channel j:
-    /// q_bias[j] = round(b_j * s_w[j] * 32768) as i64.
+    /// `q_bias[j] = round(b_j * s_w[j] * 32768) as i64`.
     pub q_bias: Vec<i64>,
-    /// Per-output-channel requant multiplier M0[j]
-    /// (from M_real[j] = s_act / (s_w[j] * 32768)).
+    /// Per-output-channel requant multiplier `M0[j]`
+    /// (from `M_real[j] = s_act / (s_w[j] * 32768)`).
     pub requant_m0: Vec<i32>,
-    /// Per-output-channel requant shift S[j]
-    /// (so that requant[j] = (acc * M0[j] + 2^(S[j]-1)) >> S[j]).
+    /// Per-output-channel requant shift `S[j]`
+    /// (so that `requant[j] = (acc * M0[j] + 2^(S[j]-1)) >> S[j]`).
     pub requant_shift: Vec<u32>,
-    /// Per-input fixed-point scale: A_FIXED[i] = round(2^16 / (s_act_prev * std_i)).
+    /// Per-input fixed-point scale: `A_FIXED[i] = round(2^16 / (s_act_prev * std_i))`.
     pub norm_a_fixed: Vec<i32>,
-    /// Per-input fixed-point offset: B_FIXED[i] = round(-mean_i / std_i * 2^16).
+    /// Per-input fixed-point offset: `B_FIXED[i] = round(-mean_i / std_i * 2^16)`.
     pub norm_b_fixed: Vec<i32>,
     /// Quantized grid range lower bound: round(r_min * 2^16).
     pub q_rmin: i32,
@@ -407,7 +407,7 @@ impl BakedModel {
     /// only has fixed-point basis polynomials for those orders, even though
     /// [`KanConfig::validate`](crate::KanConfig::validate) accepts
     /// `1..=MAX_SPLINE_ORDER` (7) for the f32 CPU path. Use
-    /// [`KanNetwork::forward`](crate::KanNetwork::forward) for other orders.
+    /// [`KanNetwork::forward_single`](crate::KanNetwork::forward_single) for other orders.
     pub fn from_network(network: &KanNetwork, calibration: Option<&[f32]>) -> Self {
         let config = network.config.clone();
         let uncalibrated = calibration.is_none();

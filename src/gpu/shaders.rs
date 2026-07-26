@@ -10,12 +10,12 @@
 
 /// Forward pass shader for KAN layer (cubic B-spline, order=3).
 ///
-/// Computes: y[j] = Σᵢ Σₖ weights[j,i,k] · B_k(x[i]) + bias[j]
+/// Computes: `y[j] = Σᵢ Σₖ weights[j,i,k] · B_k(x[i]) + bias[j]`
 ///
 /// # Bind Groups
 ///
 /// - Group 0 (Static):
-///   - Binding 0: weights (storage, read) - array<vec4<f32>>, layout [out_dim, in_dim, basis_vec4s]
+///   - Binding 0: weights (storage, read) - `array<vec4<f32>>`, layout `[out_dim, in_dim, basis_vec4s]`
 ///   - Binding 1: bias (storage, read) - `(out_dim,)`
 ///   - Binding 2: config (uniform) - LayerUniforms
 ///
@@ -32,7 +32,7 @@
 /// Weights are stored as `array<vec4<f32>>` where basis_vec4s = ceil(basis_padded / 4).
 /// Each vec4 contains 4 consecutive basis weights. Access pattern:
 /// - vec4_idx = basis_idx / 4
-/// - component = basis_idx % 4 (use indexing: v[0], v[1], v[2], v[3])
+/// - component = basis_idx % 4 (use indexing: `v[0]`, `v[1]`, `v[2]`, `v[3]`)
 ///
 /// # Bounds Safety
 ///
@@ -416,12 +416,12 @@ fn add_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 ///
 /// **Strategy: Per-weight-element parallelism with batch reduction**
 ///
-/// Each thread handles ONE weight element grad_weights[j,i,k] and reduces
+/// Each thread handles ONE weight element `grad_weights[j,i,k]` and reduces
 /// across all batch samples. No race conditions since each weight is updated
 /// by exactly one thread.
 ///
 /// Computes:
-/// - grad_weights[j,i,k] = Σ_batch grad_output[b,j] * basis_values[b,i,k]
+/// - `grad_weights[j,i,k] = Σ_batch grad_output[b,j] * basis_values[b,i,k]`
 ///
 /// # Bind Groups
 ///
@@ -434,9 +434,9 @@ fn add_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 ///   - Binding 1: span_indices (storage, read) - span indices [batch, in_dim]
 ///   - Binding 2: grad_output (storage, read) - [batch, out_dim]
 ///   - Binding 3: grad_weights (storage, read_write) - [out_dim, in_dim, basis_padded]
-///   - Binding 4: grad_bias (storage, read_write) - [out_dim] (unused here, see bias shader)
+///   - Binding 4: grad_bias (storage, read_write) - `[out_dim]` (unused here, see bias shader)
 ///   - Binding 5: grad_input (storage, read_write) - [batch, in_dim] (unused here, see input_grad shader)
-///   - Binding 6: std_inv (storage, read) - 1/std for each input dim [in_dim]
+///   - Binding 6: std_inv (storage, read) - 1/std for each input dim `[in_dim]`
 ///
 /// # Workgroup
 ///
@@ -583,11 +583,11 @@ fn backward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 ///
 /// **Strategy: Per-input-element parallelism with output reduction**
 ///
-/// Each thread handles ONE input element grad_input[b,i] and reduces
+/// Each thread handles ONE input element `grad_input[b,i]` and reduces
 /// across all output dimensions j.
 ///
 /// Computes:
-/// - grad_input[b,i] = Σ_j Σ_k grad_output[b,j] * weights[j,i,k] * basis_deriv[k] * scale
+/// - `grad_input[b,i] = Σ_j Σ_k grad_output[b,j] * weights[j,i,k] * basis_deriv[k] * scale`
 ///
 /// # Bind Groups (same as BACKWARD_WEIGHTS_SHADER)
 ///
@@ -749,7 +749,7 @@ fn backward_input_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
 /// Bias gradient reduction shader.
 ///
-/// Computes: grad_bias[j] = Σ_batch grad_output[batch, j]
+/// Computes: `grad_bias[j] = Σ_batch grad_output[batch, j]`
 ///
 /// This is separated to avoid atomic contention in the main backward pass.
 ///
@@ -954,12 +954,12 @@ fn forward_training_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 /// Updates weights using Adam algorithm with bias correction.
 ///
 /// Computes for each parameter i:
-/// - m[i] = beta1 * m[i] + (1 - beta1) * grad[i]
-/// - v[i] = beta2 * v[i] + (1 - beta2) * grad[i]^2
-/// - m_hat = m[i] / (1 - beta1^t)
-/// - v_hat = v[i] / (1 - beta2^t)
-/// - param[i] -= lr * m_hat / (sqrt(v_hat) + epsilon)
-/// - param[i] -= weight_decay * param[i]  (decoupled weight decay)
+/// - `m[i] = beta1 * m[i] + (1 - beta1) * grad[i]`
+/// - `v[i] = beta2 * v[i] + (1 - beta2) * grad[i]^2`
+/// - `m_hat = m[i] / (1 - beta1^t)`
+/// - `v_hat = v[i] / (1 - beta2^t)`
+/// - `param[i] -= lr * m_hat / (sqrt(v_hat) + epsilon)`
+/// - `param[i] -= weight_decay * param[i]`  (decoupled weight decay)
 ///
 /// # Bind Groups
 ///
@@ -1041,9 +1041,9 @@ fn adam_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 /// SGD optimizer compute shader with momentum.
 ///
 /// Computes:
-/// - velocity[i] = momentum * velocity[i] + grad[i]
-/// - param[i] -= lr * velocity[i]
-/// - param[i] -= weight_decay * param[i]  (decoupled weight decay)
+/// - `velocity[i] = momentum * velocity[i] + grad[i]`
+/// - `param[i] -= lr * velocity[i]`
+/// - `param[i] -= weight_decay * param[i]`  (decoupled weight decay)
 ///
 /// # Bounds Safety
 ///

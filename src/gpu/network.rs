@@ -1934,7 +1934,7 @@ impl GpuNetwork {
 
     /// Performs a training step entirely on GPU using SGD optimizer.
     ///
-    /// Same as [`train_step_gpu_native`] but uses SGD instead of Adam.
+    /// Same as [`train_step_gpu_native`](Self::train_step_gpu_native) but uses SGD instead of Adam.
     pub fn train_step_gpu_native_sgd(
         &mut self,
         input: &[f32],
@@ -1972,7 +1972,7 @@ impl GpuNetwork {
 
     /// Performs a complete training step on GPU with full options.
     ///
-    /// Extended version of [`train_step_gpu_native`] that supports:
+    /// Extended version of [`train_step_gpu_native`](Self::train_step_gpu_native) that supports:
     /// - Optional mask for ignoring certain outputs (padding, etc.)
     /// - Gradient clipping via `max_grad_norm`
     /// - Weight decay (already supported in optimizer config)
@@ -1990,7 +1990,7 @@ impl GpuNetwork {
     /// # Note
     ///
     /// Gradient clipping requires downloading gradients to CPU for norm calculation.
-    /// If performance is critical and you don't need clipping, use [`train_step_gpu_native`].
+    /// If performance is critical and you don't need clipping, use [`train_step_gpu_native`](Self::train_step_gpu_native).
     #[allow(clippy::too_many_arguments)]
     pub fn train_step_gpu_native_with_options(
         &mut self,

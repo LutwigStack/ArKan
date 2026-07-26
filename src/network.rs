@@ -1014,7 +1014,7 @@ impl KanNetwork {
     ///
     /// MSE loss only. For binary-cross-entropy loss use the manual path
     /// (forward + backward + `optimizer.step`) or the GPU
-    /// [`GpuNetwork::train_step_cross_entropy`].
+    /// `GpuNetwork::train_step_cross_entropy` (requires the `gpu` feature).
     ///
     /// # Weight decay
     ///

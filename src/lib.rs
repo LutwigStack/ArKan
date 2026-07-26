@@ -193,8 +193,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Magic bytes for baked/quantized models.
 ///
-/// Prepended by [`baked::BakedModel::to_bytes`] to identify the file type.
-/// Checked by [`baked::BakedModel::from_bytes`] before any deserialization.
+/// Prepended by `BakedModel::to_bytes` to identify the file type, and checked
+/// by `BakedModel::from_bytes` before any deserialization. Both methods require
+/// the `serde` feature, so these are plain names rather than links — an intra-doc
+/// link would break `cargo doc` on the default build.
 pub const MAGIC_BAKED: &[u8; 12] = b"KAN_BAKED_v1";
 
 #[cfg(test)]

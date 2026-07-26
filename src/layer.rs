@@ -194,8 +194,8 @@ impl KanLayer {
     ///
     /// # Errors
     ///
-    /// Returns [`ArkanError::Config`] if dimensions are zero.
-    /// Returns [`ArkanError::Overflow`] if weight count overflows.
+    /// Returns [`ArkanError::Config`](crate::ArkanError::Config) if dimensions are zero.
+    /// Returns [`ArkanError::Overflow`](crate::ArkanError::Overflow) if weight count overflows.
     ///
     /// # Example
     ///
@@ -541,7 +541,7 @@ impl KanLayer {
     ///
     /// # Errors
     ///
-    /// Returns [`ArkanError::ShapeMismatch`] if buffer sizes don't match expected dimensions.
+    /// Returns [`ArkanError::ShapeMismatch`](crate::ArkanError::ShapeMismatch) if buffer sizes don't match expected dimensions.
     #[inline]
     pub fn try_forward_single(
         &self,
@@ -575,7 +575,7 @@ impl KanLayer {
     ///
     /// # Errors
     ///
-    /// Returns [`ArkanError::ShapeMismatch`] if input/output sizes don't match expected dimensions.
+    /// Returns [`ArkanError::ShapeMismatch`](crate::ArkanError::ShapeMismatch) if input/output sizes don't match expected dimensions.
     #[inline]
     pub fn try_forward_batch(
         &self,
