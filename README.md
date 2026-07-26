@@ -52,11 +52,7 @@ x[l+1, j] = Σᵢ φ[l,j,i](x[l, i])      где i = 1..N_in
 
 ## **Cargo features**
 
-> **Установка.** Все ранее опубликованные версии (0.1.0-0.3.0) **отозваны** (yanked):
-> они молча считают неверные градиенты при насыщении сетки, а `BakedModel::forward()`
-> в них паникует — подробности в CHANGELOG. Не используйте их.
->
-> `cargo add arkan` сейчас вернёт
+> **Установка.** Крейт пока не опубликован на crates.io — `cargo add arkan` вернёт
 > `could not be found in registry index`. До публикации подключайте через git:
 > `arkan = { git = "https://github.com/LutwigStack/ArKan" }`.
 > Версии в примерах ниже — то, чем станет ближайший релиз.
@@ -458,11 +454,7 @@ Equation for a specific weight in ArKan:
 
 ## **Cargo features**
 
-> **Installation.** Every previously published version (0.1.0-0.3.0) is **yanked**:
-> they compute silently wrong gradients wherever the grid clamp binds, and
-> `BakedModel::forward()` panics — see the CHANGELOG. Do not use them.
->
-> `cargo add arkan` currently
+> **Installation.** Not published on crates.io yet — `cargo add arkan` currently
 > returns `could not be found in registry index`. Until it is, depend on it via git:
 > `arkan = { git = "https://github.com/LutwigStack/ArKan" }`.
 > The versions in the snippets below are what the next release will be.

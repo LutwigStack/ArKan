@@ -1,19 +1,6 @@
 # Releasing
 
-Every published version of this crate so far (0.1.0, 0.1.1, 0.2.0, 0.3.0) had to be yanked
-because it produced silently wrong numbers. This file exists so that stops happening: a
-release is a checklist, not a judgement call.
-
-## Why the old versions stay yanked
-
-They compute wrong input gradients wherever the grid clamp binds, evaluate wrong GPU
-quartic/quintic bases, and `BakedModel::forward()` panics. Details in the CHANGELOG.
-**Do not un-yank them.** Silently wrong arithmetic is worse for a user than a version that
-does not exist — a build failure gets noticed, a 30x-too-large gradient with a flipped sign
-does not.
-
-Yanking does not delete a version. Anyone with a `Cargo.lock` pinning one still resolves it.
-That is why the README and CHANGELOG say so in plain words rather than relying on the yank.
+A release is a checklist, not a judgement call.
 
 ## Before you tag
 

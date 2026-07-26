@@ -5,31 +5,6 @@ All notable changes to ArKan will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Yanked releases: 0.1.0, 0.1.1, 0.2.0, 0.3.0
-
-**All previously published versions are yanked and should not be used.** They are yanked
-because they produce *silently wrong numbers*, which is worse than failing to build, and
-they will stay yanked — un-yanking them would hand someone quiet corruption.
-
-What was wrong, verified against the `v0.3.0` tag:
-
-- **Input gradients were wrong wherever the grid clamp bound.** `KanLayer::backward` used
-  `dz/dx = 1/std` unconditionally (`src/layer.rs:854` at that tag), but the forward pass
-  computes `z = clamp((x - mean)/std, ...)`, whose derivative is zero outside the range. So
-  training propagated sensitivity the forward pass did not have. Measured after the fix:
-  first-layer weight gradients came out ~30x too large **with flipped signs**. The GPU
-  backward shader had the identical defect. This is not a corner case — only layer 0
-  receives `input_mean`/`input_std`, so hidden layers clamp their raw incoming activations,
-  and this repo's own `examples/game2048` config saturated 59-71% of them.
-- **GPU quartic and quintic B-spline bases were wrong.** `spline_order` 4 and 5 on the GPU
-  evaluated incorrect polynomial coefficients, so the forward pass itself was wrong. Loose
-  test tolerances (0.2 / 0.3) hid it.
-- **`BakedModel::forward()` panicked.** It was public, documented, and `unimplemented!()`.
-
-Yanking does not delete a version: a `Cargo.lock` already pinning one keeps resolving it.
-If you have a lockfile referencing 0.1.x-0.3.0, update it — do not assume the yank
-protected you.
-
 ## [0.4.0] - Unreleased
 
 Pre-1.0, so a minor bump carries the breaking changes below.
