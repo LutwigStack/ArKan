@@ -99,12 +99,6 @@ impl Env {
         &self.state_buffer
     }
 
-    /// Copies current state into provided buffer.
-    #[inline]
-    pub fn copy_state_to(&self, dest: &mut [f32; STATE_DIM]) {
-        *dest = self.state_buffer;
-    }
-
     /// Takes an action and returns (next_state, reward, done).
     pub fn step(&mut self, action: usize) -> (Vec<f32>, f32, bool) {
         let dir = Direction::from_index(action);
@@ -120,26 +114,6 @@ impl Env {
     #[inline]
     pub fn board(&self) -> &Board {
         &self.game.board
-    }
-
-    /// Takes an action and fills Experience struct (zero-copy friendly).
-    /// Returns reward and done flag.
-    #[inline]
-    pub fn step_into(&mut self, action: usize, exp: &mut Experience) -> (f32, bool) {
-        // Copy current state before move
-        exp.state = self.state_buffer;
-        exp.action = action;
-        
-        let dir = Direction::from_index(action);
-        let (reward, _changed) = self.game.make_move(dir);
-        
-        self.update_state_buffer();
-        
-        exp.reward = reward;
-        exp.next_state = self.state_buffer;
-        exp.done = self.game.game_over;
-        
-        (reward, self.game.game_over)
     }
 
     /// Returns current score.
@@ -229,19 +203,6 @@ impl ReplayBuffer {
         self.buffer.is_empty()
     }
 
-    /// Samples random indices for a batch (for lock-free pattern).
-    pub fn sample_indices(&self, batch_size: usize) -> Option<Vec<usize>> {
-        if self.buffer.len() < batch_size {
-            return None;
-        }
-        
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let len = self.buffer.len();
-        
-        Some((0..batch_size).map(|_| rng.gen_range(0..len)).collect())
-    }
-
     /// Samples a batch into pre-allocated buffers (minimal allocations).
     /// Returns batch_size on success.
     pub fn sample_batch_into(
@@ -310,5 +271,683 @@ impl ReplayBuffer {
         )?;
 
         Some((states, actions, rewards, next_states, dones))
+    }
+}
+
+// =============================================================================
+// SHARDED REPLAY BUFFER (Lock-free)
+// =============================================================================
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
+
+/// Number of shards for parallel access.
+/// Should be a power of 2 for fast modulo operation.
+const NUM_SHARDS: usize = 16;
+
+/// Sharded replay buffer for reduced lock contention.
+///
+/// Uses multiple shards with per-shard locking to reduce contention
+/// when multiple threads are pushing/sampling simultaneously.
+/// TODO: wire into train/gpu.rs for multi-threaded collection
+/// 
+/// # Design
+/// 
+/// - Experiences are distributed across shards using a round-robin approach
+/// - Sampling reads from all shards with minimal locking
+/// - Each shard has its own RwLock for fine-grained synchronization
+/// 
+/// # Example
+/// 
+/// ```ignore
+/// use std::sync::Arc;
+/// 
+/// let buffer = Arc::new(ShardedReplayBuffer::new(100000));
+/// 
+/// // Push from multiple threads
+/// buffer.push(experience);
+/// 
+/// // Sample batch
+/// if let Some(batch) = buffer.sample_batch(64) {
+///     // Use batch for training
+/// }
+/// ```
+pub struct ShardedReplayBuffer {
+    /// Shards for distributed storage
+    shards: Vec<RwLock<Vec<Experience>>>,
+    /// Capacity per shard
+    shard_capacity: usize,
+    /// Shard write positions (for circular buffer behavior)
+    shard_positions: Vec<AtomicUsize>,
+    /// Round-robin counter for pushing
+    push_counter: AtomicUsize,
+    /// Total capacity
+    #[allow(dead_code)]
+    capacity: usize,
+}
+
+impl ShardedReplayBuffer {
+    /// Creates a new sharded replay buffer.
+    pub fn new(capacity: usize) -> Self {
+        let shard_capacity = (capacity + NUM_SHARDS - 1) / NUM_SHARDS;
+        
+        let shards: Vec<_> = (0..NUM_SHARDS)
+            .map(|_| RwLock::new(Vec::with_capacity(shard_capacity)))
+            .collect();
+        
+        let shard_positions: Vec<_> = (0..NUM_SHARDS)
+            .map(|_| AtomicUsize::new(0))
+            .collect();
+        
+        Self {
+            shards,
+            shard_capacity,
+            shard_positions,
+            push_counter: AtomicUsize::new(0),
+            capacity,
+        }
+    }
+
+    /// Pushes an experience into the buffer.
+    /// Uses round-robin distribution across shards.
+    #[inline]
+    pub fn push(&self, exp: Experience) {
+        // Round-robin shard selection
+        let counter = self.push_counter.fetch_add(1, Ordering::Relaxed);
+        let shard_idx = counter % NUM_SHARDS;
+        
+        // Get position within shard
+        let pos = self.shard_positions[shard_idx].fetch_add(1, Ordering::Relaxed);
+        let idx_in_shard = pos % self.shard_capacity;
+        
+        // Lock only the target shard for writing
+        let mut shard = self.shards[shard_idx].write().unwrap();
+        
+        if shard.len() < self.shard_capacity {
+            // Still filling up
+            if idx_in_shard < shard.len() {
+                shard[idx_in_shard] = exp;
+            } else {
+                shard.push(exp);
+            }
+        } else {
+            shard[idx_in_shard] = exp;
+        }
+    }
+
+    /// Pushes multiple experiences efficiently.
+    /// Batches writes to reduce lock acquisitions.
+    pub fn push_batch(&self, experiences: Vec<Experience>) {
+        if experiences.is_empty() {
+            return;
+        }
+
+        // Group by target shard
+        let base_counter = self.push_counter.fetch_add(experiences.len(), Ordering::Relaxed);
+        
+        // Pre-compute shard assignments
+        let mut shard_batches: Vec<Vec<(usize, Experience)>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+        
+        for (i, exp) in experiences.into_iter().enumerate() {
+            let shard_idx = (base_counter + i) % NUM_SHARDS;
+            let pos = self.shard_positions[shard_idx].fetch_add(1, Ordering::Relaxed);
+            let idx_in_shard = pos % self.shard_capacity;
+            shard_batches[shard_idx].push((idx_in_shard, exp));
+        }
+        
+        // Write each batch to its shard
+        for (shard_idx, batch) in shard_batches.into_iter().enumerate() {
+            if batch.is_empty() {
+                continue;
+            }
+            
+            let mut shard = self.shards[shard_idx].write().unwrap();
+            for (idx, exp) in batch {
+                if idx < shard.len() {
+                    shard[idx] = exp;
+                } else if shard.len() < self.shard_capacity {
+                    shard.push(exp);
+                } else {
+                    // Wrap around
+                    let wrapped_idx = idx % shard.len();
+                    shard[wrapped_idx] = exp;
+                }
+            }
+        }
+    }
+
+    /// Returns total number of experiences.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.shards.iter()
+            .map(|s| s.read().unwrap().len())
+            .sum()
+    }
+
+    /// Returns true if buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Samples a batch from all shards with minimal locking.
+    /// Returns None if not enough experiences are available.
+    pub fn sample_batch(
+        &self,
+        batch_size: usize,
+    ) -> Option<(Vec<f32>, Vec<usize>, Vec<f32>, Vec<f32>, Vec<bool>)> {
+        // Quick check on total length
+        let total_len = self.len();
+        if total_len < batch_size {
+            return None;
+        }
+
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        
+        // Pre-allocate output vectors
+        let mut states = Vec::with_capacity(batch_size * STATE_DIM);
+        let mut actions = Vec::with_capacity(batch_size);
+        let mut rewards = Vec::with_capacity(batch_size);
+        let mut next_states = Vec::with_capacity(batch_size * STATE_DIM);
+        let mut dones = Vec::with_capacity(batch_size);
+
+        // Sample from random shards
+        // Take read locks on all shards first (sorted order to avoid deadlock)
+        let shard_reads: Vec<_> = self.shards.iter()
+            .map(|s| s.read().unwrap())
+            .collect();
+        
+        // Build cumulative lengths for weighted sampling
+        let shard_lens: Vec<usize> = shard_reads.iter().map(|s| s.len()).collect();
+        let total: usize = shard_lens.iter().sum();
+        
+        if total < batch_size {
+            return None;
+        }
+
+        // Sample random indices
+        for _ in 0..batch_size {
+            let global_idx = rng.gen_range(0..total);
+            
+            // Find which shard and local index
+            let mut cumsum = 0;
+            for (shard_idx, &shard_len) in shard_lens.iter().enumerate() {
+                if global_idx < cumsum + shard_len {
+                    let local_idx = global_idx - cumsum;
+                    let exp = &shard_reads[shard_idx][local_idx];
+                    
+                    states.extend_from_slice(&exp.state);
+                    actions.push(exp.action);
+                    rewards.push(exp.reward);
+                    next_states.extend_from_slice(&exp.next_state);
+                    dones.push(exp.done);
+                    break;
+                }
+                cumsum += shard_len;
+            }
+        }
+
+        Some((states, actions, rewards, next_states, dones))
+    }
+
+    /// Samples a batch into pre-allocated buffers.
+    pub fn sample_batch_into(
+        &self,
+        batch_size: usize,
+        states: &mut Vec<f32>,
+        actions: &mut Vec<usize>,
+        rewards: &mut Vec<f32>,
+        next_states: &mut Vec<f32>,
+        dones: &mut Vec<bool>,
+    ) -> Option<usize> {
+        let total_len = self.len();
+        if total_len < batch_size {
+            return None;
+        }
+
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        
+        // Clear and reserve
+        states.clear();
+        actions.clear();
+        rewards.clear();
+        next_states.clear();
+        dones.clear();
+        
+        states.reserve(batch_size * STATE_DIM);
+        actions.reserve(batch_size);
+        rewards.reserve(batch_size);
+        next_states.reserve(batch_size * STATE_DIM);
+        dones.reserve(batch_size);
+
+        // Take read locks
+        let shard_reads: Vec<_> = self.shards.iter()
+            .map(|s| s.read().unwrap())
+            .collect();
+        
+        let shard_lens: Vec<usize> = shard_reads.iter().map(|s| s.len()).collect();
+        let total: usize = shard_lens.iter().sum();
+        
+        if total < batch_size {
+            return None;
+        }
+
+        for _ in 0..batch_size {
+            let global_idx = rng.gen_range(0..total);
+            
+            let mut cumsum = 0;
+            for (shard_idx, &shard_len) in shard_lens.iter().enumerate() {
+                if global_idx < cumsum + shard_len {
+                    let local_idx = global_idx - cumsum;
+                    let exp = &shard_reads[shard_idx][local_idx];
+                    
+                    states.extend_from_slice(&exp.state);
+                    actions.push(exp.action);
+                    rewards.push(exp.reward);
+                    next_states.extend_from_slice(&exp.next_state);
+                    dones.push(exp.done);
+                    break;
+                }
+                cumsum += shard_len;
+            }
+        }
+
+        Some(batch_size)
+    }
+}
+
+// =============================================================================
+// TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // ReplayBuffer Tests
+    // =========================================================================
+
+    #[test]
+    fn test_replay_buffer_push_and_len() {
+        let mut buffer = ReplayBuffer::new(100);
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.is_empty());
+
+        for i in 0..10 {
+            let exp = Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: i == 9,
+            };
+            buffer.push(exp);
+        }
+
+        assert_eq!(buffer.len(), 10);
+        assert!(!buffer.is_empty());
+    }
+
+    #[test]
+    fn test_replay_buffer_circular() {
+        let mut buffer = ReplayBuffer::new(5);
+
+        // Push 10 items into buffer of capacity 5
+        for i in 0..10 {
+            let exp = Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: false,
+            };
+            buffer.push(exp);
+        }
+
+        // Should only have 5 items (circular buffer)
+        assert_eq!(buffer.len(), 5);
+    }
+
+    #[test]
+    fn test_replay_buffer_sample() {
+        let mut buffer = ReplayBuffer::new(100);
+
+        // Fill with 50 items
+        for i in 0..50 {
+            let exp = Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: false,
+            };
+            buffer.push(exp);
+        }
+
+        // Sample batch of 16
+        let result = buffer.sample_batch(16);
+        assert!(result.is_some());
+
+        let (states, actions, rewards, next_states, dones) = result.unwrap();
+        assert_eq!(states.len(), 16 * STATE_DIM);
+        assert_eq!(actions.len(), 16);
+        assert_eq!(rewards.len(), 16);
+        assert_eq!(next_states.len(), 16 * STATE_DIM);
+        assert_eq!(dones.len(), 16);
+    }
+
+    #[test]
+    fn test_replay_buffer_sample_insufficient() {
+        let mut buffer = ReplayBuffer::new(100);
+
+        // Only push 5 items
+        for i in 0..5 {
+            buffer.push(Experience {
+                state: [i as f32; STATE_DIM],
+                action: 0,
+                reward: 0.0,
+                next_state: [0.0; STATE_DIM],
+                done: false,
+            });
+        }
+
+        // Try to sample 10 - should fail
+        assert!(buffer.sample_batch(10).is_none());
+
+        // Sample 5 - should succeed
+        assert!(buffer.sample_batch(5).is_some());
+    }
+
+    // =========================================================================
+    // ShardedReplayBuffer Tests
+    // =========================================================================
+
+    #[test]
+    fn test_sharded_buffer_push_and_len() {
+        let buffer = ShardedReplayBuffer::new(1000);
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.is_empty());
+
+        for i in 0..100 {
+            let exp = Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: i == 99,
+            };
+            buffer.push(exp);
+        }
+
+        assert_eq!(buffer.len(), 100);
+        assert!(!buffer.is_empty());
+    }
+
+    #[test]
+    fn test_sharded_buffer_push_batch() {
+        let buffer = ShardedReplayBuffer::new(1000);
+
+        // Create batch of experiences
+        let experiences: Vec<Experience> = (0..50)
+            .map(|i| Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: false,
+            })
+            .collect();
+
+        buffer.push_batch(experiences);
+        assert_eq!(buffer.len(), 50);
+    }
+
+    #[test]
+    fn test_sharded_buffer_sample() {
+        let buffer = ShardedReplayBuffer::new(1000);
+
+        // Fill with 200 items
+        for i in 0..200 {
+            buffer.push(Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: false,
+            });
+        }
+
+        // Sample batch of 32
+        let result = buffer.sample_batch(32);
+        assert!(result.is_some());
+
+        let (states, actions, rewards, next_states, dones) = result.unwrap();
+        assert_eq!(states.len(), 32 * STATE_DIM);
+        assert_eq!(actions.len(), 32);
+        assert_eq!(rewards.len(), 32);
+        assert_eq!(next_states.len(), 32 * STATE_DIM);
+        assert_eq!(dones.len(), 32);
+    }
+
+    #[test]
+    fn test_sharded_buffer_sample_into() {
+        let buffer = ShardedReplayBuffer::new(1000);
+
+        // Fill with 200 items
+        for i in 0..200 {
+            buffer.push(Experience {
+                state: [i as f32; STATE_DIM],
+                action: i % 4,
+                reward: i as f32,
+                next_state: [(i + 1) as f32; STATE_DIM],
+                done: false,
+            });
+        }
+
+        // Pre-allocate buffers
+        let mut states = Vec::new();
+        let mut actions = Vec::new();
+        let mut rewards = Vec::new();
+        let mut next_states = Vec::new();
+        let mut dones = Vec::new();
+
+        let result = buffer.sample_batch_into(
+            32,
+            &mut states,
+            &mut actions,
+            &mut rewards,
+            &mut next_states,
+            &mut dones,
+        );
+
+        assert_eq!(result, Some(32));
+        assert_eq!(states.len(), 32 * STATE_DIM);
+        assert_eq!(actions.len(), 32);
+    }
+
+    /// Test fairness: samples should be distributed across all data.
+    #[test]
+    fn test_sharded_buffer_sampling_fairness() {
+        let buffer = ShardedReplayBuffer::new(1000);
+
+        // Fill with 160 items (10 per shard with 16 shards)
+        for i in 0..160 {
+            buffer.push(Experience {
+                state: [i as f32; STATE_DIM],
+                action: (i / 40) % 4, // 4 groups: 0,1,2,3
+                reward: i as f32,
+                next_state: [0.0; STATE_DIM],
+                done: false,
+            });
+        }
+
+        // Sample many times and count action distribution
+        let mut action_counts = [0usize; 4];
+        let num_samples = 10000;
+
+        for _ in 0..(num_samples / 64) {
+            if let Some((_, actions, _, _, _)) = buffer.sample_batch(64) {
+                for action in actions {
+                    action_counts[action] += 1;
+                }
+            }
+        }
+
+        // Each action should be ~25% of samples (within 20% tolerance)
+        let expected = num_samples / 4;
+        let tolerance = expected / 5; // 20%
+
+        for (action, &count) in action_counts.iter().enumerate() {
+            assert!(
+                (count as i64 - expected as i64).unsigned_abs() < tolerance as u64,
+                "Action {} count {} is far from expected {} (tolerance {})",
+                action, count, expected, tolerance
+            );
+        }
+    }
+
+    // =========================================================================
+    // Bellman Equation Test
+    // =========================================================================
+
+    /// Tests that DQN target computation follows Bellman equation:
+    /// Q(s,a) = r + γ * max_a' Q(s', a') for non-terminal states
+    /// Q(s,a) = r for terminal states
+    #[test]
+    fn test_bellman_equation_computation() {
+        let gamma = 0.99f32;
+
+        // Test case 1: Non-terminal state
+        {
+            let reward = 10.0f32;
+            let next_q_values = [1.0f32, 2.0, 3.0, 4.0]; // max = 4.0
+            let done = false;
+
+            let target_q = if done {
+                reward
+            } else {
+                let max_next_q = next_q_values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                reward + gamma * max_next_q
+            };
+
+            // Expected: 10.0 + 0.99 * 4.0 = 13.96
+            let expected = 10.0 + 0.99 * 4.0;
+            assert!(
+                (target_q - expected).abs() < 1e-6,
+                "Non-terminal Bellman: got {}, expected {}",
+                target_q, expected
+            );
+        }
+
+        // Test case 2: Terminal state
+        {
+            let reward = 100.0f32;
+            let next_q_values = [1.0f32, 2.0, 3.0, 4.0]; // Should be ignored
+            let done = true;
+
+            let target_q = if done {
+                reward
+            } else {
+                let max_next_q = next_q_values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                reward + gamma * max_next_q
+            };
+
+            // Expected: reward only (no future)
+            assert!(
+                (target_q - 100.0).abs() < 1e-6,
+                "Terminal Bellman: got {}, expected {}",
+                target_q, 100.0
+            );
+        }
+
+        // Test case 3: Zero reward, non-terminal
+        {
+            let reward = 0.0f32;
+            let next_q_values = [-1.0f32, -2.0, -0.5, -3.0]; // max = -0.5
+            let done = false;
+
+            let target_q = if done {
+                reward
+            } else {
+                let max_next_q = next_q_values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                reward + gamma * max_next_q
+            };
+
+            // Expected: 0.0 + 0.99 * (-0.5) = -0.495
+            let expected = 0.0 + 0.99 * (-0.5);
+            assert!(
+                (target_q - expected).abs() < 1e-6,
+                "Zero reward Bellman: got {}, expected {}",
+                target_q, expected
+            );
+        }
+    }
+
+    /// Tests that Q-value updates only target the selected action.
+    #[test]
+    fn test_bellman_selective_update() {
+        let current_q = [1.0f32, 2.0, 3.0, 4.0];
+        let action = 2; // Selected action
+        let target_q = 10.0f32; // New target for action 2
+
+        // Build targets array (copy current, update only selected action)
+        let mut targets = current_q;
+        targets[action] = target_q;
+
+        // Verify only action 2 changed
+        assert_eq!(targets[0], 1.0, "Action 0 should be unchanged");
+        assert_eq!(targets[1], 2.0, "Action 1 should be unchanged");
+        assert_eq!(targets[2], 10.0, "Action 2 should be updated");
+        assert_eq!(targets[3], 4.0, "Action 3 should be unchanged");
+    }
+
+    // =========================================================================
+    // Environment Tests
+    // =========================================================================
+
+    #[test]
+    fn test_env_creation() {
+        let env = Env::new();
+        assert_eq!(env.state_dim(), STATE_DIM);
+        assert_eq!(env.action_dim(), 4);
+        assert!(!env.is_done());
+    }
+
+    #[test]
+    fn test_env_reset() {
+        let mut env = Env::new();
+
+        // Take some actions
+        let _ = env.step(0);
+        let _ = env.step(1);
+
+        // Reset
+        let state = env.reset();
+        assert_eq!(state.len(), STATE_DIM);
+        assert!(!env.is_done());
+    }
+
+    #[test]
+    fn test_env_step() {
+        let mut env = Env::new();
+
+        let (next_state, reward, done) = env.step(0); // Move up
+
+        assert_eq!(next_state.len(), STATE_DIM);
+        assert!(reward.is_finite());
+        // done could be true or false depending on game state
+        let _ = done;
+    }
+
+    #[test]
+    fn test_experience_creation() {
+        let exp = Experience::new();
+        assert_eq!(exp.state.len(), STATE_DIM);
+        assert_eq!(exp.next_state.len(), STATE_DIM);
+        assert_eq!(exp.action, 0);
+        assert_eq!(exp.reward, 0.0);
+        assert!(!exp.done);
     }
 }

@@ -10,7 +10,7 @@
 //! variants available in the API.
 
 use arkan::network::TrainOptions;
-use arkan::{Adam, AdamConfig, KanConfig, KanNetwork, SGD};
+use arkan::{Adam, AdamConfig, KanConfig, KanNetwork, SGDConfig, SGD};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -151,7 +151,7 @@ fn bench_optimizer_init(c: &mut Criterion) {
 
     group.bench_function("sgd_new", |b| {
         b.iter(|| {
-            black_box(SGD::new(&network, 0.001, 0.9, 0.0));
+            black_box(SGD::new(&network, SGDConfig::with_momentum(0.001, 0.9)));
         });
     });
 

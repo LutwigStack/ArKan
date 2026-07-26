@@ -10,11 +10,173 @@ use crate::gpu::layer::GpuLayer;
 use crate::gpu::optimizer::{GpuAdam, GpuSgd};
 use crate::gpu::pipeline::{workgroup_count, PipelineCache, WORKGROUP_SIZE};
 use crate::gpu::workspace::GpuWorkspace;
-use crate::loss::{masked_cross_entropy, masked_mse};
+use crate::loss::{masked_bce_with_logits, masked_mse};
 use crate::network::{KanNetwork, TrainOptions};
-use crate::optimizer::{Adam, SGD};
+use crate::optimizer::{Adam, Optimizer, SGD};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
+
+/// Unpads weight gradients from GPU format (basis_padded) to CPU format (global_basis_size).
+///
+/// GPU stores weights with padding for vec4 alignment:
+/// - GPU: [out_dim, in_dim, basis_padded] where basis_padded = align4(global_basis_size)
+/// - CPU: [out_dim, in_dim, global_basis_size]
+///
+/// This function strips the padding to make gradients compatible with CPU optimizer.
+fn unpad_weights(
+    padded: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+    global_basis_size: usize,
+    basis_padded: usize,
+) -> Vec<f32> {
+    // If no padding needed, return as-is
+    if global_basis_size == basis_padded {
+        return padded.to_vec();
+    }
+
+    let cpu_size = out_dim * in_dim * global_basis_size;
+    let mut result = Vec::with_capacity(cpu_size);
+
+    for o in 0..out_dim {
+        for i in 0..in_dim {
+            let padded_offset = (o * in_dim + i) * basis_padded;
+            // Copy only global_basis_size elements, skip padding
+            for b in 0..global_basis_size {
+                result.push(padded[padded_offset + b]);
+            }
+        }
+    }
+
+    result
+}
+
+/// Handle for asynchronous GPU forward pass result.
+///
+/// Created by [`GpuNetwork::forward_batch_async`]. This handle allows you to
+/// submit GPU work and continue CPU processing while the GPU computes the result.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use arkan::{KanConfig, KanNetwork};
+/// use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork, GpuWorkspace};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let backend = WgpuBackend::init(WgpuOptions::default())?;
+/// let config = KanConfig::preset();
+/// let cpu_network = KanNetwork::new(config.clone());
+/// let mut gpu_network = GpuNetwork::from_cpu(&backend, &cpu_network)?;
+/// let mut workspace = GpuWorkspace::new(&backend.device, 64, config.input_dim, config.output_dim)?;
+///
+/// let input = vec![0.5f32; 64 * config.input_dim];
+///
+/// // Submit work and get handle
+/// let handle = gpu_network.forward_batch_async(&input, 64, &mut workspace)?;
+///
+/// // Do other CPU work while GPU computes...
+///
+/// // Get result (blocking)
+/// let output = handle.wait()?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct GpuForwardHandle {
+    /// Staging buffer for reading results.
+    staging_buffer: wgpu::Buffer,
+    /// Receiver for map_async completion signal.
+    receiver: Receiver<Result<(), wgpu::BufferAsyncError>>,
+    /// Batch size of this forward pass.
+    batch_size: usize,
+    /// Output dimension.
+    out_dim: usize,
+    /// Device reference for polling.
+    device: Arc<wgpu::Device>,
+}
+
+impl GpuForwardHandle {
+    /// Blocks until the GPU result is ready and returns the output.
+    ///
+    /// This is equivalent to calling `forward_batch` but allows you to do
+    /// CPU work between submission and result retrieval.
+    ///
+    /// # Returns
+    ///
+    /// Output data `[batch_size * out_dim]`.
+    pub fn wait(self) -> ArkanResult<Vec<f32>> {
+        // Poll device to ensure work is submitted
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Wait for map_async callback
+        self.receiver
+            .recv()
+            .map_err(|e| ArkanError::buffer(format!("Channel recv failed: {}", e)))?
+            .map_err(|e| ArkanError::buffer(format!("Buffer map failed: {:?}", e)))?;
+
+        // Read mapped data
+        let data = {
+            let mapped = self.staging_buffer.slice(..).get_mapped_range();
+            let full_data: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
+            let used = self.batch_size * self.out_dim;
+            full_data[..used].to_vec()
+        };
+
+        self.staging_buffer.unmap();
+        Ok(data)
+    }
+
+    /// Attempts to get the result without blocking.
+    ///
+    /// Returns `Some(Ok(data))` if the result is ready, `Some(Err(e))` if there
+    /// was an error, or `None` if the GPU is still computing.
+    ///
+    /// # Note
+    ///
+    /// You should call `poll()` before `try_recv()` to check for completion.
+    // `Err(self)` hands the still-pending request back to the caller so it can
+    // retry; boxing it would move the same bytes to the heap for no gain.
+    #[allow(clippy::result_large_err)]
+    pub fn try_recv(self) -> Result<Option<ArkanResult<Vec<f32>>>, Self> {
+        // Do a non-blocking poll
+        self.device.poll(wgpu::Maintain::Poll);
+
+        match self.receiver.try_recv() {
+            Ok(Ok(())) => {
+                // Ready - read data
+                let data = {
+                    let mapped = self.staging_buffer.slice(..).get_mapped_range();
+                    let full_data: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
+                    let used = self.batch_size * self.out_dim;
+                    full_data[..used].to_vec()
+                };
+                self.staging_buffer.unmap();
+                Ok(Some(Ok(data)))
+            }
+            Ok(Err(e)) => {
+                // Map failed
+                Ok(Some(Err(ArkanError::buffer(format!(
+                    "Buffer map failed: {:?}",
+                    e
+                )))))
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // Not ready yet - return self for retry
+                Err(self)
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Ok(Some(Err(ArkanError::buffer("Channel disconnected"))))
+            }
+        }
+    }
+
+    /// Polls the GPU for work completion.
+    ///
+    /// Call this periodically if using `try_recv()` in a loop.
+    pub fn poll(&self) {
+        self.device.poll(wgpu::Maintain::Poll);
+    }
+}
 
 /// GPU memory usage statistics.
 ///
@@ -101,6 +263,9 @@ pub struct GpuNetwork {
     /// B-spline order (2-5).
     spline_order: usize,
 
+    /// Maximum VRAM allocation per buffer.
+    max_vram_alloc: u64,
+
     /// Workspace bind group layout.
     workspace_layout: wgpu::BindGroupLayout,
 }
@@ -144,6 +309,9 @@ impl GpuNetwork {
         let output_dim = cpu_network.config.output_dim;
         let spline_order = cpu_network.config.spline_order;
 
+        // Store max_vram_alloc from backend
+        let max_vram_alloc = backend.max_vram_alloc();
+
         // layer_dims: [input_dim, hidden_0, hidden_1, ..., output_dim]
         // Used for intermediate buffer sizing
         let mut layer_dims = vec![input_dim];
@@ -161,13 +329,25 @@ impl GpuNetwork {
             output_dim,
             layer_dims,
             spline_order,
+            max_vram_alloc,
             workspace_layout,
         })
     }
 
-    /// Creates a GPU workspace for this network.
+    /// Creates a GPU workspace for this network with configured VRAM limit.
     pub fn create_workspace(&self, max_batch: usize) -> ArkanResult<GpuWorkspace> {
-        GpuWorkspace::new(&self.device, max_batch, self.input_dim, self.output_dim)
+        GpuWorkspace::new_with_limit(
+            &self.device,
+            max_batch,
+            self.input_dim,
+            self.output_dim,
+            self.max_vram_alloc,
+        )
+    }
+
+    /// Returns the maximum VRAM allocation per buffer.
+    pub fn max_vram_alloc(&self) -> u64 {
+        self.max_vram_alloc
     }
 
     /// Warms up the GPU by compiling all necessary pipelines.
@@ -366,6 +546,111 @@ impl GpuNetwork {
 
         // Download output
         workspace.download_output(&self.device, &self.queue, batch_size)
+    }
+
+    /// Performs asynchronous forward pass on GPU.
+    ///
+    /// Unlike `forward_batch`, this method returns immediately with a handle
+    /// that can be used to retrieve the result later. This allows overlapping
+    /// GPU computation with CPU work.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input data `[batch_size * input_dim]`.
+    /// * `batch_size` - Number of samples in the batch.
+    /// * `workspace` - GPU workspace for intermediate buffers.
+    ///
+    /// # Returns
+    ///
+    /// A [`GpuForwardHandle`] that can be used to retrieve the output.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use arkan::{KanConfig, KanNetwork};
+    /// # use arkan::gpu::{WgpuBackend, WgpuOptions, GpuNetwork, GpuWorkspace};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let backend = WgpuBackend::init(WgpuOptions::default())?;
+    /// # let config = KanConfig::preset();
+    /// # let mut gpu_network = GpuNetwork::from_cpu(&backend, &KanNetwork::new(config.clone()))?;
+    /// # let mut workspace = GpuWorkspace::new(&backend.device, 64, config.input_dim, config.output_dim)?;
+    /// let input = vec![0.5f32; 64 * config.input_dim];
+    ///
+    /// // Submit work to GPU
+    /// let handle = gpu_network.forward_batch_async(&input, 64, &mut workspace)?;
+    ///
+    /// // Do CPU work while GPU computes...
+    /// let cpu_result = expensive_cpu_computation();
+    ///
+    /// // Get GPU result
+    /// let output = handle.wait()?;
+    /// # Ok(())
+    /// # }
+    /// # fn expensive_cpu_computation() -> i32 { 42 }
+    /// ```
+    pub fn forward_batch_async(
+        &mut self,
+        input: &[f32],
+        batch_size: usize,
+        workspace: &mut GpuWorkspace,
+    ) -> ArkanResult<GpuForwardHandle> {
+        // Validate input
+        let expected_input_len = batch_size * self.input_dim;
+        if input.len() != expected_input_len {
+            return Err(ArkanError::shape_mismatch(
+                &[batch_size, self.input_dim],
+                &[input.len() / self.input_dim, self.input_dim],
+            ));
+        }
+
+        // Ensure workspace capacity
+        workspace.ensure_capacity(&self.device, batch_size)?;
+
+        // Upload input
+        workspace.upload_input(&self.queue, input)?;
+
+        // Execute forward pass (submits GPU commands)
+        self.execute_forward(batch_size, workspace)?;
+
+        // Create staging buffer for async readback
+        let output_buffer = workspace
+            .output_buffer()
+            .ok_or_else(|| ArkanError::buffer("Output buffer not allocated"))?;
+
+        let output_size = batch_size * self.output_dim;
+        let size_bytes = (output_size * std::mem::size_of::<f32>()) as u64;
+
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Forward async staging"),
+            size: size_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Copy from output buffer to staging buffer
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Forward async copy encoder"),
+            });
+        encoder.copy_buffer_to_buffer(output_buffer, 0, &staging_buffer, 0, size_bytes);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Set up async map
+        let (tx, rx) = mpsc::channel();
+        staging_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+
+        Ok(GpuForwardHandle {
+            staging_buffer,
+            receiver: rx,
+            batch_size,
+            out_dim: self.output_dim,
+            device: Arc::clone(&self.device),
+        })
     }
 
     /// Executes the forward pass computation.
@@ -724,14 +1009,11 @@ impl GpuNetwork {
             return Ok(());
         }
 
-        // Get training workspace layout
-        let training_layout = self.pipeline_cache.get_training_workspace_layout();
-        // SAFETY: We need to extend the lifetime of training_layout to use it after
-        // mutable borrows of self. This is safe because:
-        // 1. training_layout is stored in pipeline_cache and never deallocated
-        // 2. The underlying wgpu::BindGroupLayout is immutable once created
-        // 3. We only use training_layout_ref for creating bind groups, not modifying pipeline_cache
-        let training_layout_ref = unsafe { &*(training_layout as *const _) };
+        // Ensure training workspace layout is populated (takes &mut self).
+        self.pipeline_cache.get_training_workspace_layout();
+        // Clone the Arc handle (O(1) refcount bump). The owned Arc releases the immutable
+        // borrow on self.pipeline_cache so subsequent &mut self calls are borrow-checker clean.
+        let training_layout = self.pipeline_cache.clone_training_workspace_layout();
 
         // For single layer network
         if self.layers.len() == 1 {
@@ -739,7 +1021,7 @@ impl GpuNetwork {
                 0,
                 batch_size,
                 workspace,
-                training_layout_ref,
+                &training_layout,
             );
         }
 
@@ -754,7 +1036,7 @@ impl GpuNetwork {
                 num_layers,
                 batch_size,
                 workspace,
-                training_layout_ref,
+                &training_layout,
             )?;
         }
 
@@ -958,16 +1240,30 @@ impl GpuNetwork {
         let num_layers = self.layers.len();
 
         for layer_idx in (0..num_layers).rev() {
-            let compute_input_grad = layer_idx > 0;
+            // Always compute input gradients:
+            // - For intermediate layers: to propagate gradients backward
+            // - For first layer (layer_idx == 0): to return gradient w.r.t. network input
+            let compute_input_grad = true;
 
             // Execute GPU backward for this layer
             self.backward_layer_gpu(layer_idx, batch_size, workspace, compute_input_grad)?;
 
-            // Download gradients from GPU
-            let layer_grad_weights =
+            // Download gradients from GPU (padded format)
+            let padded_grad_weights =
                 workspace.download_grad_weights(&self.device, &self.queue, layer_idx)?;
             let layer_grad_bias =
                 workspace.download_grad_bias(&self.device, &self.queue, layer_idx)?;
+
+            // Unpad gradients to match CPU weight layout
+            // GPU uses basis_padded (aligned to 4), CPU uses global_basis_size
+            let layer = &self.layers[layer_idx];
+            let layer_grad_weights = unpad_weights(
+                &padded_grad_weights,
+                layer.out_dim,
+                layer.in_dim,
+                layer.global_basis_size,
+                layer.basis_padded,
+            );
 
             grad_weights.push(layer_grad_weights);
             grad_biases.push(layer_grad_bias);
@@ -1034,17 +1330,14 @@ impl GpuNetwork {
         );
 
         // Create backward workspace bind group (Group 1)
-        // SAFETY: We need to extend the lifetime of backward_workspace_layout to use it
-        // after mutable borrows of self. This is safe because:
-        // 1. backward_workspace_layout is stored in pipeline_cache and never deallocated
-        // 2. The underlying wgpu::BindGroupLayout is immutable once created
-        // 3. We only use it for creating bind groups, not modifying pipeline_cache
-        let backward_workspace_layout = self.pipeline_cache.get_backward_workspace_layout();
-        let backward_workspace_layout_ptr = backward_workspace_layout as *const _;
-        let backward_workspace_bind_group =
-            self.create_backward_workspace_bind_group(workspace, layer_idx, unsafe {
-                &*backward_workspace_layout_ptr
-            })?;
+        // Ensure the backward workspace layout is populated (takes &mut self).
+        self.pipeline_cache.get_backward_workspace_layout();
+        // The mutable borrow ends here. Take a plain immutable borrow via the &self accessor.
+        let backward_workspace_bind_group = self.create_backward_workspace_bind_group(
+            workspace,
+            layer_idx,
+            self.pipeline_cache.backward_workspace_layout_ref(),
+        )?;
 
         // Get pipelines
         let weights_pipeline = self
@@ -1231,7 +1524,10 @@ impl GpuNetwork {
     /// Performs a complete training step on GPU with MSE loss.
     ///
     /// This method combines forward pass, loss computation, backward pass,
-    /// and optimizer step into a single call.
+    /// and optimizer step into a single call. It delegates to
+    /// [`train_step_with_options`](Self::train_step_with_options) with
+    /// [`TrainOptions::default()`] (no gradient clipping, no weight decay),
+    /// matching the CPU default.
     ///
     /// # Arguments
     ///
@@ -1254,39 +1550,16 @@ impl GpuNetwork {
         optimizer: &mut Adam,
         cpu_network: &mut KanNetwork,
     ) -> ArkanResult<f32> {
-        // Validate target shape
-        let expected_target_len = batch_size * self.output_dim;
-        if target.len() != expected_target_len {
-            return Err(ArkanError::shape_mismatch(
-                &[batch_size, self.output_dim],
-                &[target.len() / self.output_dim, self.output_dim],
-            ));
-        }
-
-        // 1. Forward pass with training data
-        let output = self.forward_batch_training(input, batch_size, workspace)?;
-
-        // 2. Compute loss and gradient
-        let (loss, grad_output) = masked_mse(&output, target, None);
-
-        // 3. Backward pass
-        let mut grad_weights = Vec::new();
-        let mut grad_biases = Vec::new();
-        let _grad_input = self.backward_batch(
-            &grad_output,
+        self.train_step_with_options(
+            input,
+            target,
+            None,
             batch_size,
             workspace,
-            &mut grad_weights,
-            &mut grad_biases,
-        )?;
-
-        // 4. Optimizer step on CPU network
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, Some(1.0));
-
-        // 5. Sync weights from CPU to GPU
-        self.sync_weights(cpu_network)?;
-
-        Ok(loss)
+            optimizer,
+            cpu_network,
+            &TrainOptions::default(),
+        )
     }
 
     /// Performs a training step with cross-entropy loss.
@@ -1311,8 +1584,8 @@ impl GpuNetwork {
         // 1. Forward pass with training data
         let output = self.forward_batch_training(input, batch_size, workspace)?;
 
-        // 2. Compute loss and gradient
-        let (loss, grad_output) = masked_cross_entropy(&output, target, None);
+        // 2. Compute loss and gradient — output is raw KAN logits, use logit-aware BCE
+        let (loss, grad_output) = masked_bce_with_logits(&output, target, None);
 
         // 3. Backward pass
         let mut grad_weights = Vec::new();
@@ -1325,8 +1598,10 @@ impl GpuNetwork {
             &mut grad_biases,
         )?;
 
-        // 4. Optimizer step on CPU network
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, Some(1.0));
+        // 4. Optimizer step on CPU network. No gradient clipping by default; for
+        //    configurable clipping pass max_grad_norm to optimizer.step in your own
+        //    BCE training loop (there is no _with_options variant for the BCE path).
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, None)?;
 
         // 5. Sync weights from CPU to GPU
         self.sync_weights(cpu_network)?;
@@ -1401,7 +1676,7 @@ impl GpuNetwork {
         }
 
         // 5. Optimizer step on CPU network with gradient clipping
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, opts.max_grad_norm);
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, opts.max_grad_norm)?;
 
         // 6. Sync weights from CPU to GPU
         self.sync_weights(cpu_network)?;
@@ -1461,7 +1736,7 @@ impl GpuNetwork {
         )?;
 
         // 4. Optimizer step on CPU network
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, None);
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, None)?;
 
         // 5. Sync weights from CPU to GPU
         self.sync_weights(cpu_network)?;
@@ -1525,7 +1800,7 @@ impl GpuNetwork {
 
         // 4. Apply weight decay override if specified in opts
         if opts.weight_decay > 0.0 {
-            let lr = optimizer.lr;
+            let lr = optimizer.lr();
             for layer in &mut cpu_network.layers {
                 for w in layer.weights.as_mut_slice() {
                     *w *= 1.0 - lr * opts.weight_decay;
@@ -1534,7 +1809,7 @@ impl GpuNetwork {
         }
 
         // 5. Optimizer step on CPU network with gradient clipping
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, opts.max_grad_norm);
+        optimizer.step(cpu_network, &grad_weights, &grad_biases, opts.max_grad_norm)?;
 
         // 6. Sync weights from CPU to GPU
         self.sync_weights(cpu_network)?;
@@ -1659,7 +1934,7 @@ impl GpuNetwork {
 
     /// Performs a training step entirely on GPU using SGD optimizer.
     ///
-    /// Same as [`train_step_gpu_native`] but uses SGD instead of Adam.
+    /// Same as [`train_step_gpu_native`](Self::train_step_gpu_native) but uses SGD instead of Adam.
     pub fn train_step_gpu_native_sgd(
         &mut self,
         input: &[f32],
@@ -1697,7 +1972,7 @@ impl GpuNetwork {
 
     /// Performs a complete training step on GPU with full options.
     ///
-    /// Extended version of [`train_step_gpu_native`] that supports:
+    /// Extended version of [`train_step_gpu_native`](Self::train_step_gpu_native) that supports:
     /// - Optional mask for ignoring certain outputs (padding, etc.)
     /// - Gradient clipping via `max_grad_norm`
     /// - Weight decay (already supported in optimizer config)
@@ -1715,7 +1990,7 @@ impl GpuNetwork {
     /// # Note
     ///
     /// Gradient clipping requires downloading gradients to CPU for norm calculation.
-    /// If performance is critical and you don't need clipping, use [`train_step_gpu_native`].
+    /// If performance is critical and you don't need clipping, use [`train_step_gpu_native`](Self::train_step_gpu_native).
     #[allow(clippy::too_many_arguments)]
     pub fn train_step_gpu_native_with_options(
         &mut self,
@@ -1759,10 +2034,7 @@ impl GpuNetwork {
         Ok(loss)
     }
 
-    /// Applies gradient clipping to gradients in workspace.
-    ///
-    /// Computes L2 norm of all gradients and scales them down if norm > max_norm.
-    /// This requires downloading gradients to CPU for norm calculation.
+    /// Internal gradient clipping implementation.
     fn apply_gradient_clipping(
         &self,
         workspace: &mut GpuWorkspace,

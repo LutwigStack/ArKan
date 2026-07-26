@@ -16,6 +16,9 @@ use crate::gpu::shaders::{ADAM_SHADER, SGD_SHADER};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
+/// Workgroup size for optimizer compute shaders (must match shader source).
+const OPTIMIZER_WORKGROUP_SIZE: u32 = 256;
+
 /// Uniform buffer for Adam optimizer shader.
 ///
 /// This struct must match the AdamUniforms in ADAM_SHADER exactly (std140 layout).
@@ -339,7 +342,7 @@ impl GpuAdam {
             ],
         });
 
-        let workgroups = (state.num_params as u32).div_ceil(256);
+        let workgroups = (state.num_params as u32).div_ceil(OPTIMIZER_WORKGROUP_SIZE);
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -723,7 +726,8 @@ impl GpuSgd {
                 ],
             });
 
-            let workgroups = (self.weight_states[i].num_params as u32).div_ceil(256);
+            let workgroups =
+                (self.weight_states[i].num_params as u32).div_ceil(OPTIMIZER_WORKGROUP_SIZE);
 
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -774,7 +778,8 @@ impl GpuSgd {
                 ],
             });
 
-            let workgroups = (self.bias_states[i].num_params as u32).div_ceil(256);
+            let workgroups =
+                (self.bias_states[i].num_params as u32).div_ceil(OPTIMIZER_WORKGROUP_SIZE);
 
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

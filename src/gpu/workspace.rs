@@ -4,7 +4,7 @@
 //! for GPU operations with automatic resizing.
 
 use crate::error::{ArkanError, ArkanResult};
-use crate::gpu::{exceeds_vram_limit, GpuTensor, MAX_VRAM_ALLOC};
+use crate::gpu::{GpuTensor, DEFAULT_MAX_VRAM_ALLOC};
 
 /// GPU workspace for managing dynamic input/output buffers.
 ///
@@ -77,9 +77,10 @@ pub struct GpuWorkspace {
     pub out_dim: usize,
     /// Current maximum batch capacity.
     pub max_batch: usize,
+    /// Maximum VRAM allocation per buffer in bytes.
+    /// Configurable via `WgpuBackend::max_vram_alloc()`.
+    max_vram_alloc: u64,
 
-    /// Bind group layout for dynamic resources (Group 1).
-    pub bind_group_layout: Option<wgpu::BindGroupLayout>,
     /// Cached bind group for single-layer (input -> output).
     cached_bind_group: Option<wgpu::BindGroup>,
     /// Cached bind groups for multi-layer, indexed by (in_buffer_type, out_buffer_type).
@@ -89,9 +90,6 @@ pub struct GpuWorkspace {
     cached_training_bind_groups: Vec<Option<wgpu::BindGroup>>,
     /// Cached bind groups for backward pass.
     cached_backward_bind_groups: Vec<Option<wgpu::BindGroup>>,
-
-    /// Generation counter for cache invalidation.
-    generation: u64,
 }
 
 impl GpuWorkspace {
@@ -107,11 +105,47 @@ impl GpuWorkspace {
     /// # Returns
     ///
     /// A new workspace, or an error if allocation fails.
+    ///
+    /// # Note
+    ///
+    /// Uses default VRAM limit (2GB). For custom limits, use `new_with_limit()`.
     pub fn new(
         device: &wgpu::Device,
         max_batch: usize,
         in_dim: usize,
         out_dim: usize,
+    ) -> ArkanResult<Self> {
+        Self::new_with_limit(device, max_batch, in_dim, out_dim, DEFAULT_MAX_VRAM_ALLOC)
+    }
+
+    /// Creates a new workspace with custom VRAM limit.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - The wgpu device.
+    /// * `max_batch` - Maximum batch size to support.
+    /// * `in_dim` - Input dimension.
+    /// * `out_dim` - Output dimension.
+    /// * `max_vram_alloc` - Maximum VRAM per buffer in bytes.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use arkan::gpu::{GpuWorkspace, WgpuBackend, WgpuOptions};
+    ///
+    /// let backend = WgpuBackend::init(WgpuOptions::with_max_vram(8))?;
+    /// let workspace = GpuWorkspace::new_with_limit(
+    ///     &backend.device, 64, 21, 64,
+    ///     backend.max_vram_alloc()
+    /// )?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn new_with_limit(
+        device: &wgpu::Device,
+        max_batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        max_vram_alloc: u64,
     ) -> ArkanResult<Self> {
         let input_size = max_batch * in_dim;
         let output_size = max_batch * out_dim;
@@ -120,10 +154,10 @@ impl GpuWorkspace {
         let input_bytes = (input_size * std::mem::size_of::<f32>()) as u64;
         let output_bytes = (output_size * std::mem::size_of::<f32>()) as u64;
 
-        if exceeds_vram_limit(input_bytes) || exceeds_vram_limit(output_bytes) {
+        if input_bytes > max_vram_alloc || output_bytes > max_vram_alloc {
             return Err(ArkanError::batch_too_large(
                 max_batch,
-                (MAX_VRAM_ALLOC / (in_dim.max(out_dim) * std::mem::size_of::<f32>()) as u64)
+                (max_vram_alloc / (in_dim.max(out_dim) * std::mem::size_of::<f32>()) as u64)
                     as usize,
             ));
         }
@@ -145,17 +179,23 @@ impl GpuWorkspace {
             in_dim,
             out_dim,
             max_batch,
-            bind_group_layout: None,
+            max_vram_alloc,
             cached_bind_group: None,
             cached_layer_bind_groups: Vec::new(),
             cached_training_bind_groups: Vec::new(),
             cached_backward_bind_groups: Vec::new(),
-            generation: 0,
         })
     }
 
     /// Creates an empty workspace (lazy allocation).
+    ///
+    /// Uses default VRAM limit. For custom limits, use `empty_with_limit()`.
     pub fn empty(in_dim: usize, out_dim: usize) -> Self {
+        Self::empty_with_limit(in_dim, out_dim, DEFAULT_MAX_VRAM_ALLOC)
+    }
+
+    /// Creates an empty workspace with custom VRAM limit.
+    pub fn empty_with_limit(in_dim: usize, out_dim: usize, max_vram_alloc: u64) -> Self {
         Self {
             input: None,
             output: None,
@@ -170,13 +210,17 @@ impl GpuWorkspace {
             in_dim,
             out_dim,
             max_batch: 0,
-            bind_group_layout: None,
+            max_vram_alloc,
             cached_bind_group: None,
             cached_layer_bind_groups: Vec::new(),
             cached_training_bind_groups: Vec::new(),
             cached_backward_bind_groups: Vec::new(),
-            generation: 0,
         }
+    }
+
+    /// Returns the maximum VRAM allocation per buffer.
+    pub fn max_vram_alloc(&self) -> u64 {
+        self.max_vram_alloc
     }
 
     /// Ensures the workspace can handle at least `batch_size` samples.
@@ -198,14 +242,14 @@ impl GpuWorkspace {
         let input_size = new_capacity * self.in_dim;
         let output_size = new_capacity * self.out_dim;
 
-        // Check VRAM limits
+        // Check VRAM limits using configured max
         let input_bytes = (input_size * std::mem::size_of::<f32>()) as u64;
         let output_bytes = (output_size * std::mem::size_of::<f32>()) as u64;
 
-        if exceeds_vram_limit(input_bytes) || exceeds_vram_limit(output_bytes) {
+        if input_bytes > self.max_vram_alloc || output_bytes > self.max_vram_alloc {
             return Err(ArkanError::batch_too_large(
                 batch_size,
-                (MAX_VRAM_ALLOC
+                (self.max_vram_alloc
                     / (self.in_dim.max(self.out_dim) * std::mem::size_of::<f32>()) as u64)
                     as usize,
             ));
@@ -272,12 +316,6 @@ impl GpuWorkspace {
         self.cached_layer_bind_groups.clear();
         self.cached_training_bind_groups.clear();
         self.cached_backward_bind_groups.clear();
-        self.generation += 1;
-    }
-
-    /// Returns the current generation (for cache validation).
-    pub fn generation(&self) -> u64 {
-        self.generation
     }
 
     /// Prepares training buffers for backward pass.
@@ -933,7 +971,6 @@ impl std::fmt::Debug for GpuWorkspace {
             .field("in_dim", &self.in_dim)
             .field("out_dim", &self.out_dim)
             .field("max_batch", &self.max_batch)
-            .field("generation", &self.generation)
             .field("has_input", &self.input.is_some())
             .field("has_output", &self.output.is_some())
             .field("num_intermediates", &self.intermediates.len())

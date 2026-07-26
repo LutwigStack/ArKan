@@ -45,15 +45,27 @@
 //! - 4-wide SSE4 for smaller batches
 //! - Scalar fallback for non-aligned cases
 
-use crate::buffer::Workspace;
+use crate::buffer::{Workspace, MAX_BUFFER_ELEMENTS};
 use crate::config::{KanConfig, EPSILON};
-use crate::spline::{compute_basis, compute_basis_and_deriv, compute_knots, find_span};
+use crate::spline::{
+    compute_basis, compute_basis_and_deriv, compute_knots, find_span, SPAN_CLAMPED_FLAG,
+    SPAN_INDEX_MASK,
+};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use wide::{f32x4, f32x8};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize};
+
+/// Recovers the knot span from a span index stored by the forward pass.
+///
+/// Stored values carry [`SPAN_CLAMPED_FLAG`] in their high bit, so they must never
+/// be used as an index directly.
+#[inline]
+fn span_of(stored: u32) -> usize {
+    (stored & SPAN_INDEX_MASK) as usize
+}
 
 /// A single KAN layer with learnable spline coefficients.
 ///
@@ -182,8 +194,8 @@ impl KanLayer {
     ///
     /// # Errors
     ///
-    /// Returns [`ArkanError::Config`] if dimensions are zero.
-    /// Returns [`ArkanError::Overflow`] if weight count overflows.
+    /// Returns [`ArkanError::Config`](crate::ArkanError::Config) if dimensions are zero.
+    /// Returns [`ArkanError::Overflow`](crate::ArkanError::Overflow) if weight count overflows.
     ///
     /// # Example
     ///
@@ -240,11 +252,10 @@ impl KanLayer {
             })?;
 
         // Check against practical limits (avoid OOM)
-        const MAX_WEIGHTS: usize = 1 << 30; // ~1 billion weights, ~4GB
-        if total_weights > MAX_WEIGHTS {
+        if total_weights > MAX_BUFFER_ELEMENTS {
             return Err(ArkanError::Overflow(format!(
                 "weight count {} exceeds maximum {}",
-                total_weights, MAX_WEIGHTS
+                total_weights, MAX_BUFFER_ELEMENTS
             )));
         }
 
@@ -361,10 +372,8 @@ impl KanLayer {
     pub fn set_normalization(&mut self, mean: &[f32], std: &[f32]) {
         assert_eq!(mean.len(), self.in_dim);
         assert_eq!(std.len(), self.in_dim);
-        self.mean.clear();
-        self.mean.extend_from_slice(mean);
-        self.std.clear();
-        self.std.extend(std.iter().map(|s| s.max(EPSILON)));
+        self.mean = mean.to_vec();
+        self.std = std.iter().map(|s| s.max(EPSILON)).collect();
     }
 
     /// Forward pass for a single input sample.
@@ -401,6 +410,9 @@ impl KanLayer {
         output.copy_from_slice(&self.bias);
 
         // For each input, compute basis and accumulate
+        // ponytail: unlike forward_batch this does not record SPAN_CLAMPED_FLAG -
+        // it keeps no history buffer, so no backward pass can consume it. If a
+        // single-sample training path ever appears, it needs the flag too.
         for (i, raw) in input.iter().enumerate() {
             let z =
                 ((*raw - self.mean[i]) / self.std[i]).clamp(self.grid_range.0, self.grid_range.1);
@@ -490,11 +502,14 @@ impl KanLayer {
 
             for i in 0..self.in_dim {
                 let raw = inputs[input_start + i];
-                let z = ((raw - self.mean[i]) / self.std[i])
-                    .clamp(self.grid_range.0, self.grid_range.1);
+                let unclamped = (raw - self.mean[i]) / self.std[i];
+                let z = unclamped.clamp(self.grid_range.0, self.grid_range.1);
                 workspace.z_buffer.as_mut_slice()[input_start + i] = z;
                 let span = find_span(z, &self.knots, self.order, self.grid_size);
-                workspace.grid_indices[span_batch_start + i] = span as u32;
+                // Record saturation with the span: dz/dx is 0 here, and backward
+                // cannot recover that from the clamped z alone.
+                let clamped = if z == unclamped { 0 } else { SPAN_CLAMPED_FLAG };
+                workspace.grid_indices[span_batch_start + i] = span as u32 | clamped;
 
                 let basis_start = basis_batch_start + i * self.basis_aligned;
                 let basis_slice = workspace.basis_values.as_mut_slice();
@@ -526,7 +541,7 @@ impl KanLayer {
     ///
     /// # Errors
     ///
-    /// Returns [`ArkanError::ShapeMismatch`] if buffer sizes don't match expected dimensions.
+    /// Returns [`ArkanError::ShapeMismatch`](crate::ArkanError::ShapeMismatch) if buffer sizes don't match expected dimensions.
     #[inline]
     pub fn try_forward_single(
         &self,
@@ -560,7 +575,7 @@ impl KanLayer {
     ///
     /// # Errors
     ///
-    /// Returns [`ArkanError::ShapeMismatch`] if input/output sizes don't match expected dimensions.
+    /// Returns [`ArkanError::ShapeMismatch`](crate::ArkanError::ShapeMismatch) if input/output sizes don't match expected dimensions.
     #[inline]
     pub fn try_forward_batch(
         &self,
@@ -629,7 +644,7 @@ impl KanLayer {
                         // Scalar fallback
                         let mut s = 0.0f32;
                         for i in 0..self.in_dim {
-                            let span = spans[span_batch_start + i] as usize;
+                            let span = span_of(spans[span_batch_start + i]);
                             let start_idx = span - self.order;
                             let basis_start = basis_batch_start + i * self.basis_aligned;
 
@@ -672,7 +687,7 @@ impl KanLayer {
 
                 for lane in 0..8 {
                     let i = i_base + lane;
-                    let span = spans[span_batch_start + i] as usize;
+                    let span = span_of(spans[span_batch_start + i]);
                     let start_idx = span - self.order;
                     let basis_start = basis_batch_start + i * self.basis_aligned;
 
@@ -692,7 +707,7 @@ impl KanLayer {
 
         // Handle remaining inputs (scalar)
         for i in (chunks * 8)..self.in_dim {
-            let span = spans[span_batch_start + i] as usize;
+            let span = span_of(spans[span_batch_start + i]);
             let start_idx = span - self.order;
             let basis_start = basis_batch_start + i * self.basis_aligned;
 
@@ -727,7 +742,7 @@ impl KanLayer {
 
                 for lane in 0..4 {
                     let i = i_base + lane;
-                    let span = spans[span_batch_start + i] as usize;
+                    let span = span_of(spans[span_batch_start + i]);
                     let start_idx = span - self.order;
                     let basis_start = basis_batch_start + i * self.basis_aligned;
 
@@ -746,7 +761,7 @@ impl KanLayer {
 
         // Tail
         for i in (chunks * 4)..self.in_dim {
-            let span = spans[span_batch_start + i] as usize;
+            let span = span_of(spans[span_batch_start + i]);
             let start_idx = span - self.order;
             let basis_start = basis_batch_start + i * self.basis_aligned;
 
@@ -849,7 +864,7 @@ impl KanLayer {
 
             for i in 0..self.in_dim {
                 let z = normalized_input[input_offset + i];
-                let span = grid_indices[input_offset + i] as usize;
+                let span = span_of(grid_indices[input_offset + i]);
                 let basis_offset = base_offset + i * self.basis_aligned;
 
                 compute_basis_and_deriv(
@@ -890,9 +905,17 @@ impl KanLayer {
                 grad_bias[j] += g_out;
 
                 for i in 0..self.in_dim {
-                    let span = grid_indices[span_batch_start + i] as usize;
+                    let stored_span = grid_indices[span_batch_start + i];
+                    let span = span_of(stored_span);
                     let start_idx = span - self.order;
                     let basis_start = basis_batch_start + i * self.basis_aligned;
+                    // dz/dx for the *clamped* normalization: zero where the forward
+                    // pass saturated, so a saturated input reports no sensitivity.
+                    let dz_dx = if stored_span & SPAN_CLAMPED_FLAG != 0 {
+                        0.0
+                    } else {
+                        1.0 / self.std[i].max(EPSILON)
+                    };
 
                     for k in 0..self.local_basis_size {
                         let weight_idx = self.weight_index(j, i, start_idx + k);
@@ -901,12 +924,239 @@ impl KanLayer {
 
                         if let Some(ref mut gi) = grad_input {
                             let deriv = deriv_slice[basis_start + k];
-                            let std_inv = 1.0 / self.std[i].max(EPSILON);
                             gi[span_batch_start + i] +=
-                                g_out * self.weights[weight_idx] * deriv * std_inv;
+                                g_out * self.weights[weight_idx] * deriv * dz_dx;
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Parallel backward pass using thread-local gradient accumulation.
+    ///
+    /// **Requires the `parallel` feature.** Without it only the sequential
+    /// [`backward`](Self::backward) exists; the two are numerically equivalent
+    /// (see `tests/backward_correctness.rs`).
+    ///
+    /// # Algorithm (Thread-Local Gradients + Reduce)
+    ///
+    /// 1. **Parallel basis computation**: Each thread computes basis values and
+    ///    derivatives for a subset of samples independently.
+    ///
+    /// 2. **Thread-local accumulation**: Each thread accumulates gradients into
+    ///    its own local `(grad_weights, grad_bias, grad_input)` buffers.
+    ///    No synchronization needed during accumulation.
+    ///
+    /// 3. **Reduce**: After parallel section, thread-local buffers are summed
+    ///    into the final output buffers.
+    ///
+    /// # Memory Overhead
+    ///
+    /// O(num_threads × num_parameters) additional memory for thread-local buffers.
+    /// For a layer with 10K parameters and 8 threads: ~320 KB overhead.
+    ///
+    /// # When to Use
+    ///
+    /// Use this method when `batch_size >= multithreading_threshold` (typically 64+).
+    /// For smaller batches, the sequential [`backward`](Self::backward) is faster.
+    ///
+    /// # Arguments
+    ///
+    /// Same as [`backward`](Self::backward).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanLayer, Workspace};
+    ///
+    /// let config = KanConfig::preset();
+    /// let layer = KanLayer::new(4, 8, &config);
+    /// let mut workspace = Workspace::new(&config);
+    ///
+    /// let batch_size = 128;
+    /// let normalized_input = vec![0.5f32; batch_size * 4];
+    /// let grid_indices = vec![3u32; batch_size * 4];
+    /// let grad_output = vec![1.0f32; batch_size * 8];
+    /// let mut grad_input = vec![0.0f32; batch_size * 4];
+    /// let mut grad_weights = vec![0.0f32; layer.weights.len()];
+    /// let mut grad_bias = vec![0.0f32; layer.bias.len()];
+    ///
+    /// layer.backward_parallel(
+    ///     &normalized_input,
+    ///     &grid_indices,
+    ///     &grad_output,
+    ///     Some(&mut grad_input),
+    ///     &mut grad_weights,
+    ///     &mut grad_bias,
+    /// );
+    /// ```
+    #[cfg(feature = "parallel")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_parallel(
+        &self,
+        normalized_input: &[f32],
+        grid_indices: &[u32],
+        grad_output: &[f32],
+        grad_input: Option<&mut [f32]>,
+        grad_weights: &mut [f32],
+        grad_bias: &mut [f32],
+    ) {
+        use rayon::prelude::*;
+
+        let batch_size = normalized_input.len() / self.in_dim;
+        debug_assert_eq!(normalized_input.len(), batch_size * self.in_dim);
+        debug_assert_eq!(grid_indices.len(), batch_size * self.in_dim);
+        debug_assert_eq!(grad_output.len(), batch_size * self.out_dim);
+        debug_assert_eq!(grad_weights.len(), self.weights.len());
+        debug_assert_eq!(grad_bias.len(), self.bias.len());
+
+        let compute_grad_input = grad_input.is_some();
+
+        // Parallel phase: each chunk computes its own gradients
+        // Returns (local_grad_weights, local_grad_bias, local_grad_input)
+        let (reduced_weights, reduced_bias, reduced_input, _, _) = (0..batch_size)
+            .into_par_iter()
+            .fold(
+                || {
+                    // Thread-local gradient buffers
+                    let local_weights = vec![0.0f32; self.weights.len()];
+                    let local_bias = vec![0.0f32; self.bias.len()];
+                    let local_input = if compute_grad_input {
+                        vec![0.0f32; batch_size * self.in_dim]
+                    } else {
+                        Vec::new()
+                    };
+                    // Thread-local basis buffers
+                    let basis_values = vec![0.0f32; self.in_dim * self.basis_aligned];
+                    let basis_derivs = vec![0.0f32; self.in_dim * self.basis_aligned];
+                    (
+                        local_weights,
+                        local_bias,
+                        local_input,
+                        basis_values,
+                        basis_derivs,
+                    )
+                },
+                |mut acc, b| {
+                    let (
+                        ref mut local_weights,
+                        ref mut local_bias,
+                        ref mut local_input,
+                        ref mut basis_values,
+                        ref mut basis_derivs,
+                    ) = acc;
+
+                    let input_offset = b * self.in_dim;
+                    let grad_out_start = b * self.out_dim;
+
+                    // Compute basis values and derivatives for this sample
+                    for i in 0..self.in_dim {
+                        let z = normalized_input[input_offset + i];
+                        let span = span_of(grid_indices[input_offset + i]);
+                        let basis_offset = i * self.basis_aligned;
+
+                        compute_basis_and_deriv(
+                            z,
+                            span,
+                            &self.knots,
+                            self.order,
+                            &mut basis_values[basis_offset..basis_offset + self.local_basis_size],
+                            &mut basis_derivs[basis_offset..basis_offset + self.local_basis_size],
+                        );
+
+                        // Zero padding
+                        for k in self.local_basis_size..self.basis_aligned {
+                            basis_values[basis_offset + k] = 0.0;
+                            basis_derivs[basis_offset + k] = 0.0;
+                        }
+                    }
+
+                    // Accumulate gradients for this sample
+                    for j in 0..self.out_dim {
+                        let g_out = grad_output[grad_out_start + j];
+                        if g_out == 0.0 {
+                            continue;
+                        }
+
+                        local_bias[j] += g_out;
+
+                        for i in 0..self.in_dim {
+                            let stored_span = grid_indices[input_offset + i];
+                            let span = span_of(stored_span);
+                            let start_idx = span - self.order;
+                            let basis_start = i * self.basis_aligned;
+                            // Must match `backward`: dz/dx is 0 for saturated inputs.
+                            let dz_dx = if stored_span & SPAN_CLAMPED_FLAG != 0 {
+                                0.0
+                            } else {
+                                1.0 / self.std[i].max(EPSILON)
+                            };
+
+                            for k in 0..self.local_basis_size {
+                                let weight_idx = self.weight_index(j, i, start_idx + k);
+                                let basis_val = basis_values[basis_start + k];
+                                local_weights[weight_idx] += g_out * basis_val;
+
+                                if compute_grad_input {
+                                    let deriv = basis_derivs[basis_start + k];
+                                    local_input[input_offset + i] +=
+                                        g_out * self.weights[weight_idx] * deriv * dz_dx;
+                                }
+                            }
+                        }
+                    }
+
+                    acc
+                },
+            )
+            .reduce(
+                || {
+                    // Identity for reduce
+                    let local_weights = vec![0.0f32; self.weights.len()];
+                    let local_bias = vec![0.0f32; self.bias.len()];
+                    let local_input = if compute_grad_input {
+                        vec![0.0f32; batch_size * self.in_dim]
+                    } else {
+                        Vec::new()
+                    };
+                    let basis_values = Vec::new();
+                    let basis_derivs = Vec::new();
+                    (
+                        local_weights,
+                        local_bias,
+                        local_input,
+                        basis_values,
+                        basis_derivs,
+                    )
+                },
+                |mut a, b| {
+                    // Sum thread-local gradients
+                    for (aw, bw) in a.0.iter_mut().zip(b.0.iter()) {
+                        *aw += bw;
+                    }
+                    for (ab, bb) in a.1.iter_mut().zip(b.1.iter()) {
+                        *ab += bb;
+                    }
+                    if compute_grad_input {
+                        for (ai, bi) in a.2.iter_mut().zip(b.2.iter()) {
+                            *ai += bi;
+                        }
+                    }
+                    a
+                },
+            );
+
+        // Copy reduced results to output buffers
+        for (gw, rw) in grad_weights.iter_mut().zip(reduced_weights.iter()) {
+            *gw += rw;
+        }
+        for (gb, rb) in grad_bias.iter_mut().zip(reduced_bias.iter()) {
+            *gb += rb;
+        }
+        if let Some(gi) = grad_input {
+            for (g, r) in gi.iter_mut().zip(reduced_input.iter()) {
+                *g += r;
             }
         }
     }

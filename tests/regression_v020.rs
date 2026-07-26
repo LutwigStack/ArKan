@@ -538,31 +538,32 @@ fn test_p0_config_validation_safety() {
         "Mismatched input_mean should be invalid"
     );
 
-    // Zero/negative std - now warns but succeeds (values will be clamped to EPSILON)
+    // Zero/negative std - now a hard validation error (WS06 hardening).
+    // Non-positive std silently distorts normalization, so it is rejected at
+    // the trust boundary instead of being clamped to EPSILON.
     let config = KanConfig {
         input_dim: 2,
         output_dim: 1,
         input_mean: vec![0.0; 2],
-        input_std: vec![0.0, 1.0], // Zero - will be clamped
+        input_std: vec![0.0, 1.0], // Zero - invalid
         ..Default::default()
     };
-    // Should succeed with warning, not error
     assert!(
-        config.validate().is_ok(),
-        "Zero input_std should warn but not fail"
+        config.validate().is_err(),
+        "Zero input_std should be a validation error"
     );
 
-    // Negative std also warns but succeeds
+    // Negative std also errors
     let config = KanConfig {
         input_dim: 2,
         output_dim: 1,
         input_mean: vec![0.0; 2],
-        input_std: vec![-1.0, 1.0], // Negative - will be clamped
+        input_std: vec![-1.0, 1.0], // Negative - invalid
         ..Default::default()
     };
     assert!(
-        config.validate().is_ok(),
-        "Negative input_std should warn but not fail"
+        config.validate().is_err(),
+        "Negative input_std should be a validation error"
     );
 }
 

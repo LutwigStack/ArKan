@@ -37,10 +37,12 @@ pub struct PipelineCache {
     backward_input_pipeline: Option<wgpu::ComputePipeline>,
     /// Backward bias pipeline
     backward_bias_pipeline: Option<wgpu::ComputePipeline>,
-    /// Bind group layout for training (Group 1)
-    training_workspace_layout: Option<wgpu::BindGroupLayout>,
-    /// Bind group layout for backward pass (Group 1)
-    backward_workspace_layout: Option<wgpu::BindGroupLayout>,
+    /// Bind group layout for training (Group 1).
+    /// Stored behind Arc so callers can clone the handle cheaply without borrowing &self.
+    training_workspace_layout: Option<Arc<wgpu::BindGroupLayout>>,
+    /// Bind group layout for backward pass (Group 1).
+    /// Stored behind Arc so callers can clone the handle cheaply without borrowing &self.
+    backward_workspace_layout: Option<Arc<wgpu::BindGroupLayout>>,
 }
 
 impl PipelineCache {
@@ -262,9 +264,48 @@ impl PipelineCache {
         Ok(())
     }
 
-    /// Returns the forward pipeline layout.
-    pub fn forward_layout(&self) -> Option<&wgpu::PipelineLayout> {
-        self.forward_layout.as_ref()
+    /// Returns an immutable reference to the training workspace layout.
+    ///
+    /// Panics if the layout has not been initialized yet via `get_training_workspace_layout`.
+    /// Call `get_training_workspace_layout` first (which takes `&mut self`) to initialize, then
+    /// use this method (which takes `&self`) for subsequent accesses without a mutable borrow.
+    pub fn training_workspace_layout_ref(&self) -> &wgpu::BindGroupLayout {
+        self.training_workspace_layout
+            .as_deref()
+            .expect("training_workspace_layout not yet initialized")
+    }
+
+    /// Returns a cloned `Arc` handle to the training workspace layout.
+    ///
+    /// Call `get_training_workspace_layout` first to ensure the layout is initialized.
+    /// Cloning the `Arc` is O(1) and releases any borrow on `self`, allowing the caller
+    /// to subsequently take `&mut self` without borrow-checker conflicts.
+    pub fn clone_training_workspace_layout(&self) -> Arc<wgpu::BindGroupLayout> {
+        self.training_workspace_layout
+            .clone()
+            .expect("training_workspace_layout not yet initialized")
+    }
+
+    /// Returns an immutable reference to the backward workspace layout.
+    ///
+    /// Panics if the layout has not been initialized yet via `get_backward_workspace_layout`.
+    /// Call `get_backward_workspace_layout` first (which takes `&mut self`) to initialize, then
+    /// use this method (which takes `&self`) for subsequent accesses without a mutable borrow.
+    pub fn backward_workspace_layout_ref(&self) -> &wgpu::BindGroupLayout {
+        self.backward_workspace_layout
+            .as_deref()
+            .expect("backward_workspace_layout not yet initialized")
+    }
+
+    /// Returns a cloned `Arc` handle to the backward workspace layout.
+    ///
+    /// Call `get_backward_workspace_layout` first to ensure the layout is initialized.
+    /// Cloning the `Arc` is O(1) and releases any borrow on `self`, allowing the caller
+    /// to subsequently take `&mut self` without borrow-checker conflicts.
+    pub fn clone_backward_workspace_layout(&self) -> Arc<wgpu::BindGroupLayout> {
+        self.backward_workspace_layout
+            .clone()
+            .expect("backward_workspace_layout not yet initialized")
     }
 
     // ==================== Softmax Pipeline ====================
@@ -359,7 +400,7 @@ impl PipelineCache {
     /// Group 1: input, output, z_values, span_indices
     pub fn get_training_workspace_layout(&mut self) -> &wgpu::BindGroupLayout {
         if self.training_workspace_layout.is_none() {
-            self.training_workspace_layout = Some(self.device.create_bind_group_layout(
+            self.training_workspace_layout = Some(Arc::new(self.device.create_bind_group_layout(
                 &wgpu::BindGroupLayoutDescriptor {
                     label: Some("Training Workspace BindGroupLayout"),
                     entries: &[
@@ -409,16 +450,16 @@ impl PipelineCache {
                         },
                     ],
                 },
-            ));
+            )));
         }
-        self.training_workspace_layout.as_ref().unwrap()
+        self.training_workspace_layout.as_deref().unwrap()
     }
 
     /// Creates the bind group layout for backward pass.
     /// Group 1: z_values, span_indices, grad_output, grad_weights, grad_bias, grad_input, std_inv
     pub fn get_backward_workspace_layout(&mut self) -> &wgpu::BindGroupLayout {
         if self.backward_workspace_layout.is_none() {
-            self.backward_workspace_layout = Some(self.device.create_bind_group_layout(
+            self.backward_workspace_layout = Some(Arc::new(self.device.create_bind_group_layout(
                 &wgpu::BindGroupLayoutDescriptor {
                     label: Some("Backward Workspace BindGroupLayout"),
                     entries: &[
@@ -501,9 +542,9 @@ impl PipelineCache {
                         },
                     ],
                 },
-            ));
+            )));
         }
-        self.backward_workspace_layout.as_ref().unwrap()
+        self.backward_workspace_layout.as_deref().unwrap()
     }
 
     /// Gets or creates the forward training pipeline.
@@ -521,9 +562,11 @@ impl PipelineCache {
         &mut self,
         layer_layout: &wgpu::BindGroupLayout,
     ) -> ArkanResult<()> {
-        let training_layout = self.get_training_workspace_layout();
-        // Need to clone since we mutably borrow self above
-        let training_layout_ref = unsafe { &*(training_layout as *const _) };
+        // Ensure the layout is populated while we hold &mut self.
+        self.get_training_workspace_layout();
+        // The mutable borrow from get_training_workspace_layout ends here.
+        // Now take a plain immutable borrow of the populated field.
+        let training_layout_ref = self.training_workspace_layout.as_deref().unwrap();
 
         let shader = self
             .device
@@ -561,8 +604,11 @@ impl PipelineCache {
         layer_layout: &wgpu::BindGroupLayout,
         order: usize,
     ) -> ArkanResult<()> {
-        let training_layout = self.get_training_workspace_layout();
-        let training_layout_ref = unsafe { &*(training_layout as *const _) };
+        // Ensure the layout is populated while we hold &mut self.
+        self.get_training_workspace_layout();
+        // The mutable borrow from get_training_workspace_layout ends here.
+        // Now take a plain immutable borrow of the populated field.
+        let training_layout_ref = self.training_workspace_layout.as_deref().unwrap();
 
         let shader_source = shaders::generate_forward_training_shader(order)?;
         let shader = self
@@ -610,9 +656,11 @@ impl PipelineCache {
         &mut self,
         layer_layout: &wgpu::BindGroupLayout,
     ) -> ArkanResult<()> {
-        let backward_layout = self.get_backward_workspace_layout();
-        // Need to clone since we mutably borrow self above
-        let backward_layout_ref = unsafe { &*(backward_layout as *const _) };
+        // Ensure the layout is populated while we hold &mut self.
+        self.get_backward_workspace_layout();
+        // The mutable borrow from get_backward_workspace_layout ends here.
+        // Now take a plain immutable borrow of the populated field.
+        let backward_layout_ref = self.backward_workspace_layout.as_deref().unwrap();
 
         let shader = self
             .device
@@ -659,8 +707,11 @@ impl PipelineCache {
         &mut self,
         layer_layout: &wgpu::BindGroupLayout,
     ) -> ArkanResult<()> {
-        let backward_layout = self.get_backward_workspace_layout();
-        let backward_layout_ref = unsafe { &*(backward_layout as *const _) };
+        // Ensure the layout is populated while we hold &mut self.
+        self.get_backward_workspace_layout();
+        // The mutable borrow from get_backward_workspace_layout ends here.
+        // Now take a plain immutable borrow of the populated field.
+        let backward_layout_ref = self.backward_workspace_layout.as_deref().unwrap();
 
         let shader = self
             .device

@@ -1,30 +1,37 @@
 [package]
 name = "arkan"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "High-performance KAN (Kolmogorov-Arnold Network) for poker solver"
+# Determined empirically, not guessed: 1.72 fails on our own `div_ceil`
+# (`int_roundings`, stable since 1.73) at src/config.rs:287; 1.73 builds the lib
+# with default features and with `serde`. Optional features need more, because
+# their dependencies do: `parallel` needs 1.80 (rayon-core), `gpu` needs 1.85
+# (indexmap, via wgpu 23 -> naga). CI pins the default-feature MSRV; see
+# .github/workflows/ci.yml and the MSRV table in README.md.
+# ponytail: no Cargo.lock is committed (it is in .gitignore), so CI always
+# resolves the newest compatible dependencies and this floor drifts upward on
+# its own. The `msrv` job is what tells us it moved; the fix is to bump this line.
+rust-version = "1.73"
+description = "Embeddable Kolmogorov-Arnold Networks: SIMD B-spline inference, int8 quantized deployment, optional wgpu GPU backend"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/LutwigStack/ArKan"
 documentation = "https://docs.rs/arkan"
 readme = "README.md"
 keywords = ["kan", "ml", "simd", "spline", "inference"]
 categories = ["algorithms", "science"]
-exclude = ["target/*", "scripts/*", ".github/*", "README for KAN.md"]
+exclude = ["target/*", "scripts/*", ".github/*", "README for KAN.md", "docs/audit/*", "docs/FUNCTIONALITY_AUDIT.md", "tasks/*", "RELEASING.md"]
 
 [dependencies]
 # SIMD abstractions
 wide = "0.7"
 rand = { version = "0.8", features = ["small_rng"] }
 
-# Parallelism
-rayon = "1.10"
+# Parallelism (optional, `parallel` feature)
+rayon = { version = "1.10", optional = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"], optional = true }
 bincode = { version = "1.3", optional = true }
-
-# Half precision (optional, for baked models)
-half = { version = "2.4", optional = true }
 
 # Error handling
 thiserror = "1.0"
@@ -43,11 +50,11 @@ serde = { version = "1.0", features = ["derive"] }
 
 [features]
 default = []
-simd = []
-parallel = []
+# Rayon-backed multi-core paths: `KanLayer::backward_parallel`,
+# `KanNetwork::forward_batch_parallel`, and the automatic parallel branch of
+# `train_step`'s backward pass above `KanConfig::multithreading_threshold`.
+parallel = ["dep:rayon"]
 serde = ["dep:serde", "dep:bincode"]
-quantization = ["half"]
-nightly = []  # For SIMD intrinsics that require nightly
 gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster", "dep:log"]
 
 [[bench]]
@@ -79,6 +86,10 @@ name = "latency"
 harness = false
 
 [[bench]]
+name = "baked"
+harness = false
+
+[[bench]]
 name = "gpu_forward"
 harness = false
 required-features = ["gpu"]
@@ -86,10 +97,6 @@ required-features = ["gpu"]
 [[bench]]
 name = "gpu_backward"
 harness = false
-required-features = ["gpu"]
-
-[[example]]
-name = "gpu_comprehensive_test"
 required-features = ["gpu"]
 
 # game2048 is a separate project with its own Cargo.toml in examples/game2048/

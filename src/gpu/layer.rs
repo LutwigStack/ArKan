@@ -37,7 +37,7 @@ use wgpu::util::DeviceExt;
 /// - `grad_weights`: accumulated gradients for weights
 /// - `grad_bias`: accumulated gradients for bias
 ///
-/// These buffers are used by GPU-native optimizers ([`GpuAdam`], [`GpuSgd`])
+/// These buffers are used by GPU-native optimizers ([`GpuAdam`](crate::gpu::GpuAdam), [`GpuSgd`](crate::gpu::GpuSgd))
 /// to update weights entirely on GPU without CPU transfers.
 pub struct GpuLayer {
     /// Weight tensor [out_dim, in_dim, basis_vec4s] stored as vec4.
@@ -348,11 +348,11 @@ impl GpuLayer {
     /// - `grad_weights`: same size as weights buffer
     /// - `grad_bias`: same size as bias buffer
     ///
-    /// These buffers are used by [`GpuAdam`] and [`GpuSgd`] optimizers.
+    /// These buffers are used by [`GpuAdam`](crate::gpu::GpuAdam) and [`GpuSgd`](crate::gpu::GpuSgd) optimizers.
     ///
     /// # Errors
     ///
-    /// Returns [`ArkanError::BufferError`] if buffer creation fails.
+    /// Returns [`ArkanError::BufferError`](crate::ArkanError::BufferError) if buffer creation fails.
     pub fn init_training(&mut self, device: &wgpu::Device) -> crate::ArkanResult<()> {
         use crate::ArkanError;
 
@@ -420,7 +420,7 @@ impl GpuLayer {
     ///
     /// # Errors
     ///
-    /// Returns [`ArkanError::InvalidWorkspace`] if training is not initialized.
+    /// Returns [`ArkanError::InvalidWorkspace`](crate::ArkanError::InvalidWorkspace) if training is not initialized.
     #[inline]
     pub fn grad_weights_buffer(&self) -> crate::ArkanResult<&wgpu::Buffer> {
         use crate::ArkanError;
@@ -439,7 +439,7 @@ impl GpuLayer {
     ///
     /// # Errors
     ///
-    /// Returns [`ArkanError::InvalidWorkspace`] if training is not initialized.
+    /// Returns [`ArkanError::InvalidWorkspace`](crate::ArkanError::InvalidWorkspace) if training is not initialized.
     #[inline]
     pub fn grad_bias_buffer(&self) -> crate::ArkanResult<&wgpu::Buffer> {
         use crate::ArkanError;

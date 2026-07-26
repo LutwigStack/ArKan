@@ -327,22 +327,6 @@ impl AlignedBuffer {
         self.len = new_len;
     }
 
-    /// Resizes the buffer without initializing new elements.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure that all elements in `[old_len, new_len)` are written
-    /// before being read. This is useful for hot paths where the buffer will be
-    /// completely overwritten (e.g., forward pass output).
-    ///
-    /// Note: Due to our zero-initialization invariant, this is actually safe,
-    /// but we keep it marked unsafe as a reminder that the data may be stale.
-    #[inline]
-    pub unsafe fn resize_uninitialized(&mut self, new_len: usize) {
-        self.reserve(new_len);
-        self.len = new_len;
-    }
-
     /// Tries to resize, returning error on overflow.
     #[inline]
     pub fn try_resize(&mut self, new_len: usize) -> ArkanResult<()> {
@@ -356,12 +340,6 @@ impl AlignedBuffer {
         Ok(())
     }
 
-    /// Clears the buffer (sets len to 0, doesn't deallocate).
-    #[inline]
-    pub fn clear(&mut self) {
-        self.len = 0;
-    }
-
     /// Fills the current length with zeros.
     #[inline]
     pub fn zero(&mut self) {
@@ -369,16 +347,6 @@ impl AlignedBuffer {
             // SAFETY: buffer is allocated and len > 0
             unsafe {
                 std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len);
-            }
-        }
-    }
-
-    /// Fills the entire capacity with zeros (useful after resize_uninitialized).
-    #[inline]
-    pub fn zero_all(&mut self) {
-        if self.capacity > 0 {
-            unsafe {
-                std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.capacity);
             }
         }
     }
@@ -736,6 +704,10 @@ pub struct Workspace {
     pub basis_derivs: AlignedBuffer,
 
     /// Grid indices: `[Batch, Input]`
+    ///
+    /// The high bit carries [`crate::SPAN_CLAMPED_FLAG`] when the forward pass
+    /// clamped that input to the grid range; mask with
+    /// [`crate::SPAN_INDEX_MASK`] before using an entry as a span index.
     pub grid_indices: Vec<u32>,
 
     /// Intermediate layer outputs: `[Batch, MaxHiddenDim]`
@@ -756,6 +728,10 @@ pub struct Workspace {
     ///
     /// The spline segment index for each input, recorded during forward.
     /// Used in backward to index into the correct spline weights.
+    ///
+    /// As with [`Workspace::grid_indices`], the high bit is
+    /// [`crate::SPAN_CLAMPED_FLAG`] and must be masked off with
+    /// [`crate::SPAN_INDEX_MASK`] before use as an index.
     pub layers_grid_indices: Vec<Vec<u32>>,
 
     /// Gradient buffer passed between layers during backprop: `[Batch, MaxDim]`.
@@ -1001,11 +977,19 @@ impl Workspace {
         self.basis_derivs.reserve(deriv_size);
         self.basis_derivs.resize(deriv_size);
 
-        // Training ping-pong buffers
+        // Training ping-pong buffers.
+        //
+        // `predictions_buffer` is deliberately NOT sized here. Its only consumer,
+        // `KanNetwork::try_forward_backward_mse`, sizes it itself and then
+        // `std::mem::take`s it to dodge a borrow conflict before calling into the
+        // forward pass — which lands here. Re-reserving it at that point allocates a
+        // fresh buffer for the field the caller just emptied, and the caller then
+        // overwrites it with the original on the way out, throwing the new one away.
+        // That was one heap allocation on every single training step, which is what
+        // the "zero-allocation training" claim tripped over. Pinned by
+        // tests/allocation_budget.rs.
         let output_dim = config.output_dim;
         let output_size = checked_buffer_size(batch_size, output_dim)?;
-        self.predictions_buffer.reserve(output_size);
-        self.predictions_buffer.resize(output_size);
 
         self.grad_output.reserve(output_size);
         self.grad_output.resize(output_size);
@@ -1022,7 +1006,10 @@ impl Workspace {
     /// - `layers_grid_indices`: one vec per layer for saved spline indices
     /// - `layer_grads`, `staging_buffer`: ping-pong gradient buffers
     /// - `basis_derivs`: B-spline derivative values
-    /// - `predictions_buffer`, `grad_output`: loss computation buffers
+    /// - `grad_output`: loss gradient buffer
+    ///
+    /// Note: `predictions_buffer` is NOT sized here — its consumer sizes and owns it.
+    /// See the comment at the call site below.
     ///
     /// # Zero-Allocation Guarantee
     ///
@@ -1127,27 +1114,38 @@ impl Workspace {
         Ok(())
     }
 
+    /// Zeros all gradient buffers in-place without reallocation.
+    ///
+    /// Call this at the start of each training step to clear gradients
+    /// from the previous iteration. This is more efficient than reallocating
+    /// the buffers.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork, Workspace};
+    ///
+    /// let config = KanConfig::preset();
+    /// let network = KanNetwork::new(config.clone());
+    /// let mut workspace = network.create_workspace(64);
+    ///
+    /// // After training step, zero grads for next iteration
+    /// workspace.zero_grads();
+    /// ```
+    #[inline]
+    pub fn zero_grads(&mut self) {
+        for wg in &mut self.weight_grads {
+            wg.fill(0.0);
+        }
+        for bg in &mut self.bias_grads {
+            bg.fill(0.0);
+        }
+    }
+
     /// Current batch capacity.
     #[inline]
     pub fn batch_capacity(&self) -> usize {
         self.batch_capacity
-    }
-
-    /// Returns the history batch size.
-    #[inline]
-    pub fn history_batch_size(&self) -> usize {
-        self.history_batch_size
-    }
-
-    /// Asserts that workspace is properly sized for the batch.
-    #[inline]
-    pub fn assert_history_batch(&self, batch_size: usize) {
-        assert!(
-            self.history_batch_size == batch_size,
-            "Workspace history batch {} != requested {}",
-            self.history_batch_size,
-            batch_size
-        );
     }
 
     /// Checks that workspace history matches the expected batch size.
@@ -1161,36 +1159,6 @@ impl Workspace {
                 &[batch_size],
                 &[self.history_batch_size],
             ));
-        }
-        Ok(())
-    }
-
-    /// Asserts that workspace is properly sized for the batch.
-    #[inline]
-    pub fn assert_capacity(&self, batch_size: usize) {
-        assert!(
-            batch_size <= self.batch_capacity,
-            "Workspace capacity {} < batch size {}",
-            self.batch_capacity,
-            batch_size
-        );
-    }
-
-    /// Validates workspace state, returning error if invalid.
-    #[inline]
-    pub fn validate(&self) -> ArkanResult<()> {
-        // Check that ping-pong buffers have capacity
-        if self.batch_capacity > 0 {
-            if self.layer_output.capacity() == 0 && self.max_dim > 0 {
-                return Err(ArkanError::invalid_workspace(
-                    "layer_output buffer is empty after previous operation",
-                ));
-            }
-            if self.layer_input.capacity() == 0 && self.max_dim > 0 {
-                return Err(ArkanError::invalid_workspace(
-                    "layer_input buffer is empty after previous operation",
-                ));
-            }
         }
         Ok(())
     }
@@ -1279,31 +1247,11 @@ impl<'a> WorkspaceGuard<'a> {
         )
     }
 
-    /// Takes buffer_a, leaving None in its place.
-    /// The buffer will NOT be returned to workspace on drop.
-    #[inline]
-    pub fn take_buffer_a(&mut self) -> AlignedBuffer {
-        self.buffer_a.take().expect("buffer_a already taken")
-    }
-
-    /// Takes buffer_b, leaving None in its place.
-    /// The buffer will NOT be returned to workspace on drop.
-    #[inline]
-    pub fn take_buffer_b(&mut self) -> AlignedBuffer {
-        self.buffer_b.take().expect("buffer_b already taken")
-    }
-
     /// Explicitly returns buffers to workspace and consumes the guard.
     /// This is the normal completion path (no panic).
     #[inline]
     pub fn finish(mut self) {
         self.return_buffers();
-    }
-
-    /// Returns the workspace reference for accessing other fields.
-    #[inline]
-    pub fn workspace(&mut self) -> &mut Workspace {
-        self.workspace
     }
 
     fn return_buffers(&mut self) {
@@ -1413,21 +1361,6 @@ mod tests {
     }
 
     #[test]
-    fn test_aligned_buffer_zero_all() {
-        let mut buf = AlignedBuffer::with_capacity(100);
-        buf.resize(50);
-        for i in 0..50 {
-            buf[i] = 1.0;
-        }
-
-        buf.zero();
-
-        for i in 0..50 {
-            assert_eq!(buf[i], 0.0);
-        }
-    }
-
-    #[test]
     fn test_aligned_buffer_try_reserve() {
         let mut buf = AlignedBuffer::new();
 
@@ -1488,15 +1421,6 @@ mod tests {
         // Buffers should still be returned
         assert!(ws.layer_output.capacity() >= 200);
         assert!(ws.layer_input.capacity() > 0);
-    }
-
-    #[test]
-    fn test_workspace_validate() {
-        let config = KanConfig::preset();
-        let ws = Workspace::new(&config);
-
-        // Fresh workspace should be valid
-        assert!(ws.validate().is_ok());
     }
 
     #[test]

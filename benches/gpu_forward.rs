@@ -596,7 +596,7 @@ fn estimate_gpu_memory_bytes(config: &KanConfig, batch_size: usize) -> usize {
         let out_dim = layer_dims[i + 1];
 
         // Weights: [out_dim][in_dim][basis_size] (padded to vec4)
-        let padded_basis = ((basis_size + 3) / 4) * 4;
+        let padded_basis = basis_size.div_ceil(4) * 4;
         total_bytes += out_dim * in_dim * padded_basis * 4;
 
         // Bias: [out_dim]

@@ -10,12 +10,12 @@
 
 /// Forward pass shader for KAN layer (cubic B-spline, order=3).
 ///
-/// Computes: y[j] = Σᵢ Σₖ weights[j,i,k] · B_k(x[i]) + bias[j]
+/// Computes: `y[j] = Σᵢ Σₖ weights[j,i,k] · B_k(x[i]) + bias[j]`
 ///
 /// # Bind Groups
 ///
 /// - Group 0 (Static):
-///   - Binding 0: weights (storage, read) - array<vec4<f32>>, layout [out_dim, in_dim, basis_vec4s]
+///   - Binding 0: weights (storage, read) - `array<vec4<f32>>`, layout `[out_dim, in_dim, basis_vec4s]`
 ///   - Binding 1: bias (storage, read) - `(out_dim,)`
 ///   - Binding 2: config (uniform) - LayerUniforms
 ///
@@ -32,7 +32,7 @@
 /// Weights are stored as `array<vec4<f32>>` where basis_vec4s = ceil(basis_padded / 4).
 /// Each vec4 contains 4 consecutive basis weights. Access pattern:
 /// - vec4_idx = basis_idx / 4
-/// - component = basis_idx % 4 (use indexing: v[0], v[1], v[2], v[3])
+/// - component = basis_idx % 4 (use indexing: `v[0]`, `v[1]`, `v[2]`, `v[3]`)
 ///
 /// # Bounds Safety
 ///
@@ -416,12 +416,12 @@ fn add_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 ///
 /// **Strategy: Per-weight-element parallelism with batch reduction**
 ///
-/// Each thread handles ONE weight element grad_weights[j,i,k] and reduces
+/// Each thread handles ONE weight element `grad_weights[j,i,k]` and reduces
 /// across all batch samples. No race conditions since each weight is updated
 /// by exactly one thread.
 ///
 /// Computes:
-/// - grad_weights[j,i,k] = Σ_batch grad_output[b,j] * basis_values[b,i,k]
+/// - `grad_weights[j,i,k] = Σ_batch grad_output[b,j] * basis_values[b,i,k]`
 ///
 /// # Bind Groups
 ///
@@ -434,9 +434,9 @@ fn add_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 ///   - Binding 1: span_indices (storage, read) - span indices [batch, in_dim]
 ///   - Binding 2: grad_output (storage, read) - [batch, out_dim]
 ///   - Binding 3: grad_weights (storage, read_write) - [out_dim, in_dim, basis_padded]
-///   - Binding 4: grad_bias (storage, read_write) - [out_dim] (unused here, see bias shader)
+///   - Binding 4: grad_bias (storage, read_write) - `[out_dim]` (unused here, see bias shader)
 ///   - Binding 5: grad_input (storage, read_write) - [batch, in_dim] (unused here, see input_grad shader)
-///   - Binding 6: std_inv (storage, read) - 1/std for each input dim [in_dim]
+///   - Binding 6: std_inv (storage, read) - 1/std for each input dim `[in_dim]`
 ///
 /// # Workgroup
 ///
@@ -553,8 +553,9 @@ fn backward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
         
         let z = z_values[input_idx];
-        let span = span_indices[input_idx];
-        
+        // High bit is the clamp flag written by the forward pass; mask it off.
+        let span = span_indices[input_idx] & 0x7FFFFFFFu;
+
         // Check if this weight k is active for this span
         // Active basis indices are: span, span+1, span+2, span+3
         if (k < span || k > span + 3u) {
@@ -582,11 +583,11 @@ fn backward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 ///
 /// **Strategy: Per-input-element parallelism with output reduction**
 ///
-/// Each thread handles ONE input element grad_input[b,i] and reduces
+/// Each thread handles ONE input element `grad_input[b,i]` and reduces
 /// across all output dimensions j.
 ///
 /// Computes:
-/// - grad_input[b,i] = Σ_j Σ_k grad_output[b,j] * weights[j,i,k] * basis_deriv[k] * scale
+/// - `grad_input[b,i] = Σ_j Σ_k grad_output[b,j] * weights[j,i,k] * basis_deriv[k] * scale`
 ///
 /// # Bind Groups (same as BACKWARD_WEIGHTS_SHADER)
 ///
@@ -691,22 +692,28 @@ fn backward_input_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
     
     let z = z_values[input_idx];
-    let span = span_indices[input_idx];
-    
+    let stored_span = span_indices[input_idx];
+    let span = stored_span & 0x7FFFFFFFu;
+
     let grid_size_f = f32(config.grid_size);
     let grid_range = config.grid_max - config.grid_min;
     let t_norm = (z - config.grid_min) / grid_range;
     let t_grid = t_norm * grid_size_f;
     let t_local = t_grid - f32(span);
-    
+
     let deriv = cubic_basis_deriv(t_local);
-    
+
     // Bounds check on std_inv
     var scale_factor = 1.0;
     if (i < arrayLength(&std_inv)) {
         scale_factor = grid_size_f / grid_range * std_inv[i];
     }
-    
+    // dz/dx is 0 where the forward pass clamped this input: the output does not
+    // depend on x at all, so neither may the gradient.
+    if ((stored_span & 0x80000000u) != 0u) {
+        scale_factor = 0.0;
+    }
+
     let grad_out_len = arrayLength(&grad_output);
     
     var grad_sum = 0.0;
@@ -742,7 +749,7 @@ fn backward_input_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
 /// Bias gradient reduction shader.
 ///
-/// Computes: grad_bias[j] = Σ_batch grad_output[batch, j]
+/// Computes: `grad_bias[j] = Σ_batch grad_output[batch, j]`
 ///
 /// This is separated to avoid atomic contention in the main backward pass.
 ///
@@ -892,24 +899,32 @@ fn forward_training_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             continue;
         }
         
-        var x = input[input_idx];
-        
+        let raw = input[input_idx];
+        var x = raw;
+
         x = clamp(x, config.grid_min, config.grid_max);
         let t_norm = (x - config.grid_min) / grid_range;
         let t_grid = t_norm * grid_size_f;
         let span = clamp(u32(floor(t_grid)), 0u, config.grid_size - 1u);
         let t_local = t_grid - f32(span);
-        
-        // Save for backward pass (only first output thread per batch writes)
+
+        // Save for backward pass (only first output thread per batch writes).
+        // The high bit of the span records saturation: dz/dx is 0 there, and the
+        // clamped z alone cannot tell backward that. Must match the CPU's
+        // SPAN_CLAMPED_FLAG.
+        var stored_span = span;
+        if (x != raw) {
+            stored_span = span | 0x80000000u;
+        }
         if (out_idx == 0u) {
             if (input_idx < z_len) {
                 z_values[input_idx] = x;
             }
             if (input_idx < span_len) {
-                span_indices[input_idx] = span;
+                span_indices[input_idx] = stored_span;
             }
         }
-        
+
         let basis = cubic_basis(t_local);
         let weight_base_vec4 = (out_idx * config.in_dim + in_idx) * basis_vec4s;
         
@@ -939,12 +954,12 @@ fn forward_training_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 /// Updates weights using Adam algorithm with bias correction.
 ///
 /// Computes for each parameter i:
-/// - m[i] = beta1 * m[i] + (1 - beta1) * grad[i]
-/// - v[i] = beta2 * v[i] + (1 - beta2) * grad[i]^2
-/// - m_hat = m[i] / (1 - beta1^t)
-/// - v_hat = v[i] / (1 - beta2^t)
-/// - param[i] -= lr * m_hat / (sqrt(v_hat) + epsilon)
-/// - param[i] -= weight_decay * param[i]  (decoupled weight decay)
+/// - `m[i] = beta1 * m[i] + (1 - beta1) * grad[i]`
+/// - `v[i] = beta2 * v[i] + (1 - beta2) * grad[i]^2`
+/// - `m_hat = m[i] / (1 - beta1^t)`
+/// - `v_hat = v[i] / (1 - beta2^t)`
+/// - `param[i] -= lr * m_hat / (sqrt(v_hat) + epsilon)`
+/// - `param[i] -= weight_decay * param[i]`  (decoupled weight decay)
 ///
 /// # Bind Groups
 ///
@@ -1026,9 +1041,9 @@ fn adam_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 /// SGD optimizer compute shader with momentum.
 ///
 /// Computes:
-/// - velocity[i] = momentum * velocity[i] + grad[i]
-/// - param[i] -= lr * velocity[i]
-/// - param[i] -= weight_decay * param[i]  (decoupled weight decay)
+/// - `velocity[i] = momentum * velocity[i] + grad[i]`
+/// - `param[i] -= lr * velocity[i]`
+/// - `param[i] -= weight_decay * param[i]`  (decoupled weight decay)
 ///
 /// # Bounds Safety
 ///
@@ -1213,9 +1228,9 @@ fn bspline_basis(t: f32) -> array<f32, 5> {
     
     var result: array<f32, 5>;
     result[0] = omt4 / 24.0;
-    result[1] = (4.0 * t4 - 12.0 * t3 + 6.0 * t2 + 12.0 * t + 1.0) / 24.0;
-    result[2] = (-6.0 * t4 + 12.0 * t3 + 6.0 * t2 - 12.0 * t + 11.0) / 24.0;
-    result[3] = (4.0 * t4 - 4.0 * t3 - 6.0 * t2 - 4.0 * t + 11.0) / 24.0;
+    result[1] = (-4.0 * t4 + 12.0 * t3 - 6.0 * t2 - 12.0 * t + 11.0) / 24.0;
+    result[2] = (6.0 * t4 - 12.0 * t3 - 6.0 * t2 + 12.0 * t + 11.0) / 24.0;
+    result[3] = (-4.0 * t4 + 4.0 * t3 + 6.0 * t2 + 4.0 * t + 1.0) / 24.0;
     result[4] = t4 / 24.0;
     return result;
 }
@@ -1246,9 +1261,9 @@ fn bspline_basis(t: f32) -> array<f32, 6> {
     
     var result: array<f32, 6>;
     result[0] = omt5 / 120.0;
-    result[1] = (5.0 * t5 - 20.0 * t4 + 20.0 * t3 + 20.0 * t2 - 20.0 * t + 26.0) / 120.0;
-    result[2] = (-10.0 * t5 + 30.0 * t4 - 20.0 * t2 + 66.0) / 120.0;
-    result[3] = (10.0 * t5 - 20.0 * t4 - 20.0 * t3 + 20.0 * t2 + 20.0 * t + 26.0) / 120.0;
+    result[1] = (5.0 * t5 - 20.0 * t4 + 20.0 * t3 + 20.0 * t2 - 50.0 * t + 26.0) / 120.0;
+    result[2] = (-10.0 * t5 + 30.0 * t4 - 60.0 * t2 + 66.0) / 120.0;
+    result[3] = (10.0 * t5 - 20.0 * t4 - 20.0 * t3 + 20.0 * t2 + 50.0 * t + 26.0) / 120.0;
     result[4] = (-5.0 * t5 + 5.0 * t4 + 10.0 * t3 + 10.0 * t2 + 5.0 * t + 1.0) / 120.0;
     result[5] = t5 / 120.0;
     return result;
@@ -1320,9 +1335,9 @@ fn bspline_deriv(t: f32) -> array<f32, 5> {
     
     var result: array<f32, 5>;
     result[0] = -omt3 / 6.0;
-    result[1] = (16.0 * t3 - 36.0 * t2 + 12.0 * t + 12.0) / 24.0;
-    result[2] = (-24.0 * t3 + 36.0 * t2 + 12.0 * t - 12.0) / 24.0;
-    result[3] = (16.0 * t3 - 12.0 * t2 - 12.0 * t - 4.0) / 24.0;
+    result[1] = (-16.0 * t3 + 36.0 * t2 - 12.0 * t - 12.0) / 24.0;
+    result[2] = (24.0 * t3 - 36.0 * t2 - 12.0 * t + 12.0) / 24.0;
+    result[3] = (-16.0 * t3 + 12.0 * t2 + 12.0 * t + 4.0) / 24.0;
     result[4] = t3 / 6.0;
     return result;
 }
@@ -1345,9 +1360,9 @@ fn bspline_deriv(t: f32) -> array<f32, 6> {
     
     var result: array<f32, 6>;
     result[0] = -omt4 / 24.0;
-    result[1] = (25.0 * t4 - 80.0 * t3 + 60.0 * t2 + 40.0 * t - 20.0) / 120.0;
-    result[2] = (-50.0 * t4 + 120.0 * t3 - 40.0 * t) / 120.0;
-    result[3] = (50.0 * t4 - 80.0 * t3 - 60.0 * t2 + 40.0 * t + 20.0) / 120.0;
+    result[1] = (25.0 * t4 - 80.0 * t3 + 60.0 * t2 + 40.0 * t - 50.0) / 120.0;
+    result[2] = (-50.0 * t4 + 120.0 * t3 - 120.0 * t) / 120.0;
+    result[3] = (50.0 * t4 - 80.0 * t3 - 60.0 * t2 + 40.0 * t + 50.0) / 120.0;
     result[4] = (-25.0 * t4 + 20.0 * t3 + 30.0 * t2 + 20.0 * t + 5.0) / 120.0;
     result[5] = t4 / 24.0;
     return result;
@@ -1587,8 +1602,9 @@ fn backward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
         }}
         
         let z = z_values[input_idx];
-        let span = span_indices[input_idx];
-        
+        // High bit is the clamp flag written by the forward pass; mask it off.
+        let span = span_indices[input_idx] & 0x7FFFFFFFu;
+
         // Check if this weight k is active for this span
         if (k < span || k >= span + ACTIVE_BASIS_COUNT) {{
             continue;
@@ -1697,21 +1713,26 @@ fn backward_input_main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
     }}
     
     let z = z_values[input_idx];
-    let span = span_indices[input_idx];
-    
+    let stored_span = span_indices[input_idx];
+    let span = stored_span & 0x7FFFFFFFu;
+
     let grid_size_f = f32(config.grid_size);
     let grid_range = config.grid_max - config.grid_min;
     let t_norm = (z - config.grid_min) / grid_range;
     let t_grid = t_norm * grid_size_f;
     let t_local = t_grid - f32(span);
-    
+
     let deriv = bspline_deriv(t_local);
-    
+
     var scale_factor = 1.0;
     if (i < arrayLength(&std_inv)) {{
         scale_factor = grid_size_f / grid_range * std_inv[i];
     }}
-    
+    // dz/dx is 0 for a clamped input; must match the CPU backward.
+    if ((stored_span & 0x80000000u) != 0u) {{
+        scale_factor = 0.0;
+    }}
+
     let grad_out_len = arrayLength(&grad_output);
     
     var grad_sum = 0.0;
@@ -1832,24 +1853,30 @@ fn forward_training_main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
             continue;
         }}
         
-        var x = input[input_idx];
-        
+        let raw = input[input_idx];
+        var x = raw;
+
         x = clamp(x, config.grid_min, config.grid_max);
         let t_norm = (x - config.grid_min) / grid_range;
         let t_grid = t_norm * grid_size_f;
         let span = clamp(u32(floor(t_grid)), 0u, config.grid_size - 1u);
         let t_local = t_grid - f32(span);
-        
-        // Save for backward pass (only first output thread per batch writes)
+
+        // High bit of the stored span = "this input was clamped", so backward can
+        // zero dz/dx. Must match the CPU's SPAN_CLAMPED_FLAG.
+        var stored_span = span;
+        if (x != raw) {{
+            stored_span = span | 0x80000000u;
+        }}
         if (out_idx == 0u) {{
             if (input_idx < z_len) {{
                 z_values[input_idx] = x;
             }}
             if (input_idx < span_len) {{
-                span_indices[input_idx] = span;
+                span_indices[input_idx] = stored_span;
             }}
         }}
-        
+
         let basis = bspline_basis(t_local);
         let weight_base_vec4 = (out_idx * config.in_dim + in_idx) * basis_vec4s;
         

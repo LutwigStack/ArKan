@@ -29,7 +29,7 @@
 //!
 //! | Parameter | Typical Values | Effect |
 //! |-----------|---------------|--------|
-//! | `grid_size` | 3-16 | More intervals = finer control, more params |
+//! | `grid_size` | 3-64 | More intervals = finer control, more params |
 //! | `spline_order` | 2-5 | Higher = smoother functions, more compute |
 //!
 //! **Recommended**: `grid_size=5`, `spline_order=3` (cubic) for balanced performance.
@@ -54,6 +54,13 @@ pub const EPSILON: f32 = 1e-6;
 /// A grid size of 5 provides a good balance between expressiveness
 /// and computational cost for most applications.
 pub const DEFAULT_GRID_SIZE: usize = 5;
+
+/// Maximum supported grid size.
+///
+/// Higher grid sizes allow finer control of the spline functions,
+/// but increase memory usage and computation time quadratically.
+/// For most applications, grid_size <= 16 is sufficient.
+pub const MAX_GRID_SIZE: usize = 64;
 
 /// Default spline order (cubic).
 ///
@@ -163,6 +170,10 @@ pub struct KanConfig {
 
     /// Batch size threshold for multithreading.
     /// Batches smaller than this are processed single-threaded.
+    ///
+    /// Only consulted with the `parallel` feature enabled. Without it the
+    /// backward pass has no parallel branch to switch to and this value is
+    /// ignored.
     pub multithreading_threshold: usize,
 
     /// SIMD vector width for basis alignment (8 for AVX2, 16 for AVX-512).
@@ -311,10 +322,13 @@ impl KanConfig {
     ///
     /// Returns [`ConfigError`] if:
     /// - Dimensions are zero
-    /// - `grid_size` not in 1..=16
+    /// - `grid_size` not in 1..=[`MAX_GRID_SIZE`] (64)
     /// - `spline_order` not in 1..=[`MAX_SPLINE_ORDER`]
+    ///   - Note: `spline_order = 1` is valid but produces a degenerate step function,
+    ///     not a smooth spline. Consider `spline_order >= 2` for smooth approximation.
     /// - `grid_range.0 >= grid_range.1`
     /// - Normalization arrays don't match `input_dim`
+    /// - Any `input_std[i] <= 0` (callers wanting EPSILON clamping must apply it before validation)
     /// - `simd_width` is not 4, 8, or 16
     ///
     /// # Example
@@ -342,7 +356,7 @@ impl KanConfig {
                 "output_dim must be > 0",
             )));
         }
-        if self.grid_size == 0 || self.grid_size > 16 {
+        if self.grid_size == 0 || self.grid_size > MAX_GRID_SIZE {
             return Err(ConfigError::InvalidGridSize(self.grid_size));
         }
         if self.spline_order == 0 || self.spline_order > MAX_SPLINE_ORDER {
@@ -357,31 +371,19 @@ impl KanConfig {
         if self.input_std.len() != self.input_dim {
             return Err(ConfigError::MismatchedNormalization("input_std"));
         }
-        // Warn about zero/negative values in input_std (will be clamped to EPSILON)
+        // Reject non-positive input_std — silently clamping to EPSILON would distort features.
+        // Callers wanting EPSILON clamping must apply it explicitly before calling validate().
         if self.input_std.iter().any(|&s| s <= 0.0) {
-            #[cfg(feature = "gpu")]
-            log::warn!(
-                "input_std contains zero or negative values; will be clamped to EPSILON ({})",
-                EPSILON
-            );
-            #[cfg(not(feature = "gpu"))]
-            eprintln!(
-                "Warning: input_std contains zero or negative values; will be clamped to EPSILON ({})",
-                EPSILON
-            );
+            return Err(ConfigError::NonPositiveInputStd);
         }
         // init_seed: any value is acceptable, None => random
         // SIMD width must be a power of 2 (4, 8, 16)
         if !matches!(self.simd_width, 4 | 8 | 16) {
             return Err(ConfigError::InvalidSimdWidth(self.simd_width));
         }
-        // Ensure order+1 <= global_basis_size (always true, but verify)
-        let global_basis = self.basis_size();
-        if self.spline_order + 1 > global_basis {
-            return Err(ConfigError::InvalidDimension(Cow::Borrowed(
-                "spline_order + 1 must be <= grid_size + spline_order",
-            )));
-        }
+        // Note: `spline_order + 1 > grid_size + spline_order` is always false, so
+        // the check is omitted. The basis_size() = grid_size + spline_order already
+        // satisfies order+1 <= basis for all valid grid_size >= 1.
         Ok(())
     }
 
@@ -392,14 +394,21 @@ impl KanConfig {
     /// * `mean` - Per-feature mean values, length must equal `input_dim`
     /// * `std` - Per-feature standard deviations, clamped to [`EPSILON`] minimum
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Debug-asserts if `mean.len() != input_dim` or `std.len() != input_dim`.
-    pub fn set_normalization(&mut self, mean: Vec<f32>, std: Vec<f32>) {
-        debug_assert_eq!(mean.len(), self.input_dim);
-        debug_assert_eq!(std.len(), self.input_dim);
+    /// Returns [`ConfigError::MismatchedNormalization`] if `mean.len()` or `std.len()`
+    /// does not equal `input_dim`. This replaces a previous `debug_assert` that was
+    /// silently ignored in release builds.
+    pub fn set_normalization(&mut self, mean: Vec<f32>, std: Vec<f32>) -> Result<(), ConfigError> {
+        if mean.len() != self.input_dim {
+            return Err(ConfigError::MismatchedNormalization("input_mean"));
+        }
+        if std.len() != self.input_dim {
+            return Err(ConfigError::MismatchedNormalization("input_std"));
+        }
         self.input_mean = mean;
         self.input_std = std.into_iter().map(|s| s.max(EPSILON)).collect();
+        Ok(())
     }
 }
 
@@ -441,8 +450,8 @@ pub enum ConfigError {
     #[error("Invalid dimension: {0}")]
     InvalidDimension(Cow<'static, str>),
 
-    /// Grid size is out of valid range (1-16).
-    #[error("Grid size must be 1-16, got {0}")]
+    /// Grid size is out of valid range (1 to [`MAX_GRID_SIZE`]).
+    #[error("Grid size must be 1-64, got {0}")]
     InvalidGridSize(usize),
 
     /// Spline order is out of valid range (1-7 for CPU, 2-5 for GPU).
@@ -460,6 +469,15 @@ pub enum ConfigError {
     /// SIMD width is not a valid value (4, 8, or 16).
     #[error("SIMD width must be 4, 8, or 16, got {0}")]
     InvalidSimdWidth(usize),
+
+    /// One or more `input_std` values are zero or negative.
+    ///
+    /// All standard deviations must be positive. If you want EPSILON clamping,
+    /// apply it explicitly before calling [`KanConfig::validate`].
+    #[error(
+        "input_std contains zero or negative values; all standard deviations must be positive"
+    )]
+    NonPositiveInputStd,
 }
 
 /// Builder for creating [`KanConfig`] with a fluent API.
@@ -583,6 +601,9 @@ impl KanConfigBuilder {
     ///
     /// Batches smaller than this are processed single-threaded.
     /// Default: 128.
+    ///
+    /// Ignored without the `parallel` feature — see
+    /// [`KanConfig::multithreading_threshold`].
     #[must_use]
     pub fn multithreading_threshold(mut self, threshold: usize) -> Self {
         self.multithreading_threshold = threshold;
@@ -687,11 +708,29 @@ mod tests {
 
     #[test]
     fn test_invalid_grid_size() {
+        // grid_size = 65 exceeds MAX_GRID_SIZE (64)
         let config = KanConfig {
-            grid_size: 20,
+            grid_size: 65,
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_valid_large_grid_size() {
+        // grid_size = 64 is now valid (MAX_GRID_SIZE)
+        let config = KanConfig {
+            grid_size: 64,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        // grid_size = 32 also valid
+        let config32 = KanConfig {
+            grid_size: 32,
+            ..Default::default()
+        };
+        assert!(config32.validate().is_ok());
     }
 
     #[test]
@@ -779,5 +818,122 @@ mod tests {
         // Should default to mean=0, std=1
         assert_eq!(config.input_mean, vec![0.0; 4]);
         assert_eq!(config.input_std, vec![1.0; 4]);
+    }
+
+    // ===== Validation hardening tests (WS06) =====
+
+    #[test]
+    fn test_non_positive_input_std_zero_errors() {
+        // input_dim=3, so mean and std must also be length 3
+        let config = KanConfig {
+            input_dim: 3,
+            output_dim: 1,
+            input_mean: vec![0.0; 3],
+            input_std: vec![1.0, 0.0, 1.0], // zero std
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::NonPositiveInputStd),
+            "expected NonPositiveInputStd, got {err:?}"
+        );
+        assert!(err.to_string().contains("zero or negative"));
+    }
+
+    #[test]
+    fn test_non_positive_input_std_negative_errors() {
+        let config = KanConfig {
+            input_dim: 3,
+            output_dim: 1,
+            input_mean: vec![0.0; 3],
+            input_std: vec![1.0, -0.5, 1.0], // negative std
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::NonPositiveInputStd
+        ));
+    }
+
+    #[test]
+    fn test_positive_input_std_ok() {
+        let config = KanConfig::default(); // std = 1.0 all
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_set_normalization_mismatched_mean_errors() {
+        let mut config = KanConfig::default(); // input_dim = 21
+        let err = config
+            .set_normalization(vec![0.0; 5], vec![1.0; 21])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::MismatchedNormalization("input_mean")
+        ));
+    }
+
+    #[test]
+    fn test_set_normalization_mismatched_std_errors() {
+        let mut config = KanConfig::default(); // input_dim = 21
+        let err = config
+            .set_normalization(vec![0.0; 21], vec![1.0; 5])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::MismatchedNormalization("input_std")
+        ));
+    }
+
+    #[test]
+    fn test_set_normalization_correct_lengths_ok() {
+        let mut config = KanConfig::default(); // input_dim = 21
+        assert!(config
+            .set_normalization(vec![0.0; 21], vec![1.0; 21])
+            .is_ok());
+    }
+
+    #[test]
+    fn test_grid_size_65_errors_with_correct_range_message() {
+        let config = KanConfig {
+            grid_size: 65,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidGridSize(65)));
+        let msg = err.to_string();
+        // Message must say 1-64 (MAX_GRID_SIZE), not the old 1-16
+        assert!(
+            msg.contains("1-64"),
+            "error message should contain '1-64', got: {msg}"
+        );
+        assert!(!msg.contains("1-16"), "old message '1-16' must not appear");
+    }
+
+    #[test]
+    fn test_grid_size_17_through_64_valid() {
+        for size in [17, 32, 48, 63, 64] {
+            let config = KanConfig {
+                grid_size: size,
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "grid_size={size} should be valid (MAX_GRID_SIZE=64)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_spline_order_1_valid() {
+        // order 1 is a degenerate step function but must remain valid (regression tests rely on it)
+        let config = KanConfig {
+            spline_order: 1,
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "spline_order=1 must remain valid"
+        );
     }
 }

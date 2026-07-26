@@ -1,7 +1,7 @@
 //! KAN-based DQN agent.
 
 use crate::env::Env;
-use arkan::{KanConfigBuilder, KanNetwork, Workspace, TrainOptions};
+use arkan::{KanConfigBuilder, KanNetwork, Workspace};
 
 /// KAN DQN Agent for CPU training.
 pub struct KanDqnAgent {
@@ -13,9 +13,6 @@ pub struct KanDqnAgent {
     workspace: Workspace,
     /// Output buffer.
     output: Vec<f32>,
-    /// Training options.
-    #[allow(dead_code)]
-    train_opts: TrainOptions,
     /// Learning rate.
     lr: f32,
 }
@@ -31,7 +28,20 @@ impl KanDqnAgent {
             .output_dim(4)         // 4 actions
             .spline_order(3)       // Cubic splines
             .grid_size(5)          // 5 grid points
-            .grid_range(0.0, 1.0)  // One-hot values are 0 or 1
+            // grid_range applies to EVERY layer, not just the input layer. Only layer 0
+            // gets input_mean/input_std; hidden layers use identity normalization, so a
+            // hidden layer's input is the previous layer's raw activation — which is not
+            // bounded to [0,1] just because the one-hot inputs are.
+            //
+            // This used to be (0.0, 1.0) "because one-hot values are 0 or 1". Measured
+            // consequence: layer0 0% saturated, but layer1 43.6% and layer2 48.9%, because
+            // every negative activation collapsed onto the lower bound (observed z range
+            // was [0.000, 0.801] — that exact 0.000 minimum is the clamp, not the data).
+            // Nearly half of each hidden layer was dead: constant output, zero gradient.
+            //
+            // With (-1.0, 1.0) saturation is 0% on all three layers and activations sit
+            // comfortably inside at [-0.771, 0.755] and [-0.604, 0.508].
+            .grid_range(-1.0, 1.0)
             .build()?;
 
         let policy_net = KanNetwork::new(config.clone());
@@ -39,17 +49,11 @@ impl KanDqnAgent {
         let workspace = Workspace::new(&config);
         let output = vec![0.0f32; 4];
 
-        let train_opts = TrainOptions {
-            max_grad_norm: Some(1.0), // Gradient clipping
-            weight_decay: 0.0,
-        };
-
         Ok(Self {
             policy_net,
             target_net,
             workspace,
             output,
-            train_opts,
             lr,
         })
     }
@@ -191,20 +195,6 @@ impl KanDqnAgent {
         &self.policy_net
     }
 
-    /// Soft update of target network (Polyak averaging).
-    #[allow(dead_code)]
-    pub fn soft_update_target(&mut self, tau: f32) {
-        for (policy_layer, target_layer) in self.policy_net.layers.iter()
-            .zip(self.target_net.layers.iter_mut())
-        {
-            for (tp, pp) in target_layer.weights.iter_mut().zip(policy_layer.weights.iter()) {
-                *tp = tau * pp + (1.0 - tau) * *tp;
-            }
-            for (tb, pb) in target_layer.bias.iter_mut().zip(policy_layer.bias.iter()) {
-                *tb = tau * pb + (1.0 - tau) * *tb;
-            }
-        }
-    }
 }
 
 impl super::Agent for KanDqnAgent {

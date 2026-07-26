@@ -6,6 +6,10 @@
 use crate::error::{ArkanError, ArkanResult};
 use std::sync::Arc;
 
+/// Default maximum VRAM allocation per buffer (2GB).
+/// Can be overridden via `WgpuOptions::max_vram_alloc`.
+pub const DEFAULT_MAX_VRAM_ALLOC: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Power preference for GPU adapter selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PowerPreference {
@@ -25,6 +29,46 @@ impl From<PowerPreference> for wgpu::PowerPreference {
     }
 }
 
+/// VRAM allocation limit specification.
+///
+/// Used to configure maximum buffer size in [`WgpuOptions`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VramLimit {
+    /// Absolute limit in bytes.
+    Bytes(u64),
+    /// Absolute limit in gigabytes.
+    Gigabytes(u64),
+    /// Percentage of device max_buffer_size (0-100).
+    /// Recommended: 25-30% to leave room for staging buffers and overhead.
+    Percent(u8),
+    /// Use device max_buffer_size (no ArKan-imposed limit).
+    Unlimited,
+}
+
+impl Default for VramLimit {
+    fn default() -> Self {
+        // Default: 2GB (conservative, works on most GPUs)
+        VramLimit::Bytes(DEFAULT_MAX_VRAM_ALLOC)
+    }
+}
+
+impl VramLimit {
+    /// Resolves the limit to actual bytes given device max_buffer_size.
+    pub fn resolve(&self, device_max_buffer_size: u64) -> u64 {
+        match self {
+            VramLimit::Bytes(b) => *b,
+            VramLimit::Gigabytes(gb) => gb * 1024 * 1024 * 1024,
+            VramLimit::Percent(p) => {
+                let p = (*p).min(100) as u64;
+                // Avoid overflow: divide first, then multiply
+                // This loses some precision but avoids overflow on u64::MAX
+                (device_max_buffer_size / 100) * p
+            }
+            VramLimit::Unlimited => device_max_buffer_size,
+        }
+    }
+}
+
 /// Options for initializing the wgpu backend.
 #[derive(Debug, Clone)]
 pub struct WgpuOptions {
@@ -39,6 +83,17 @@ pub struct WgpuOptions {
     pub required_features: wgpu::Features,
     /// Required limits (minimum).
     pub required_limits: wgpu::Limits,
+    /// If true, use maximum limits supported by the adapter instead of required_limits.
+    /// This allows using full GPU capabilities (e.g., larger buffers on desktop GPUs).
+    pub use_adapter_limits: bool,
+    /// Maximum VRAM allocation per buffer.
+    ///
+    /// Default is 2GB. Options:
+    /// - `VramLimit::Bytes(n)` - absolute limit in bytes
+    /// - `VramLimit::Gigabytes(n)` - absolute limit in GB
+    /// - `VramLimit::Percent(30)` - 30% of device max (recommended for large buffers)
+    /// - `VramLimit::Unlimited` - use device max_buffer_size
+    pub max_vram_alloc: VramLimit,
 }
 
 impl Default for WgpuOptions {
@@ -49,6 +104,8 @@ impl Default for WgpuOptions {
             force_adapter_name: None,
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::default(),
+            use_adapter_limits: true, // Use full GPU capabilities by default
+            max_vram_alloc: VramLimit::default(), // 2GB default
         }
     }
 }
@@ -70,6 +127,8 @@ impl WgpuOptions {
                 max_compute_invocations_per_workgroup: 256,
                 ..wgpu::Limits::default()
             },
+            use_adapter_limits: true,
+            max_vram_alloc: VramLimit::Unlimited, // Use device limits
         }
     }
 
@@ -81,6 +140,83 @@ impl WgpuOptions {
             force_adapter_name: None,
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::downlevel_defaults(),
+            use_adapter_limits: false, // Use conservative limits
+            max_vram_alloc: VramLimit::Bytes(512 * 1024 * 1024), // 512MB for low-memory
+        }
+    }
+
+    /// Creates options with specific required limits (no adapter limits).
+    pub fn with_limits(limits: wgpu::Limits) -> Self {
+        Self {
+            power_preference: PowerPreference::HighPerformance,
+            backend: None,
+            force_adapter_name: None,
+            required_features: wgpu::Features::empty(),
+            required_limits: limits,
+            use_adapter_limits: false,
+            max_vram_alloc: VramLimit::default(),
+        }
+    }
+
+    /// Creates options with custom max VRAM allocation in gigabytes.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_vram_gb` - Maximum VRAM per buffer in gigabytes.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use arkan::gpu::WgpuOptions;
+    ///
+    /// // For RTX 4070 SUPER (12GB), allow 8GB buffers
+    /// let options = WgpuOptions::with_max_vram(8);
+    /// ```
+    pub fn with_max_vram(max_vram_gb: u64) -> Self {
+        Self {
+            max_vram_alloc: VramLimit::Gigabytes(max_vram_gb),
+            ..Default::default()
+        }
+    }
+
+    /// Creates options with VRAM limit as percentage of device max.
+    ///
+    /// **Note:** Some drivers (NVIDIA) report `u64::MAX` as max_buffer_size,
+    /// making percentage-based limits effectively unlimited. For NVIDIA GPUs,
+    /// prefer `with_max_vram(gb)` with an explicit size.
+    ///
+    /// **Recommended:** 25-30% to leave room for staging buffers and overhead.
+    ///
+    /// # Arguments
+    ///
+    /// * `percent` - Percentage of device max_buffer_size (0-100).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use arkan::gpu::WgpuOptions;
+    ///
+    /// // Use 30% of device max (works best on AMD/Intel)
+    /// let options = WgpuOptions::with_max_vram_percent(30);
+    ///
+    /// // For NVIDIA, prefer explicit size:
+    /// let options = WgpuOptions::with_max_vram(3); // 3GB for RTX 4070 SUPER
+    /// ```
+    pub fn with_max_vram_percent(percent: u8) -> Self {
+        Self {
+            max_vram_alloc: VramLimit::Percent(percent),
+            ..Default::default()
+        }
+    }
+
+    /// Creates options that use device max_buffer_size as VRAM limit.
+    /// This removes the 2GB default limit and uses full GPU capabilities.
+    ///
+    /// **Warning:** May cause OOM if buffers are too large for your GPU.
+    pub fn unlimited_vram() -> Self {
+        Self {
+            max_vram_alloc: VramLimit::Unlimited,
+            ..Default::default()
         }
     }
 }
@@ -114,6 +250,8 @@ pub struct WgpuBackend {
     adapter_info: wgpu::AdapterInfo,
     /// Device limits.
     limits: wgpu::Limits,
+    /// Maximum VRAM allocation per buffer.
+    max_vram_alloc: u64,
 }
 
 impl WgpuBackend {
@@ -158,6 +296,14 @@ impl WgpuBackend {
 
         let limits = device.limits();
 
+        // Resolve max_vram_alloc based on VramLimit and device capabilities
+        let max_vram_alloc = options.max_vram_alloc.resolve(limits.max_buffer_size);
+        log::info!(
+            "Max VRAM allocation per buffer: {} MB ({:?})",
+            max_vram_alloc / 1024 / 1024,
+            options.max_vram_alloc
+        );
+
         Ok(Self {
             instance,
             adapter,
@@ -165,6 +311,7 @@ impl WgpuBackend {
             queue: Arc::new(queue),
             adapter_info,
             limits,
+            max_vram_alloc,
         })
     }
 
@@ -237,12 +384,26 @@ impl WgpuBackend {
         adapter: &wgpu::Adapter,
         options: &WgpuOptions,
     ) -> ArkanResult<(wgpu::Device, wgpu::Queue)> {
+        // Determine which limits to use
+        let limits = if options.use_adapter_limits {
+            // Use the maximum limits supported by the adapter
+            let adapter_limits = adapter.limits();
+            log::info!(
+                "Using adapter limits: max_buffer_size={} MB, max_storage_buffer_binding_size={} MB",
+                adapter_limits.max_buffer_size / 1024 / 1024,
+                adapter_limits.max_storage_buffer_binding_size / 1024 / 1024
+            );
+            adapter_limits
+        } else {
+            options.required_limits.clone()
+        };
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("ArKan GPU Device"),
                     required_features: options.required_features,
-                    required_limits: options.required_limits.clone(),
+                    required_limits: limits,
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
@@ -286,6 +447,20 @@ impl WgpuBackend {
     /// Returns the device limits.
     pub fn limits(&self) -> &wgpu::Limits {
         &self.limits
+    }
+
+    /// Returns the maximum VRAM allocation per buffer in bytes.
+    ///
+    /// This is configurable via `WgpuOptions::max_vram_alloc`.
+    /// Default is 2GB, or device max_buffer_size if set to None.
+    pub fn max_vram_alloc(&self) -> u64 {
+        self.max_vram_alloc
+    }
+
+    /// Checks if a size in bytes exceeds the maximum VRAM allocation limit.
+    #[inline]
+    pub fn exceeds_vram_limit(&self, size_bytes: u64) -> bool {
+        size_bytes > self.max_vram_alloc
     }
 
     /// Returns the maximum storage buffer size in bytes.

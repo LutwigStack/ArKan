@@ -5,6 +5,7 @@
 Cargo.lock
 
 # IDE and editor files
+.claude/
 .idea/
 .vscode/
 *.swp
@@ -130,3 +131,10 @@ tests/*_investigation.rs
 
 # Example project lock files (use workspace Cargo.lock)
 examples/**/Cargo.lock
+
+# Internal task tracking / workstreams (planning artifacts, not shipped)
+tasks/
+
+# Internal engineering audit (honest self-assessment, kept local; not public)
+docs/audit/
+docs/FUNCTIONALITY_AUDIT.md

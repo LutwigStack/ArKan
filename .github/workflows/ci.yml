@@ -2,28 +2,266 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, gpu-backend]
   pull_request:
-    branches: [main]
+    branches: [main, gpu-backend]
+
+# A new push to the same branch makes the in-flight run obsolete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  # ==========================================================================
+  # Formatting. Cheapest job, no compilation, so it is its own gate.
+  # Scope is the arkan crate only: the three example crates under examples/
+  # are separate packages and are not rustfmt-clean.
+  # ==========================================================================
+  fmt:
+    name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          components: clippy, rustfmt
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
-      - name: Cargo fmt
-        run: cargo fmt -- --check
+  # ==========================================================================
+  # The main gate: clippy + tests + doctests, once per feature combination.
+  #
+  # `--all-targets` is load-bearing. It is what type-checks benches; without it
+  # a bench can rot against a changed signature for months (benches/optimizer.rs
+  # called SGD::new with the pre-SGDConfig arity and nothing noticed).
+  #
+  # `default = []`, so `--no-default-features` is also the plain default build.
+  # serde,parallel is the CPU-complete combination — the only entry that runs
+  # the whole suite with both real CPU features on at once. This is deliberately
+  # not the powerset of 3 features.
+  # ==========================================================================
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no-default-features
+            flags: --no-default-features
+            norun: ''
+          - name: serde
+            flags: --features serde
+            norun: ''
+          - name: parallel
+            flags: --features parallel
+            norun: ''
+          - name: serde-parallel
+            flags: --features serde,parallel
+            norun: ''
+          # GPU tests are all #[ignore = "Requires GPU"] and a runner has no
+          # adapter, so these two compile the test binaries and stop. Compiling
+          # them is the point: it is what catches stale-signature rot in
+          # gpu-gated test code, which has bitten this repo twice.
+          - name: gpu
+            flags: --features gpu
+            norun: --no-run
+          - name: all-features
+            flags: --all-features
+            norun: --no-run
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Cargo clippy
-        run: cargo clippy -- -D warnings
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
-      - name: Cargo test
-        run: cargo test --all-features
+      # Cargo.lock is in .gitignore for this library, so the old
+      # hashFiles('**/Cargo.lock') matched zero files and evaluated to "". Every
+      # job shared one never-changing key: the cache was saved once and then
+      # frozen forever, and feature sets overwrote each other's target/.
+      # Hash the manifests that actually exist, and give each feature set its
+      # own slot.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-${{ matrix.name }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-${{ matrix.name }}-
+
+      - name: Clippy (all targets)
+        run: cargo clippy --all-targets ${{ matrix.flags }} -- -D warnings
+
+      - name: Tests
+        run: cargo test ${{ matrix.flags }} ${{ matrix.norun }}
+
+      # Separate invocation because `--all-targets` excludes doctests and
+      # `cargo test --doc --no-run` is rejected by cargo. 65+ doctests were
+      # never run by CI before.
+      - name: Doctests
+        run: cargo test --doc ${{ matrix.flags }}
+
+  # ==========================================================================
+  # MSRV. Measured, not guessed: 1.72 fails on our own div_ceil
+  # (int_roundings, stable since 1.73) at src/config.rs:287; 1.73 builds.
+  #
+  # Scope is `--lib` throughout: dev-dependencies need 1.81 (half, via criterion),
+  # so tests cannot build on the 1.73 floor. One matrix row per row of the README's
+  # MSRV table -- 1.73 (default + serde), 1.80 (parallel, floor set by rayon-core),
+  # 1.85 (gpu, floor set by indexmap via wgpu 23 -> naga). Checking only the lowest
+  # would leave the other two claims undefended, and with no committed Cargo.lock
+  # they drift on their own as dependencies release new minimums.
+  # ==========================================================================
+  msrv:
+    name: msrv ${{ matrix.toolchain }} (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each row pins one row of the README's MSRV table. Without all three,
+          # only the default floor is defended and the other two drift silently --
+          # there is no committed Cargo.lock to hold dependencies still.
+          - toolchain: 1.73.0
+            label: default+serde
+            check: --lib --no-default-features
+            check2: --lib --features serde
+          - toolchain: 1.80.0
+            label: parallel
+            check: --lib --features parallel
+            check2: ""
+          - toolchain: 1.85.0
+            label: gpu
+            check: --lib --features gpu
+            check2: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-msrv${{ matrix.toolchain }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-msrv${{ matrix.toolchain }}-
+      - run: cargo check ${{ matrix.check }}
+      - if: matrix.check2 != ''
+        run: cargo check ${{ matrix.check2 }}
+
+  # ==========================================================================
+  # Publish-time packaging. `cargo package` also runs a verification build of
+  # the extracted tarball, so it catches a source file that exists locally but
+  # never reaches crates.io.
+  # ==========================================================================
+  package:
+    name: cargo package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-package-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-package-
+
+      # A broken `exclude` in Cargo.toml would ship CI config, helper scripts or
+      # internal notes to every crates.io user. Assert before building.
+      - name: No private files in the published crate
+        run: |
+          cargo package --list > /tmp/pkg-files.txt
+          if grep -Eq '^(\.github/|scripts/|tasks/|docs/audit/|docs/FUNCTIONALITY_AUDIT\.md|README for KAN\.md)' /tmp/pkg-files.txt; then
+            echo "::error::excluded paths leaked into the package:"
+            grep -En '^(\.github/|scripts/|tasks/|docs/audit/|docs/FUNCTIONALITY_AUDIT\.md|README for KAN\.md)' /tmp/pkg-files.txt
+            exit 1
+          fi
+          echo "package contains $(wc -l < /tmp/pkg-files.txt) files, none excluded"
+
+      - name: Package and verify
+        run: cargo package
+
+  # ==========================================================================
+  # The three example crates under examples/ are separate packages that depend
+  # on arkan by path, so a feature rename breaks them without touching anything
+  # cargo builds above. game2048 requires gpu + parallel.
+  #
+  # In-crate examples (basic, training, baked_inference, gpu_forward) are
+  # already type-checked by `clippy --all-targets` in every matrix entry;
+  # `--examples` here is what actually links them.
+  # ==========================================================================
+  examples:
+    name: example crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            examples/sinusoid/target/
+            examples/mnist/target/
+            examples/game2048/target/
+          key: ${{ runner.os }}-cargo-examples-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-examples-
+
+      - name: Build in-crate examples
+        run: cargo build --examples
+
+      - name: Build sinusoid
+        working-directory: examples/sinusoid
+        run: cargo build
+
+      - name: Build mnist
+        working-directory: examples/mnist
+        run: cargo build
+
+      - name: Build game2048
+        working-directory: examples/game2048
+        run: cargo build
+
+  # ==========================================================================
+  # Docs. Both feature configurations: an intra-doc link to a feature-gated item
+  # resolves under --all-features and breaks the default build, which is exactly
+  # how MAGIC_BAKED's links to BakedModel::{to,from}_bytes got broken.
+  # ==========================================================================
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-docs-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-docs-
+      - run: cargo doc --no-deps
+      - run: cargo doc --no-deps --all-features

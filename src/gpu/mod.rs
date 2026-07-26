@@ -47,6 +47,15 @@
 //! - [`shaders`] — Dynamic shader generation for variable spline orders
 //! - [`optimizer`] — GPU-accelerated optimizers (Adam, SGD)
 
+// `rust-version` in Cargo.toml is 1.73, the floor for the default and `serde`
+// builds. clippy applies it to the whole crate, but this module can never be
+// compiled at 1.73: enabling `gpu` pulls wgpu 23 -> naga -> indexmap, which
+// requires 1.85. So APIs newer than 1.73 (`Option::is_none_or`, stable 1.82)
+// are fine here and the lint is a false positive against our actual policy.
+// ponytail: cargo has one rust-version per package, not per feature, so there
+// is nowhere to state the real 1.85 gpu floor except the README table.
+#![allow(clippy::incompatible_msrv)]
+
 mod backend;
 mod layer;
 mod network;
@@ -57,9 +66,9 @@ mod tensor;
 mod uniforms;
 mod workspace;
 
-pub use backend::{PowerPreference, WgpuBackend, WgpuOptions};
+pub use backend::{PowerPreference, VramLimit, WgpuBackend, WgpuOptions, DEFAULT_MAX_VRAM_ALLOC};
 pub use layer::GpuLayer;
-pub use network::{GpuMemoryStats, GpuNetwork};
+pub use network::{GpuForwardHandle, GpuMemoryStats, GpuNetwork};
 pub use optimizer::{
     AdamUniforms, GpuAdam, GpuAdamConfig, GpuAdamLayerState, GpuSgd, GpuSgdConfig,
     GpuSgdLayerState, SgdUniforms,
@@ -73,28 +82,23 @@ pub use tensor::{GpuTensor, GpuTensorView};
 pub use uniforms::LayerUniforms;
 pub use workspace::GpuWorkspace;
 
-/// Maximum VRAM allocation per buffer (2GB).
+/// Maximum VRAM allocation per buffer (2GB) - default value.
 ///
 /// This limit prevents excessive memory allocation on GPUs and ensures
 /// compatibility with most hardware configurations.
-pub const MAX_VRAM_ALLOC: u64 = 2 * 1024 * 1024 * 1024;
-
-/// Default alignment for GPU buffers (256 bytes).
 ///
-/// This alignment ensures compatibility with most GPU architectures and
-/// meets the requirements for uniform buffer offsets.
-pub const GPU_BUFFER_ALIGNMENT: u64 = 256;
+/// **Note:** This is the default limit. Use `WgpuOptions::with_max_vram(gb)`
+/// or `WgpuOptions::unlimited_vram()` to configure a custom limit.
+///
+/// For RTX 4070 SUPER (12GB), you can safely use 8GB or more.
+pub const MAX_VRAM_ALLOC: u64 = backend::DEFAULT_MAX_VRAM_ALLOC;
 
-/// Checks if a size in bytes exceeds the maximum VRAM allocation limit.
+/// Checks if a size in bytes exceeds the default VRAM allocation limit.
+///
+/// **Note:** For configurable limits, use `WgpuBackend::exceeds_vram_limit()`.
 #[inline]
 pub fn exceeds_vram_limit(size_bytes: u64) -> bool {
     size_bytes > MAX_VRAM_ALLOC
-}
-
-/// Aligns a size to the specified alignment.
-#[inline]
-pub const fn align_to(size: u64, alignment: u64) -> u64 {
-    (size + alignment - 1) & !(alignment - 1)
 }
 
 /// Pads a dimension to be a multiple of 4 (for vec4 access in shaders).
@@ -112,14 +116,6 @@ mod tests {
         assert!(!exceeds_vram_limit(1024));
         assert!(!exceeds_vram_limit(MAX_VRAM_ALLOC));
         assert!(exceeds_vram_limit(MAX_VRAM_ALLOC + 1));
-    }
-
-    #[test]
-    fn test_align_to() {
-        assert_eq!(align_to(0, 256), 0);
-        assert_eq!(align_to(1, 256), 256);
-        assert_eq!(align_to(256, 256), 256);
-        assert_eq!(align_to(257, 256), 512);
     }
 
     #[test]
