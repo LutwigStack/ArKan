@@ -106,6 +106,42 @@ or per-channel activation scales for per-output precision requirements.
 - `examples/game2048` now depends on `arkan` with `features = ["gpu", "parallel"]`
   because it calls `forward_batch_parallel`.
 
+#### Declared MSRV
+
+`rust-version = "1.73"` is now set. Determined by bisecting real toolchains
+against a checkout with no `Cargo.lock`: 1.72 fails on our own `div_ceil`
+(`int_roundings`, stable since 1.73), 1.73 builds the library with default
+features and with `serde`.
+
+There is no single MSRV, because the optional features' dependencies set their
+own floors. The README carries the full table:
+
+| Build | MSRV | Set by |
+|---|---|---|
+| default, `serde` | 1.73 | our own `div_ceil` |
+| `parallel` | 1.80 | `rayon-core` |
+| `gpu` | 1.85 | `indexmap`, via `wgpu` 23 → `naga` |
+
+No `Cargo.lock` is committed, so resolution always picks the newest compatible
+dependencies and these floors drift upward as those crates release.
+
+#### Documentation
+
+- `cargo doc` is now clean under `-D warnings` for default, `serde`, `gpu` and
+  `--all-features`. 72 unresolved intra-doc links are gone: most were math and
+  index notation (`M0[j]`, `grad_weights[j,i,k]`) that rustdoc parsed as links
+  and now render as code, but 14 were genuinely broken references — including
+  `crate::KanNetwork::forward`, a method that does not exist (the f32 CPU path
+  is `forward_single` / `forward_batch`).
+
+#### CI
+
+`cargo fmt`, `cargo clippy --all-targets`, tests, doctests and `cargo doc` now
+run across a feature matrix (`--no-default-features`, `serde`, `parallel`,
+`serde,parallel`, `gpu`, `--all-features`), plus `cargo package` and a pinned
+1.73 MSRV job. Benches are type-checked (`--all-targets`) and `gpu` test code is
+compile-checked (`--no-run`, since GPU tests need an adapter no runner has).
+
 ---
 
 ## [0.3.0] - 2025-12-06
