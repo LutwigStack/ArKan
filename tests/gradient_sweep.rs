@@ -421,8 +421,11 @@ fn check_layer_scaled(
         );
         let analytic = f64::from(ana.input[idx] * inject);
         let gap = (fd - analytic).abs();
-        // Tolerance = the four mechanisms that limit this probe, each named and
-        // measured above. No term is a fudge factor and none of them is free to grow.
+        // Tolerance = the three mechanisms that limit this probe, each named and
+        // measured above. No term is a fudge factor. A fourth candidate - the analytic
+        // gradient's own cancellation on narrow grids - turned out not to be
+        // load-bearing once the step grew, and is not here; see [`LAYER_REL`], which is
+        // where that error is accounted for.
         let tol = layer_tol(fd)
             + fd_roundoff_floor(scale, h)
             + step_quantization_floor(fd, x, layer.mean[i], h);
@@ -452,9 +455,11 @@ fn check_layer_scaled(
         );
         let analytic = f64::from(ana.weights[widx] * inject);
         let gap = (fd - analytic).abs();
-        // No `z_floor`: `grad_weights` is `sum_b g_out * B`, with no `1/h` factor and
-        // nothing to cancel. No Richardson either, so `fd_roundoff_floor` without its
-        // factor for it - and `hw = 0.25` makes it ~1e-6 anyway.
+        // `grad_weights` is `sum_b g_out * B`: no `1/h` factor, nothing to cancel, and
+        // no Richardson, so `fd_roundoff_floor` applies without its Richardson factor.
+        // At `hw = 0.25` it is ~1e-6 regardless. Measured worst gap over the sweeps is
+        // 9.6e-7 (`gap / tolerance = 0.001`), so weight gradients are pinned about two
+        // orders of magnitude tighter than input gradients.
         check.record(
             gap,
             layer_tol(fd) + fd_roundoff_floor(scale, hw) / 5.0,
