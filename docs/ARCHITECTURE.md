@@ -142,7 +142,7 @@ to 7, so that gap is a documented panic, not a `Result`.
 ### 4. Buffer Management (`src/buffer.rs`)
 
 **AlignedBuffer:**
-- 64-byte aligned (CACHE_LINE) for AVX-512
+- 64-byte aligned (CACHE_LINE)
 - Zero-allocation resize within capacity
 - `try_reserve` for fallible allocation
 - Overflow protection with `MAX_BUFFER_ELEMENTS`
@@ -341,7 +341,7 @@ Weights are packed into `vec4` for coalesced memory access:
 ## Performance Optimizations
 
 ### CPU
-- 64-byte aligned buffers for AVX-512 (`AlignedBuffer`)
+- 64-byte cache-line aligned buffers (`AlignedBuffer`)
 - SIMD-vectorized B-spline evaluation (`wide` crate — **always on**, not a feature)
 - Rayon parallelism over batch samples (`parallel` feature; absent without it)
 - Zero-allocation inference with `Workspace` (reuse across calls)
@@ -403,7 +403,7 @@ gated nothing.
 | `MAX_SPLINE_ORDER` | 7 | Maximum B-spline order (CPU) |
 | `MAX_GPU_SPLINE_ORDER` | 5 | Maximum B-spline order (GPU dynamic shaders) |
 | `MIN_GPU_SPLINE_ORDER` | 2 | Minimum B-spline order (GPU dynamic shaders) |
-| `CACHE_LINE` | 64 | Buffer alignment in bytes (AVX-512) |
+| `CACHE_LINE` | 64 | Buffer alignment in bytes (cache line) |
 | `MAX_BUFFER_ELEMENTS` | 2^30 | Maximum buffer size (overflow protection) |
 | `WORKGROUP_SIZE` | 64 | GPU compute workgroup size |
 | `GPU_BUFFER_ALIGNMENT` | 256 | GPU buffer alignment (uniform offsets) |

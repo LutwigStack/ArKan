@@ -80,7 +80,7 @@
 //! ### Memory Layout
 //!
 //! - **Weights**: `[Output, Input, Basis]` — row-major for cache efficiency
-//! - **Buffers**: 64-byte aligned for AVX-512 compatibility
+//! - **Buffers**: 64-byte (cache-line) aligned
 //! - **Workspace**: Preallocated buffers eliminate hot-path allocations
 //!
 //! ## Feature Flags
@@ -235,3 +235,18 @@ mod tests {
         assert_eq!(output.len(), config.output_dim);
     }
 }
+
+/// Compiles every ```rust fence in README.md as a doctest.
+///
+/// Without this the README is checked by nothing. `tests/readme_snippets.rs` is a
+/// hand-typed copy, so it can only catch rot in the copy, never divergence between the
+/// copy and the README itself — a reviewer appended a fence calling a fictional API and
+/// `clippy --all-targets --all-features`, `test`, `test --doc`, `doc` and `package` all
+/// exited 0. README.md ships inside the published package (`readme = "README.md"`), so
+/// including it here is package-safe.
+///
+/// Fences that cannot run unaided are annotated in the README itself (`no_run` for GPU
+/// paths, `text` for shell blocks) rather than being exempted here.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
