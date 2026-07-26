@@ -85,6 +85,25 @@ pub fn compute_knots(grid_size: usize, order: usize, grid_range: (f32, f32)) -> 
         .collect()
 }
 
+/// Flag OR-ed into a stored span index when the forward pass clamped that
+/// `(sample, feature)` to the grid range.
+///
+/// The forward map is `z = clamp((x - mean) / std, grid_min, grid_max)`, so for a
+/// saturated input `dz/dx` is exactly zero: perturbing `x` cannot move the output.
+/// The backward pass must therefore drop `grad_input` for those pairs, and it needs
+/// to be *told* which they are - a stored `z` sitting on the boundary is
+/// indistinguishable from a legitimately on-boundary input.
+///
+/// Span indices are at most `grid_size + order`, so the high bit is free.
+/// Always mask with [`SPAN_INDEX_MASK`] before using a stored value as an index.
+///
+/// The same flag is the record of "this input was outside the grid", i.e. the
+/// source for out-of-grid / clamped-fraction diagnostics.
+pub const SPAN_CLAMPED_FLAG: u32 = 0x8000_0000;
+
+/// Mask recovering the span index from a value stored with [`SPAN_CLAMPED_FLAG`].
+pub const SPAN_INDEX_MASK: u32 = !SPAN_CLAMPED_FLAG;
+
 /// Finds the knot span index for a given value in O(1) time.
 ///
 /// Returns index `i` such that `knots[i] <= x < knots[i+1]`.

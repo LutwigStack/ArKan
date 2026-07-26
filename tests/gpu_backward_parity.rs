@@ -1191,3 +1191,128 @@ fn test_gpu_backward_zero_grad_output() {
 
     println!("✓ Zero grad_output test passed");
 }
+
+// =============================================================================
+// TEST 11: Saturated Inputs Produce Zero Input Gradients (CPU/GPU parity)
+// =============================================================================
+
+/// The clamp in the forward pass (`clamp(x, grid_min, grid_max)`, shaders at
+/// `forward_training_main`) makes the output completely independent of a saturated
+/// input, so `dL/dx` must be exactly zero there. The GPU records the clamp in the
+/// high bit of the stored span, exactly like the CPU's `SPAN_CLAMPED_FLAG`; this
+/// test pins the two together on the saturated path.
+///
+/// See `tests/clamp_gradient_parity.rs` for the finite-difference proof on the CPU.
+#[test]
+#[ignore = "Requires GPU"]
+fn test_gpu_saturated_inputs_give_zero_input_gradient() {
+    let backend =
+        WgpuBackend::init(WgpuOptions::default()).expect("Failed to initialize GPU backend");
+
+    let config = single_layer_config(8, 4, 4242);
+    let batch_size = 8;
+
+    let cpu_network = KanNetwork::new(config.clone());
+    let mut gpu_network =
+        GpuNetwork::from_cpu(&backend, &cpu_network).expect("Failed to create GPU network");
+    let mut gpu_workspace = gpu_network
+        .create_workspace(batch_size)
+        .expect("Failed to create GPU workspace");
+
+    // Every input is outside grid_range = (-1, 1).
+    let mut rng = SmallRng::seed_from_u64(31337);
+    let input: Vec<f32> = (0..batch_size * config.input_dim)
+        .map(|i| {
+            let m = rng.gen_range(1.2f32..4.0);
+            if i % 2 == 0 {
+                m
+            } else {
+                -m
+            }
+        })
+        .collect();
+    let grad_output: Vec<f32> = (0..batch_size * config.output_dim)
+        .map(|_| rng.gen_range(-1.0f32..1.0))
+        .collect();
+
+    // Ground truth: the forward pass really is flat here. Shift every input further
+    // out and confirm the GPU output does not move.
+    let base_out = gpu_network
+        .forward_batch(&input, batch_size, &mut gpu_workspace)
+        .expect("GPU forward failed");
+    let shifted: Vec<f32> = input.iter().map(|x| x + x.signum() * 0.5).collect();
+    let shifted_out = gpu_network
+        .forward_batch(&shifted, batch_size, &mut gpu_workspace)
+        .expect("GPU forward failed");
+    assert_approx_eq(&base_out, &shifted_out, 1e-6, "saturated forward is flat");
+
+    let _ = gpu_network
+        .forward_batch_training(&input, batch_size, &mut gpu_workspace)
+        .expect("GPU forward training failed");
+
+    let mut gpu_grad_weights = Vec::new();
+    let mut gpu_grad_biases = Vec::new();
+    let gpu_grad_input = gpu_network
+        .backward_batch(
+            &grad_output,
+            batch_size,
+            &mut gpu_workspace,
+            &mut gpu_grad_weights,
+            &mut gpu_grad_biases,
+        )
+        .expect("GPU backward failed");
+
+    // CPU reference for the same layer, driven the same way.
+    let layer = &cpu_network.layers[0];
+    let mut cpu_ws = Workspace::default();
+    let mut cpu_out = vec![0.0f32; batch_size * layer.out_dim];
+    layer.forward_batch(&input, &mut cpu_out, &mut cpu_ws);
+    let z: Vec<f32> = cpu_ws.z_buffer.as_slice()[..batch_size * layer.in_dim].to_vec();
+    let spans: Vec<u32> = cpu_ws.grid_indices[..batch_size * layer.in_dim].to_vec();
+    let mut cpu_grad_input = vec![0.0f32; batch_size * layer.in_dim];
+    let mut cpu_gw = vec![0.0f32; layer.weights.len()];
+    let mut cpu_gb = vec![0.0f32; layer.bias.len()];
+    layer.backward(
+        &z,
+        &spans,
+        &grad_output,
+        Some(&mut cpu_grad_input),
+        &mut cpu_gw,
+        &mut cpu_gb,
+        &mut cpu_ws,
+    );
+
+    let gpu_max = gpu_grad_input.iter().fold(0.0f32, |m, g| m.max(g.abs()));
+    let cpu_max = cpu_grad_input.iter().fold(0.0f32, |m, g| m.max(g.abs()));
+    println!(
+        "saturated grad_input: max |CPU| = {:.3e}, max |GPU| = {:.3e}",
+        cpu_max, gpu_max
+    );
+
+    assert!(
+        cpu_max < 1e-10,
+        "CPU grad_input must vanish for saturated inputs, got {:.3e}",
+        cpu_max
+    );
+    assert!(
+        gpu_max < 1e-10,
+        "GPU grad_input must vanish for saturated inputs, got {:.3e}",
+        gpu_max
+    );
+    assert_approx_eq(
+        &cpu_grad_input,
+        &gpu_grad_input,
+        GRADIENT_TOL,
+        "saturated grad_input CPU vs GPU",
+    );
+
+    // Weight gradients are unaffected by the clamp flag - they must still match.
+    assert_approx_eq(
+        &cpu_gw,
+        &gpu_grad_weights[0],
+        GRADIENT_TOL,
+        "saturated grad_weights CPU vs GPU",
+    );
+
+    println!("✓ Saturated input gradient parity test passed");
+}

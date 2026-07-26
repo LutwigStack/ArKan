@@ -704,6 +704,10 @@ pub struct Workspace {
     pub basis_derivs: AlignedBuffer,
 
     /// Grid indices: `[Batch, Input]`
+    ///
+    /// The high bit carries [`crate::SPAN_CLAMPED_FLAG`] when the forward pass
+    /// clamped that input to the grid range; mask with
+    /// [`crate::SPAN_INDEX_MASK`] before using an entry as a span index.
     pub grid_indices: Vec<u32>,
 
     /// Intermediate layer outputs: `[Batch, MaxHiddenDim]`
@@ -724,6 +728,10 @@ pub struct Workspace {
     ///
     /// The spline segment index for each input, recorded during forward.
     /// Used in backward to index into the correct spline weights.
+    ///
+    /// As with [`Workspace::grid_indices`], the high bit is
+    /// [`crate::SPAN_CLAMPED_FLAG`] and must be masked off with
+    /// [`crate::SPAN_INDEX_MASK`] before use as an index.
     pub layers_grid_indices: Vec<Vec<u32>>,
 
     /// Gradient buffer passed between layers during backprop: `[Batch, MaxDim]`.

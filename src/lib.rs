@@ -168,6 +168,7 @@ pub use optimizer::{
 };
 pub use spline::{
     compute_basis, compute_basis_and_deriv, compute_knots, find_span, normalize_batch,
+    SPAN_CLAMPED_FLAG, SPAN_INDEX_MASK,
 };
 
 // GPU re-exports (only available with "gpu" feature)

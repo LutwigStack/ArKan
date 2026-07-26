@@ -47,13 +47,25 @@
 
 use crate::buffer::{Workspace, MAX_BUFFER_ELEMENTS};
 use crate::config::{KanConfig, EPSILON};
-use crate::spline::{compute_basis, compute_basis_and_deriv, compute_knots, find_span};
+use crate::spline::{
+    compute_basis, compute_basis_and_deriv, compute_knots, find_span, SPAN_CLAMPED_FLAG,
+    SPAN_INDEX_MASK,
+};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use wide::{f32x4, f32x8};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize};
+
+/// Recovers the knot span from a span index stored by the forward pass.
+///
+/// Stored values carry [`SPAN_CLAMPED_FLAG`] in their high bit, so they must never
+/// be used as an index directly.
+#[inline]
+fn span_of(stored: u32) -> usize {
+    (stored & SPAN_INDEX_MASK) as usize
+}
 
 /// A single KAN layer with learnable spline coefficients.
 ///
@@ -398,6 +410,9 @@ impl KanLayer {
         output.copy_from_slice(&self.bias);
 
         // For each input, compute basis and accumulate
+        // ponytail: unlike forward_batch this does not record SPAN_CLAMPED_FLAG -
+        // it keeps no history buffer, so no backward pass can consume it. If a
+        // single-sample training path ever appears, it needs the flag too.
         for (i, raw) in input.iter().enumerate() {
             let z =
                 ((*raw - self.mean[i]) / self.std[i]).clamp(self.grid_range.0, self.grid_range.1);
@@ -487,11 +502,14 @@ impl KanLayer {
 
             for i in 0..self.in_dim {
                 let raw = inputs[input_start + i];
-                let z = ((raw - self.mean[i]) / self.std[i])
-                    .clamp(self.grid_range.0, self.grid_range.1);
+                let unclamped = (raw - self.mean[i]) / self.std[i];
+                let z = unclamped.clamp(self.grid_range.0, self.grid_range.1);
                 workspace.z_buffer.as_mut_slice()[input_start + i] = z;
                 let span = find_span(z, &self.knots, self.order, self.grid_size);
-                workspace.grid_indices[span_batch_start + i] = span as u32;
+                // Record saturation with the span: dz/dx is 0 here, and backward
+                // cannot recover that from the clamped z alone.
+                let clamped = if z == unclamped { 0 } else { SPAN_CLAMPED_FLAG };
+                workspace.grid_indices[span_batch_start + i] = span as u32 | clamped;
 
                 let basis_start = basis_batch_start + i * self.basis_aligned;
                 let basis_slice = workspace.basis_values.as_mut_slice();
@@ -626,7 +644,7 @@ impl KanLayer {
                         // Scalar fallback
                         let mut s = 0.0f32;
                         for i in 0..self.in_dim {
-                            let span = spans[span_batch_start + i] as usize;
+                            let span = span_of(spans[span_batch_start + i]);
                             let start_idx = span - self.order;
                             let basis_start = basis_batch_start + i * self.basis_aligned;
 
@@ -669,7 +687,7 @@ impl KanLayer {
 
                 for lane in 0..8 {
                     let i = i_base + lane;
-                    let span = spans[span_batch_start + i] as usize;
+                    let span = span_of(spans[span_batch_start + i]);
                     let start_idx = span - self.order;
                     let basis_start = basis_batch_start + i * self.basis_aligned;
 
@@ -689,7 +707,7 @@ impl KanLayer {
 
         // Handle remaining inputs (scalar)
         for i in (chunks * 8)..self.in_dim {
-            let span = spans[span_batch_start + i] as usize;
+            let span = span_of(spans[span_batch_start + i]);
             let start_idx = span - self.order;
             let basis_start = basis_batch_start + i * self.basis_aligned;
 
@@ -724,7 +742,7 @@ impl KanLayer {
 
                 for lane in 0..4 {
                     let i = i_base + lane;
-                    let span = spans[span_batch_start + i] as usize;
+                    let span = span_of(spans[span_batch_start + i]);
                     let start_idx = span - self.order;
                     let basis_start = basis_batch_start + i * self.basis_aligned;
 
@@ -743,7 +761,7 @@ impl KanLayer {
 
         // Tail
         for i in (chunks * 4)..self.in_dim {
-            let span = spans[span_batch_start + i] as usize;
+            let span = span_of(spans[span_batch_start + i]);
             let start_idx = span - self.order;
             let basis_start = basis_batch_start + i * self.basis_aligned;
 
@@ -846,7 +864,7 @@ impl KanLayer {
 
             for i in 0..self.in_dim {
                 let z = normalized_input[input_offset + i];
-                let span = grid_indices[input_offset + i] as usize;
+                let span = span_of(grid_indices[input_offset + i]);
                 let basis_offset = base_offset + i * self.basis_aligned;
 
                 compute_basis_and_deriv(
@@ -887,9 +905,17 @@ impl KanLayer {
                 grad_bias[j] += g_out;
 
                 for i in 0..self.in_dim {
-                    let span = grid_indices[span_batch_start + i] as usize;
+                    let stored_span = grid_indices[span_batch_start + i];
+                    let span = span_of(stored_span);
                     let start_idx = span - self.order;
                     let basis_start = basis_batch_start + i * self.basis_aligned;
+                    // dz/dx for the *clamped* normalization: zero where the forward
+                    // pass saturated, so a saturated input reports no sensitivity.
+                    let dz_dx = if stored_span & SPAN_CLAMPED_FLAG != 0 {
+                        0.0
+                    } else {
+                        1.0 / self.std[i].max(EPSILON)
+                    };
 
                     for k in 0..self.local_basis_size {
                         let weight_idx = self.weight_index(j, i, start_idx + k);
@@ -898,9 +924,8 @@ impl KanLayer {
 
                         if let Some(ref mut gi) = grad_input {
                             let deriv = deriv_slice[basis_start + k];
-                            let std_inv = 1.0 / self.std[i].max(EPSILON);
                             gi[span_batch_start + i] +=
-                                g_out * self.weights[weight_idx] * deriv * std_inv;
+                                g_out * self.weights[weight_idx] * deriv * dz_dx;
                         }
                     }
                 }
@@ -1023,7 +1048,7 @@ impl KanLayer {
                     // Compute basis values and derivatives for this sample
                     for i in 0..self.in_dim {
                         let z = normalized_input[input_offset + i];
-                        let span = grid_indices[input_offset + i] as usize;
+                        let span = span_of(grid_indices[input_offset + i]);
                         let basis_offset = i * self.basis_aligned;
 
                         compute_basis_and_deriv(
@@ -1052,9 +1077,16 @@ impl KanLayer {
                         local_bias[j] += g_out;
 
                         for i in 0..self.in_dim {
-                            let span = grid_indices[input_offset + i] as usize;
+                            let stored_span = grid_indices[input_offset + i];
+                            let span = span_of(stored_span);
                             let start_idx = span - self.order;
                             let basis_start = i * self.basis_aligned;
+                            // Must match `backward`: dz/dx is 0 for saturated inputs.
+                            let dz_dx = if stored_span & SPAN_CLAMPED_FLAG != 0 {
+                                0.0
+                            } else {
+                                1.0 / self.std[i].max(EPSILON)
+                            };
 
                             for k in 0..self.local_basis_size {
                                 let weight_idx = self.weight_index(j, i, start_idx + k);
@@ -1063,9 +1095,8 @@ impl KanLayer {
 
                                 if compute_grad_input {
                                     let deriv = basis_derivs[basis_start + k];
-                                    let std_inv = 1.0 / self.std[i].max(EPSILON);
                                     local_input[input_offset + i] +=
-                                        g_out * self.weights[weight_idx] * deriv * std_inv;
+                                        g_out * self.weights[weight_idx] * deriv * dz_dx;
                                 }
                             }
                         }

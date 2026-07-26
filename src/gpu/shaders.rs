@@ -553,8 +553,9 @@ fn backward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
         
         let z = z_values[input_idx];
-        let span = span_indices[input_idx];
-        
+        // High bit is the clamp flag written by the forward pass; mask it off.
+        let span = span_indices[input_idx] & 0x7FFFFFFFu;
+
         // Check if this weight k is active for this span
         // Active basis indices are: span, span+1, span+2, span+3
         if (k < span || k > span + 3u) {
@@ -691,22 +692,28 @@ fn backward_input_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
     
     let z = z_values[input_idx];
-    let span = span_indices[input_idx];
-    
+    let stored_span = span_indices[input_idx];
+    let span = stored_span & 0x7FFFFFFFu;
+
     let grid_size_f = f32(config.grid_size);
     let grid_range = config.grid_max - config.grid_min;
     let t_norm = (z - config.grid_min) / grid_range;
     let t_grid = t_norm * grid_size_f;
     let t_local = t_grid - f32(span);
-    
+
     let deriv = cubic_basis_deriv(t_local);
-    
+
     // Bounds check on std_inv
     var scale_factor = 1.0;
     if (i < arrayLength(&std_inv)) {
         scale_factor = grid_size_f / grid_range * std_inv[i];
     }
-    
+    // dz/dx is 0 where the forward pass clamped this input: the output does not
+    // depend on x at all, so neither may the gradient.
+    if ((stored_span & 0x80000000u) != 0u) {
+        scale_factor = 0.0;
+    }
+
     let grad_out_len = arrayLength(&grad_output);
     
     var grad_sum = 0.0;
@@ -892,24 +899,32 @@ fn forward_training_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             continue;
         }
         
-        var x = input[input_idx];
-        
+        let raw = input[input_idx];
+        var x = raw;
+
         x = clamp(x, config.grid_min, config.grid_max);
         let t_norm = (x - config.grid_min) / grid_range;
         let t_grid = t_norm * grid_size_f;
         let span = clamp(u32(floor(t_grid)), 0u, config.grid_size - 1u);
         let t_local = t_grid - f32(span);
-        
-        // Save for backward pass (only first output thread per batch writes)
+
+        // Save for backward pass (only first output thread per batch writes).
+        // The high bit of the span records saturation: dz/dx is 0 there, and the
+        // clamped z alone cannot tell backward that. Must match the CPU's
+        // SPAN_CLAMPED_FLAG.
+        var stored_span = span;
+        if (x != raw) {
+            stored_span = span | 0x80000000u;
+        }
         if (out_idx == 0u) {
             if (input_idx < z_len) {
                 z_values[input_idx] = x;
             }
             if (input_idx < span_len) {
-                span_indices[input_idx] = span;
+                span_indices[input_idx] = stored_span;
             }
         }
-        
+
         let basis = cubic_basis(t_local);
         let weight_base_vec4 = (out_idx * config.in_dim + in_idx) * basis_vec4s;
         
@@ -1587,8 +1602,9 @@ fn backward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
         }}
         
         let z = z_values[input_idx];
-        let span = span_indices[input_idx];
-        
+        // High bit is the clamp flag written by the forward pass; mask it off.
+        let span = span_indices[input_idx] & 0x7FFFFFFFu;
+
         // Check if this weight k is active for this span
         if (k < span || k >= span + ACTIVE_BASIS_COUNT) {{
             continue;
@@ -1697,21 +1713,26 @@ fn backward_input_main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
     }}
     
     let z = z_values[input_idx];
-    let span = span_indices[input_idx];
-    
+    let stored_span = span_indices[input_idx];
+    let span = stored_span & 0x7FFFFFFFu;
+
     let grid_size_f = f32(config.grid_size);
     let grid_range = config.grid_max - config.grid_min;
     let t_norm = (z - config.grid_min) / grid_range;
     let t_grid = t_norm * grid_size_f;
     let t_local = t_grid - f32(span);
-    
+
     let deriv = bspline_deriv(t_local);
-    
+
     var scale_factor = 1.0;
     if (i < arrayLength(&std_inv)) {{
         scale_factor = grid_size_f / grid_range * std_inv[i];
     }}
-    
+    // dz/dx is 0 for a clamped input; must match the CPU backward.
+    if ((stored_span & 0x80000000u) != 0u) {{
+        scale_factor = 0.0;
+    }}
+
     let grad_out_len = arrayLength(&grad_output);
     
     var grad_sum = 0.0;
@@ -1832,24 +1853,30 @@ fn forward_training_main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
             continue;
         }}
         
-        var x = input[input_idx];
-        
+        let raw = input[input_idx];
+        var x = raw;
+
         x = clamp(x, config.grid_min, config.grid_max);
         let t_norm = (x - config.grid_min) / grid_range;
         let t_grid = t_norm * grid_size_f;
         let span = clamp(u32(floor(t_grid)), 0u, config.grid_size - 1u);
         let t_local = t_grid - f32(span);
-        
-        // Save for backward pass (only first output thread per batch writes)
+
+        // High bit of the stored span = "this input was clamped", so backward can
+        // zero dz/dx. Must match the CPU's SPAN_CLAMPED_FLAG.
+        var stored_span = span;
+        if (x != raw) {{
+            stored_span = span | 0x80000000u;
+        }}
         if (out_idx == 0u) {{
             if (input_idx < z_len) {{
                 z_values[input_idx] = x;
             }}
             if (input_idx < span_len) {{
-                span_indices[input_idx] = span;
+                span_indices[input_idx] = stored_span;
             }}
         }}
-        
+
         let basis = bspline_basis(t_local);
         let weight_base_vec4 = (out_idx * config.in_dim + in_idx) * basis_vec4s;
         
