@@ -286,3 +286,46 @@ fn baked_parity_single_layer() {
         nrmse * 100.0
     );
 }
+
+/// End-to-end baked accuracy across EVERY supported spline order (2..=5).
+///
+/// Why this exists: until now every baked test, bench and example hard-coded
+/// `order = 3`, so the order-4 and order-5 code paths had zero end-to-end
+/// coverage — and a Q-scale defect in their basis polynomials (max abs error
+/// 0.208 and 0.775, end-to-end NRMSE 13.98% and 89.30%) survived undetected.
+/// `make_network` already took `order` as a parameter; nothing used it.
+///
+/// This walks the whole supported range through the real pipeline: per-channel
+/// weight quantization, the `local_basis_size` = 3..6 weight layout, the
+/// inter-layer requant, and (under `serde`) the versioned round-trip.
+#[test]
+fn baked_parity_all_orders() {
+    let input_dim = 8;
+    let output_dim = 4;
+    let grid_size = 5;
+
+    let mut failures = Vec::new();
+    for order in 2..=5usize {
+        let network = make_network(input_dim, vec![16, 8], output_dim, grid_size, order, 4242);
+
+        let cal = random_inputs_in_range(256, input_dim, 111, -0.9, 0.9);
+        let test = random_inputs_in_range(2000, input_dim, 222, -0.9, 0.9);
+
+        let baked = BakedModel::from_network(&network, Some(&cal));
+        let (nrmse, worst) = measure_accuracy(&network, &baked, &test, input_dim, output_dim);
+
+        println!(
+            "[baked_parity_all_orders] order={order}: NRMSE={:.4} ({:.2}%), worst(0.1s)={:.4}",
+            nrmse,
+            nrmse * 100.0,
+            worst
+        );
+
+        // Same 10% gate as the medium config, which shares this shape.
+        if nrmse > 0.10 {
+            failures.push(format!("order={order}: NRMSE={nrmse:.4} exceeds 10%"));
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}

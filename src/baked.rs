@@ -1087,7 +1087,12 @@ mod tests {
             let mut basis_f = vec![0.0f32; order + 1];
             let mut basis_i = vec![0u16; order + 1];
 
-            for t_q16 in (0..65536u32).step_by(64).chain([65535]) {
+            // Exhaustive over the whole t domain, not a stride. A step_by(64) sweep
+            // only ever visits residues {0, 63} mod 64, and mutation testing showed
+            // five defects gated on the other 62 residues surviving it (worst true
+            // error 0.34) while still passing this test, the partition-of-unity test
+            // and the sum lemma. 65536 x 4 orders costs ~0.01s in release.
+            for t_q16 in 0..65536u32 {
                 f32_basis_ref(order, t_q16, &mut basis_f);
                 eval_basis_fixed(order, t_q16, &mut basis_i);
                 for k in 0..=order {
