@@ -75,7 +75,15 @@ impl GpuDqnAgent {
             .output_dim(4)         // 4 actions
             .spline_order(3)       // Cubic splines
             .grid_size(5)          // 5 grid points
-            .grid_range(0.0, 1.0)  // One-hot values are 0 or 1
+            // Must be (-1.0, 1.0), same as KanDqnAgent, and for the reason spelled out
+            // there: grid_range applies to every layer, and a hidden layer's input is the
+            // previous layer's raw activation, which is not bounded to [0,1] just because
+            // the one-hot inputs are. This line used to read `(0.0, 1.0) // One-hot values
+            // are 0 or 1` — the exact reasoning that comment refutes — which left layer1
+            // 43.6% and layer2 48.9% saturated (measured in tests/hidden_layer_saturation.rs
+            // on this shape). Saturated means zero gradient, so nearly half of each hidden
+            // layer was dead, and CPU and GPU training were not the same network.
+            .grid_range(-1.0, 1.0)
             .build()?;
 
         let cpu_policy = KanNetwork::new(config.clone());
