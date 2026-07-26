@@ -90,7 +90,6 @@ pub struct GpuWorkspace {
     cached_training_bind_groups: Vec<Option<wgpu::BindGroup>>,
     /// Cached bind groups for backward pass.
     cached_backward_bind_groups: Vec<Option<wgpu::BindGroup>>,
-
 }
 
 impl GpuWorkspace {

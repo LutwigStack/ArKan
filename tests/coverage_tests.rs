@@ -447,7 +447,7 @@ mod serde_tests {
 
         let network = KanNetwork::new(config.clone());
         let input = vec![0.5f32, -0.3];
-        
+
         let mut workspace = network.create_workspace(1);
         let mut output_before = vec![0.0f32; 1];
         network.forward_single(&input, &mut output_before, &mut workspace);
@@ -486,7 +486,7 @@ mod serde_tests {
 
         let network = KanNetwork::new(config.clone());
         let input: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
-        
+
         let mut workspace = network.create_workspace(1);
         let mut output_before = vec![0.0f32; 4];
         network.forward_single(&input, &mut output_before, &mut workspace);
@@ -503,7 +503,9 @@ mod serde_tests {
             assert!(
                 (b - a).abs() < 1e-6,
                 "Deep network: output {} mismatch: {} vs {}",
-                i, b, a
+                i,
+                b,
+                a
             );
         }
 
@@ -529,7 +531,7 @@ mod serde_tests {
 
         let network = KanNetwork::new(config.clone());
         let input: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.01).collect();
-        
+
         let mut workspace = network.create_workspace(1);
         let mut output_before = vec![0.0f32; 32];
         network.forward_single(&input, &mut output_before, &mut workspace);
@@ -555,7 +557,11 @@ mod serde_tests {
         );
 
         println!("✓ Wide network (64→128→32) serialization successful");
-        println!("  Serialized size: {} bytes ({:.2} KB)", bytes.len(), bytes.len() as f64 / 1024.0);
+        println!(
+            "  Serialized size: {} bytes ({:.2} KB)",
+            bytes.len(),
+            bytes.len() as f64 / 1024.0
+        );
     }
 
     /// Test serialization with various spline configurations
@@ -586,7 +592,7 @@ mod serde_tests {
 
             let network = KanNetwork::new(config);
             let input = vec![0.1f32, 0.2, 0.3, 0.4];
-            
+
             let mut workspace = network.create_workspace(1);
             let mut output_before = vec![0.0f32; 2];
             network.forward_single(&input, &mut output_before, &mut workspace);
@@ -608,7 +614,8 @@ mod serde_tests {
             assert!(
                 max_diff < 1e-5,
                 "{}: max diff {} exceeds tolerance",
-                desc, max_diff
+                desc,
+                max_diff
             );
 
             println!("✓ Spline config ({}) serialization successful", desc);
@@ -703,13 +710,13 @@ mod serde_tests {
 
         let network = KanNetwork::new(config);
         let input = vec![0.1f32, 0.2, 0.3, 0.4];
-        
+
         let mut workspace = network.create_workspace(1);
         let mut original_output = vec![0.0f32; 2];
         network.forward_single(&input, &mut original_output, &mut workspace);
 
         let mut bytes = bincode::serialize(&network).expect("Serialize failed");
-        
+
         // Flip some bits in the middle (where weights likely are)
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xFF;
@@ -730,7 +737,9 @@ mod serde_tests {
 
             // Corruption should either cause deser failure or different output
             if !differs {
-                println!("⚠️ Corrupted data happened to produce same output (unlikely but possible)");
+                println!(
+                    "⚠️ Corrupted data happened to produce same output (unlikely but possible)"
+                );
             } else {
                 println!("✓ Corrupted data produces different output (expected)");
             }
@@ -768,8 +777,11 @@ mod serde_tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("Parse failed");
 
         // Check that config is present and correct
-        assert!(parsed.get("config").is_some(), "Config should be serialized");
-        
+        assert!(
+            parsed.get("config").is_some(),
+            "Config should be serialized"
+        );
+
         let config_json = &parsed["config"];
         assert_eq!(config_json["input_dim"], 4);
         assert_eq!(config_json["output_dim"], 2);
@@ -777,7 +789,7 @@ mod serde_tests {
         assert_eq!(config_json["spline_order"], 4);
 
         println!("✓ Config properly embedded in serialized network");
-        
+
         // NOTE: For true backward compatibility, we would need to add a version field
         // to KanNetwork and handle migrations. This test documents the current behavior.
     }
@@ -799,18 +811,15 @@ mod serde_tests {
         };
 
         let network = KanNetwork::new(config);
-        
+
         // Record original structure
         let original_layer_dims: Vec<(usize, usize)> = network
             .layers
             .iter()
             .map(|l| (l.in_dim, l.out_dim))
             .collect();
-        let original_weight_counts: Vec<usize> = network
-            .layers
-            .iter()
-            .map(|l| l.weights.len())
-            .collect();
+        let original_weight_counts: Vec<usize> =
+            network.layers.iter().map(|l| l.weights.len()).collect();
 
         // Roundtrip
         let json = serde_json::to_string(&network).expect("Serialize failed");
@@ -823,11 +832,32 @@ mod serde_tests {
             "Layer count mismatch"
         );
 
-        for (i, (orig_layer, rest_layer)) in network.layers.iter().zip(restored.layers.iter()).enumerate() {
-            assert_eq!(orig_layer.in_dim, rest_layer.in_dim, "Layer {} in_dim mismatch", i);
-            assert_eq!(orig_layer.out_dim, rest_layer.out_dim, "Layer {} out_dim mismatch", i);
-            assert_eq!(orig_layer.order, rest_layer.order, "Layer {} order mismatch", i);
-            assert_eq!(orig_layer.grid_size, rest_layer.grid_size, "Layer {} grid_size mismatch", i);
+        for (i, (orig_layer, rest_layer)) in network
+            .layers
+            .iter()
+            .zip(restored.layers.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                orig_layer.in_dim, rest_layer.in_dim,
+                "Layer {} in_dim mismatch",
+                i
+            );
+            assert_eq!(
+                orig_layer.out_dim, rest_layer.out_dim,
+                "Layer {} out_dim mismatch",
+                i
+            );
+            assert_eq!(
+                orig_layer.order, rest_layer.order,
+                "Layer {} order mismatch",
+                i
+            );
+            assert_eq!(
+                orig_layer.grid_size, rest_layer.grid_size,
+                "Layer {} grid_size mismatch",
+                i
+            );
             assert_eq!(
                 orig_layer.weights.len(),
                 rest_layer.weights.len(),
@@ -863,7 +893,10 @@ mod serde_tests {
         ];
 
         println!("Serialization size comparison:");
-        println!("{:<15} {:>12} {:>12} {:>8}", "Size", "JSON (KB)", "Bincode (KB)", "Ratio");
+        println!(
+            "{:<15} {:>12} {:>12} {:>8}",
+            "Size", "JSON (KB)", "Bincode (KB)", "Ratio"
+        );
         println!("{}", "-".repeat(50));
 
         for (input, hidden, output, name) in configs {
@@ -881,7 +914,7 @@ mod serde_tests {
             };
 
             let network = KanNetwork::new(config);
-            
+
             let json = serde_json::to_string(&network).expect("JSON serialize failed");
             let bytes = bincode::serialize(&network).expect("Bincode serialize failed");
 
@@ -889,7 +922,10 @@ mod serde_tests {
             let bin_kb = bytes.len() as f64 / 1024.0;
             let ratio = json.len() as f64 / bytes.len() as f64;
 
-            println!("{:<15} {:>12.2} {:>12.2} {:>8.1}x", name, json_kb, bin_kb, ratio);
+            println!(
+                "{:<15} {:>12.2} {:>12.2} {:>8.1}x",
+                name, json_kb, bin_kb, ratio
+            );
 
             // Bincode should always be smaller
             assert!(

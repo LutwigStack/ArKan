@@ -715,7 +715,6 @@ impl Adam {
             params[i] -= update;
         }
     }
-
 }
 
 impl Clone for Adam {
@@ -2209,12 +2208,8 @@ mod tests {
         let inf_weight_grads = vec![vec![f32::INFINITY; network.layers[0].weights.len()]];
         let normal_bias_grads = vec![vec![0.5f32; network.layers[0].bias.len()]];
 
-        let result = optimizer_strict.step(
-            &mut network,
-            &inf_weight_grads,
-            &normal_bias_grads,
-            None,
-        );
+        let result =
+            optimizer_strict.step(&mut network, &inf_weight_grads, &normal_bias_grads, None);
         assert!(
             result.is_err(),
             "SafetyConfig::strict() must return Err for inf gradient"
@@ -2227,12 +2222,8 @@ mod tests {
             &network2,
             AdamConfig::with_lr(0.1).with_safety(SafetyConfig::strict()),
         );
-        let result2 = optimizer_strict2.step(
-            &mut network2,
-            &neg_inf_grads,
-            &normal_bias_grads,
-            None,
-        );
+        let result2 =
+            optimizer_strict2.step(&mut network2, &neg_inf_grads, &normal_bias_grads, None);
         assert!(
             result2.is_err(),
             "SafetyConfig::strict() must return Err for -inf gradient"
@@ -2270,16 +2261,8 @@ mod tests {
         let normal_bias_grads = vec![vec![0.5f32; network.layers[0].bias.len()]];
 
         // Step should succeed (Ok) but skip the update
-        let result = optimizer.step(
-            &mut network,
-            &inf_weight_grads,
-            &normal_bias_grads,
-            None,
-        );
-        assert!(
-            result.is_ok(),
-            "skip_step_on_nan should return Ok, not Err"
-        );
+        let result = optimizer.step(&mut network, &inf_weight_grads, &normal_bias_grads, None);
+        assert!(result.is_ok(), "skip_step_on_nan should return Ok, not Err");
 
         // Parameters must be completely unchanged
         assert_eq!(

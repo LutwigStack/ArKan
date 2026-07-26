@@ -726,7 +726,8 @@ impl GpuSgd {
                 ],
             });
 
-            let workgroups = (self.weight_states[i].num_params as u32).div_ceil(OPTIMIZER_WORKGROUP_SIZE);
+            let workgroups =
+                (self.weight_states[i].num_params as u32).div_ceil(OPTIMIZER_WORKGROUP_SIZE);
 
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -777,7 +778,8 @@ impl GpuSgd {
                 ],
             });
 
-            let workgroups = (self.bias_states[i].num_params as u32).div_ceil(OPTIMIZER_WORKGROUP_SIZE);
+            let workgroups =
+                (self.bias_states[i].num_params as u32).div_ceil(OPTIMIZER_WORKGROUP_SIZE);
 
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

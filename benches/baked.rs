@@ -67,9 +67,7 @@ fn print_size_comparison(label: &str, baked: &BakedModel, network: &KanNetwork) 
     let baked_bytes = baked.size_bytes();
     let f32_bytes = f32_weight_bytes(network);
     let ratio = f32_bytes as f32 / baked_bytes as f32;
-    println!(
-        "[size] {label}: baked={baked_bytes} B  f32={f32_bytes} B  compression={ratio:.2}x"
-    );
+    println!("[size] {label}: baked={baked_bytes} B  f32={f32_bytes} B  compression={ratio:.2}x");
 }
 
 // ---------------------------------------------------------------------------
@@ -97,11 +95,7 @@ fn bench_small(c: &mut Criterion) {
 
     group.bench_function("f32_forward_single", |b| {
         b.iter(|| {
-            network.forward_single(
-                black_box(&input),
-                black_box(&mut f32_out),
-                &mut workspace,
-            );
+            network.forward_single(black_box(&input), black_box(&mut f32_out), &mut workspace);
         });
     });
 
@@ -134,11 +128,7 @@ fn bench_medium(c: &mut Criterion) {
 
     group.bench_function("f32_forward_single", |b| {
         b.iter(|| {
-            network.forward_single(
-                black_box(&input),
-                black_box(&mut f32_out),
-                &mut workspace,
-            );
+            network.forward_single(black_box(&input), black_box(&mut f32_out), &mut workspace);
         });
     });
 

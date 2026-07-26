@@ -171,9 +171,7 @@ fn baked_parity_small() {
 
     let (nrmse, worst_case) = measure_accuracy(&network, &baked, &test, input_dim, output_dim);
 
-    println!(
-        "\n[baked_parity_small] config=4→[8]→2, grid=5, order=3"
-    );
+    println!("\n[baked_parity_small] config=4→[8]→2, grid=5, order=3");
     println!(
         "  NRMSE (aggregate L2 relative error):          {:.4} ({:.2}%)",
         nrmse,
@@ -219,9 +217,7 @@ fn baked_parity_medium() {
 
     let (nrmse, worst_case) = measure_accuracy(&network, &baked, &test, input_dim, output_dim);
 
-    println!(
-        "\n[baked_parity_medium] config=8→[16,8]→4, grid=5, order=3"
-    );
+    println!("\n[baked_parity_medium] config=8→[16,8]→4, grid=5, order=3");
     println!(
         "  NRMSE (aggregate L2 relative error):          {:.4} ({:.2}%)",
         nrmse,
@@ -265,9 +261,7 @@ fn baked_parity_single_layer() {
 
     let (nrmse, worst_case) = measure_accuracy(&network, &baked, &test, input_dim, output_dim);
 
-    println!(
-        "\n[baked_parity_single_layer] config=4→2, grid=5, order=3"
-    );
+    println!("\n[baked_parity_single_layer] config=4→2, grid=5, order=3");
     println!(
         "  NRMSE (aggregate L2 relative error):          {:.4} ({:.2}%)",
         nrmse,

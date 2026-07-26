@@ -1069,12 +1069,7 @@ impl KanNetwork {
     ) -> ArkanResult<f32> {
         let loss = self.try_forward_backward_mse(input, target, mask, workspace, opts)?;
         // Clipping was already applied in-place by the helper; pass None to avoid double-clip.
-        optimizer.step(
-            self,
-            &workspace.weight_grads,
-            &workspace.bias_grads,
-            None,
-        )?;
+        optimizer.step(self, &workspace.weight_grads, &workspace.bias_grads, None)?;
         Ok(loss)
     }
 

@@ -399,11 +399,7 @@ impl KanConfig {
     /// Returns [`ConfigError::MismatchedNormalization`] if `mean.len()` or `std.len()`
     /// does not equal `input_dim`. This replaces a previous `debug_assert` that was
     /// silently ignored in release builds.
-    pub fn set_normalization(
-        &mut self,
-        mean: Vec<f32>,
-        std: Vec<f32>,
-    ) -> Result<(), ConfigError> {
+    pub fn set_normalization(&mut self, mean: Vec<f32>, std: Vec<f32>) -> Result<(), ConfigError> {
         if mean.len() != self.input_dim {
             return Err(ConfigError::MismatchedNormalization("input_mean"));
         }
@@ -478,7 +474,9 @@ pub enum ConfigError {
     ///
     /// All standard deviations must be positive. If you want EPSILON clamping,
     /// apply it explicitly before calling [`KanConfig::validate`].
-    #[error("input_std contains zero or negative values; all standard deviations must be positive")]
+    #[error(
+        "input_std contains zero or negative values; all standard deviations must be positive"
+    )]
     NonPositiveInputStd,
 }
 
@@ -869,7 +867,10 @@ mod tests {
         let err = config
             .set_normalization(vec![0.0; 5], vec![1.0; 21])
             .unwrap_err();
-        assert!(matches!(err, ConfigError::MismatchedNormalization("input_mean")));
+        assert!(matches!(
+            err,
+            ConfigError::MismatchedNormalization("input_mean")
+        ));
     }
 
     #[test]
@@ -878,7 +879,10 @@ mod tests {
         let err = config
             .set_normalization(vec![0.0; 21], vec![1.0; 5])
             .unwrap_err();
-        assert!(matches!(err, ConfigError::MismatchedNormalization("input_std")));
+        assert!(matches!(
+            err,
+            ConfigError::MismatchedNormalization("input_std")
+        ));
     }
 
     #[test]

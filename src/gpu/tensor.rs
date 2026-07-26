@@ -461,7 +461,6 @@ impl GpuTensor {
     pub fn size_bytes(&self) -> u64 {
         (self.num_elements() * std::mem::size_of::<f32>()) as u64
     }
-
 }
 
 impl std::fmt::Debug for GpuTensor {
