@@ -245,3 +245,80 @@ fn real_consumers_keep_forward_and_parallel_gradient_bits_across_workers() {
         }
     }
 }
+
+#[test]
+fn dropping_completed_pass_preserves_gradients_and_allows_smaller_reuse() {
+    // A forward that clears gradients or leaves workers borrowing the workspace breaks reuse.
+    in_pool(4, || {
+        let net = model(9, 3, 8, 1);
+        let mut ws = net.create_workspace(129);
+        let input = inputs(&net, 129);
+        let mut output = vec![0.0; 129 * 3];
+        net.try_forward_for_backward(&input, &mut output, &mut ws)
+            .unwrap()
+            .backward(&vec![0.25; output.len()])
+            .unwrap();
+        assert!(ws.weight_grads.iter().flatten().any(|&g| g != 0.0));
+        assert!(ws.bias_grads.iter().flatten().any(|&g| g != 0.0));
+        let parameters = parameter_bits(&net);
+        let gradients = gradient_bits(&ws);
+        let pass = net
+            .try_forward_for_backward(&input, &mut output, &mut ws)
+            .unwrap();
+        drop(pass);
+        assert_eq!(parameter_bits(&net), parameters);
+        assert_eq!(gradient_bits(&ws), gradients);
+
+        let mut smaller = vec![0.0; 7 * 3];
+        net.try_forward_for_backward(&inputs(&net, 7), &mut smaller, &mut ws)
+            .unwrap()
+            .backward(&vec![0.25; smaller.len()])
+            .unwrap();
+        let mut fresh = net.create_workspace(7);
+        let mut expected = vec![0.0; 7 * 3];
+        net.try_forward_for_backward(&inputs(&net, 7), &mut expected, &mut fresh)
+            .unwrap()
+            .backward(&vec![0.25; expected.len()])
+            .unwrap();
+        assert_eq!(bits(&smaller), bits(&expected));
+        assert_eq!(history(&net, &ws, 7), history(&net, &fresh, 7));
+        assert_eq!(gradient_bits(&ws), gradient_bits(&fresh));
+        assert_eq!(parameter_bits(&net), parameters);
+    });
+}
+
+fn shared_model_snapshot(net: &KanNetwork, batch: usize) -> Vec<u32> {
+    let mut ws = net.create_workspace(1);
+    let input = inputs(net, batch);
+    let mut output = vec![0.0; batch * 3];
+    net.try_forward_batch_training(&input, &mut output, &mut ws)
+        .unwrap();
+    let mut snapshot = bits(&output);
+    snapshot.extend(history(net, &ws, batch));
+    net.try_forward_for_backward(&input, &mut output, &mut ws)
+        .unwrap()
+        .backward(&vec![0.25; output.len()])
+        .unwrap();
+    snapshot.extend(gradient_bits(&ws));
+    snapshot
+}
+
+#[test]
+fn concurrent_shared_model_consumers_match_sequential_independent_workspaces() {
+    // Sharing mutable prepared caches or returning before joined workers finish changes snapshots.
+    in_pool(4, || {
+        let net = model(9, 3, 8, 1);
+        let parameters = parameter_bits(&net);
+        let expected = [
+            shared_model_snapshot(&net, 129),
+            shared_model_snapshot(&net, 7),
+        ];
+        let actual = std::thread::scope(|scope| {
+            let large = scope.spawn(|| shared_model_snapshot(&net, 129));
+            let small = scope.spawn(|| shared_model_snapshot(&net, 7));
+            [large.join().unwrap(), small.join().unwrap()]
+        });
+        assert_eq!(actual, expected);
+        assert_eq!(parameter_bits(&net), parameters);
+    });
+}
