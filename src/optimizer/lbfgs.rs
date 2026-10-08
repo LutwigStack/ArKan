@@ -336,7 +336,7 @@ impl LBFGS {
         direction: &[f32],
     ) -> ArkanResult<Option<(f64, Vec<f32>, f64)>>
     where
-        F: FnMut(&mut KanNetwork) -> ArkanResult<LBFGSEvaluation>,
+        F: FnMut(&KanNetwork) -> ArkanResult<LBFGSEvaluation>,
     {
         const C1: f64 = 1e-4;
         const C2: f64 = 0.9;
@@ -436,7 +436,7 @@ impl LBFGS {
         direction: &[f32],
     ) -> ArkanResult<Option<(f64, Vec<f32>, f64)>>
     where
-        F: FnMut(&mut KanNetwork) -> ArkanResult<LBFGSEvaluation>,
+        F: FnMut(&KanNetwork) -> ArkanResult<LBFGSEvaluation>,
     {
         const C1: f64 = 1e-4;
         const RHO: f64 = 0.5; // Backtrack factor
@@ -559,8 +559,10 @@ impl Optimizer for LBFGS {
 impl LBFGS {
     /// Performs L-BFGS optimization step.
     ///
-    /// The closure should compute loss and gradients given the current network state.
-    /// It will be called multiple times during line search.
+    /// The closure evaluates loss and gradients through a shared network borrow, so it
+    /// cannot change model parameters or topology. It retains `FnMut`: captured
+    /// workspace, gradient buffers and external state may be mutated between calls.
+    /// It may be called multiple times during line search; returning `Err` cancels the step.
     ///
     /// # Arguments
     ///
@@ -573,9 +575,8 @@ impl LBFGS {
     ///
     /// # Rollback Guarantee
     ///
-    /// On any evaluation or line-search error, parameters and history are restored.
+    /// On any returned evaluation or line-search error, parameters and history are restored.
     /// The original error is returned. Evaluation counts include failed objective calls.
-    /// The closure must evaluate the supplied parameters without changing topology.
     /// `max_iter` bounds accepted iterations; `max_eval` includes the initial evaluation.
     ///
     /// # Example
@@ -589,18 +590,34 @@ impl LBFGS {
     /// let mut workspace = network.create_workspace(2);
     /// let mut output = [0.0; 2];
     /// let mut derivative = [0.0; 2];
-    /// let loss = optimizer.step_lbfgs(&mut network, |net| {
+    /// let mut evaluations = 0;
+    /// let loss = optimizer.step_lbfgs(&mut network, |net: &KanNetwork| {
+    ///     evaluations += 1;
     ///     let pass = net.try_forward_for_backward(&[-0.25, 0.5], &mut output, &mut workspace)?;
     ///     let loss = masked_mse_into(&output, &[0.0, 0.5], None, &mut derivative)?;
     ///     let gradients = pass.backward(&derivative)?;
     ///     Ok((loss as f64, LBFGS::flatten_grads(gradients.weights, gradients.biases)))
     /// })?;
     /// assert!(loss.is_finite());
+    /// assert!(evaluations > 0);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// A callback cannot mutate the model it evaluates:
+    ///
+    /// ```compile_fail,E0596
+    /// use arkan::{KanConfig, KanNetwork, LBFGS, LBFGSConfig};
+    /// let mut network = KanNetwork::new(KanConfig::default());
+    /// let mut optimizer = LBFGS::new(&network, LBFGSConfig::default());
+    /// let _ = optimizer.step_lbfgs(&mut network, |net| {
+    ///     net.layers[0].weights[0] = 0.0;
+    ///     net.layers.clear();
+    ///     Ok((0.0, Vec::new()))
+    /// });
     /// ```
     pub fn step_lbfgs<F>(&mut self, network: &mut KanNetwork, mut closure: F) -> ArkanResult<f64>
     where
-        F: FnMut(&mut KanNetwork) -> ArkanResult<(f64, Vec<f32>)>,
+        F: FnMut(&KanNetwork) -> ArkanResult<(f64, Vec<f32>)>,
     {
         network.checked_layout()?;
         validate_safety(&self.config.safety, None)?;
@@ -653,11 +670,16 @@ impl LBFGS {
         let mut numerical_failure = false;
         let mut initial_loss = None;
         let result = (|| {
-            let mut evaluate = |net: &mut KanNetwork| -> ArkanResult<LBFGSEvaluation> {
+            let mut evaluate = |net: &KanNetwork| -> ArkanResult<LBFGSEvaluation> {
                 if evaluations.get() >= budget {
                     return Ok(LBFGSEvaluation::BudgetExhausted);
                 }
-                if Self::flatten_params(net).iter().any(|p| !p.is_finite()) {
+                if net
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.weights.iter().chain(&layer.bias))
+                    .any(|p| !p.is_finite())
+                {
                     return Ok(LBFGSEvaluation::RejectedNonFinite);
                 }
                 evaluations.set(evaluations.get() + 1);
