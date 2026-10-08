@@ -452,13 +452,11 @@ impl KanNetwork {
     /// These history buffers are prepared by [`Workspace::prepare_training`] and
     /// sized to `batch_size * in_dim` per layer.
     ///
-    /// # Storage and Scheduling
+    /// # Zero-Allocation Note
     ///
-    /// After warmup for the required capacity, ArKan reuses its execution and
-    /// history storage. With `parallel`, the configured multithreading threshold
-    /// also schedules cached output accumulation when multiple workers are available.
-    /// External-thread calls may allocate Rayon scheduling-queue blocks; warmed
-    /// enclosing-pool zero-allocation observations do not guarantee this for every pool.
+    /// After warmup (first call with a given batch size), this method performs
+    /// zero heap allocations. The history buffers grow monotonically and are
+    /// reused across training steps.
     pub fn forward_batch_training(
         &self,
         input: &[f32],
@@ -566,9 +564,6 @@ impl KanNetwork {
         }
 
         workspace.try_prepare_training(batch_size, &self.config, self.layout().layer_dims())?;
-        let parallel_accumulation = cfg!(feature = "parallel")
-            && batch_size > 1
-            && batch_size >= self.config.multithreading_threshold;
 
         let max_hidden = self
             .layout()
@@ -610,12 +605,11 @@ impl KanNetwork {
                 };
 
                 output_buf.try_resize(out_size)?;
-                layer.forward_batch_impl(
+                layer.forward_batch(
                     input_slice,
                     &mut output_buf.as_mut_slice()[..out_size],
                     workspace,
-                    parallel_accumulation,
-                )?;
+                );
 
                 // Save normalized inputs and grid indices for backward
                 let hist_in = &mut workspace.layers_inputs[layer_idx].as_mut_slice()[..in_size];
