@@ -1379,6 +1379,12 @@ pub struct LBFGS {
 unsafe impl Send for LBFGS {}
 unsafe impl Sync for LBFGS {}
 
+enum LBFGSEvaluation {
+    Finite(f64, Vec<f32>),
+    RejectedNonFinite,
+    BudgetExhausted,
+}
+
 impl LBFGS {
     /// Creates a new L-BFGS optimizer.
     pub fn new(_network: &KanNetwork, config: LBFGSConfig) -> Self {
@@ -1559,6 +1565,18 @@ impl LBFGS {
         grad.iter().map(|&g| (g as f64).powi(2)).sum::<f64>().sqrt()
     }
 
+    // Numerical exhaustion is separate from closure errors for the caller's safety policy.
+    fn exhausted_line_search(
+        numerical_rejection: bool,
+        reason: &str,
+    ) -> ArkanResult<Option<(f64, Vec<f32>, f64)>> {
+        if numerical_rejection {
+            Ok(None)
+        } else {
+            Err(ArkanError::line_search_failed(reason))
+        }
+    }
+
     /// Strong Wolfe line search.
     ///
     /// Finds step size α satisfying Strong Wolfe conditions:
@@ -1577,9 +1595,9 @@ impl LBFGS {
         f0: f64,
         g0: &[f32],
         direction: &[f32],
-    ) -> ArkanResult<(f64, Vec<f32>, f64)>
+    ) -> ArkanResult<Option<(f64, Vec<f32>, f64)>>
     where
-        F: FnMut(&mut KanNetwork) -> ArkanResult<(f64, Vec<f32>)>,
+        F: FnMut(&mut KanNetwork) -> ArkanResult<LBFGSEvaluation>,
     {
         const C1: f64 = 1e-4;
         const C2: f64 = 0.9;
@@ -1596,6 +1614,7 @@ impl LBFGS {
         }
 
         let mut alpha = self.config.lr as f64;
+        let mut numerical_rejection = false;
         let mut alpha_lo: f64 = 0.0;
         let mut alpha_hi: f64 = ALPHA_MAX;
         let mut f_lo = f0;
@@ -1609,15 +1628,21 @@ impl LBFGS {
                 .collect();
 
             Self::restore_params(network, &x_new);
-            let (f_new, g_new) = closure(network)?;
-
-            // Check for NaN
-            if f_new.is_nan() || !f_new.is_finite() {
-                // Reduce step size
-                alpha_hi = alpha;
-                alpha = (alpha_lo + alpha_hi) / 2.0;
-                continue;
-            }
+            let (f_new, g_new) = match closure(network)? {
+                LBFGSEvaluation::Finite(loss, gradient) => (loss, gradient),
+                LBFGSEvaluation::RejectedNonFinite => {
+                    numerical_rejection = true;
+                    alpha_hi = alpha;
+                    alpha = (alpha_lo + alpha_hi) / 2.0;
+                    continue;
+                }
+                LBFGSEvaluation::BudgetExhausted => {
+                    return Self::exhausted_line_search(
+                        numerical_rejection,
+                        "LBFGS evaluation budget exhausted",
+                    );
+                }
+            };
 
             let dg_new = Self::directional_derivative(&g_new, direction);
 
@@ -1629,7 +1654,7 @@ impl LBFGS {
                 // Check Strong Wolfe curvature condition
                 if dg_new.abs() <= -C2 * dg0 {
                     // Both conditions satisfied
-                    return Ok((alpha, g_new, f_new));
+                    return Ok(Some((alpha, g_new, f_new)));
                 }
 
                 if dg_new >= 0.0 {
@@ -1649,17 +1674,16 @@ impl LBFGS {
             // Zoom phase: binary search in [alpha_lo, alpha_hi]
             if (alpha_hi - alpha_lo).abs() < 1e-10 {
                 // Interval too small
-                return Err(ArkanError::line_search_failed(
+                return Self::exhausted_line_search(
+                    numerical_rejection,
                     "Strong Wolfe interval exhausted",
-                ));
+                );
             }
 
             alpha = (alpha_lo + alpha_hi) / 2.0;
         }
 
-        Err(ArkanError::line_search_failed(
-            "Strong Wolfe search exhausted",
-        ))
+        Self::exhausted_line_search(numerical_rejection, "Strong Wolfe search exhausted")
     }
 
     /// Backtracking line search with Armijo condition.
@@ -1671,9 +1695,9 @@ impl LBFGS {
         f0: f64,
         g0: &[f32],
         direction: &[f32],
-    ) -> ArkanResult<(f64, Vec<f32>, f64)>
+    ) -> ArkanResult<Option<(f64, Vec<f32>, f64)>>
     where
-        F: FnMut(&mut KanNetwork) -> ArkanResult<(f64, Vec<f32>)>,
+        F: FnMut(&mut KanNetwork) -> ArkanResult<LBFGSEvaluation>,
     {
         const C1: f64 = 1e-4;
         const RHO: f64 = 0.5; // Backtrack factor
@@ -1681,6 +1705,7 @@ impl LBFGS {
 
         let dg0 = Self::directional_derivative(g0, direction);
         let mut alpha = self.config.lr as f64;
+        let mut numerical_rejection = false;
 
         for _ in 0..MAX_LS_ITER {
             let x_new: Vec<f32> = x0
@@ -1690,19 +1715,33 @@ impl LBFGS {
                 .collect();
 
             Self::restore_params(network, &x_new);
-            let (f_new, g_new) = closure(network)?;
+            let (f_new, g_new) = match closure(network)? {
+                LBFGSEvaluation::Finite(loss, gradient) => (loss, gradient),
+                LBFGSEvaluation::RejectedNonFinite => {
+                    numerical_rejection = true;
+                    alpha *= RHO;
+                    continue;
+                }
+                LBFGSEvaluation::BudgetExhausted => {
+                    return Self::exhausted_line_search(
+                        numerical_rejection,
+                        "LBFGS evaluation budget exhausted",
+                    );
+                }
+            };
 
             // Check Armijo condition
             if f_new <= f0 + C1 * alpha * dg0 {
-                return Ok((alpha, g_new, f_new));
+                return Ok(Some((alpha, g_new, f_new)));
             }
 
             alpha *= RHO;
         }
 
-        Err(ArkanError::line_search_failed(
+        Self::exhausted_line_search(
+            numerical_rejection,
             "Backtracking line search did not converge",
-        ))
+        )
     }
 }
 
@@ -1869,30 +1908,37 @@ impl LBFGS {
         let mut numerical_failure = false;
         let mut initial_loss = None;
         let result = (|| {
-            let mut evaluate = |net: &mut KanNetwork| -> ArkanResult<(f64, Vec<f32>)> {
+            let mut evaluate = |net: &mut KanNetwork| -> ArkanResult<LBFGSEvaluation> {
                 if evaluations.get() >= budget {
-                    return Err(ArkanError::line_search_failed(
-                        "LBFGS evaluation budget exhausted",
-                    ));
+                    return Ok(LBFGSEvaluation::BudgetExhausted);
                 }
                 if Self::flatten_params(net).iter().any(|p| !p.is_finite()) {
-                    numerical_failure = true;
-                    return Err(ArkanError::nan_encountered(0, "LBFGS trial parameters"));
+                    return Ok(LBFGSEvaluation::RejectedNonFinite);
                 }
                 evaluations.set(evaluations.get() + 1);
                 let (loss, gradient) = closure(net)?;
                 initial_loss.get_or_insert(loss);
                 validate_shape(size, gradient.len())?;
                 if !loss.is_finite() || find_nan_in_grads(&gradient).is_some() {
+                    return Ok(LBFGSEvaluation::RejectedNonFinite);
+                }
+                Ok(LBFGSEvaluation::Finite(loss, gradient))
+            };
+            let (mut loss, mut gradient) = match evaluate(network)? {
+                LBFGSEvaluation::Finite(loss, gradient) => (loss, gradient),
+                LBFGSEvaluation::RejectedNonFinite => {
                     numerical_failure = true;
                     return Err(ArkanError::nan_encountered(
                         0,
-                        "LBFGS objective or gradient",
+                        "LBFGS initial objective or parameters",
                     ));
                 }
-                Ok((loss, gradient))
+                LBFGSEvaluation::BudgetExhausted => {
+                    return Err(ArkanError::line_search_failed(
+                        "LBFGS evaluation budget exhausted",
+                    ))
+                }
             };
-            let (mut loss, mut gradient) = evaluate(network)?;
             let mut params = original_params.clone();
             for _ in 0..self.config.max_iter {
                 if Self::grad_norm(&gradient) <= self.config.tolerance_grad {
@@ -1906,7 +1952,7 @@ impl LBFGS {
                 if find_nan_in_grads(&direction).is_some() {
                     return Err(ArkanError::optimizer("LBFGS search direction is nonfinite"));
                 }
-                let (alpha, new_gradient, new_loss) = match self.config.line_search_fn {
+                let accepted_point = match self.config.line_search_fn {
                     LineSearchMethod::StrongWolfe => self.strong_wolfe_line_search(
                         network,
                         &mut evaluate,
@@ -1931,9 +1977,25 @@ impl LBFGS {
                             .map(|(&x, &d)| (x as f64 + alpha * d as f64) as f32)
                             .collect();
                         Self::restore_params(network, &trial);
-                        let (new_loss, new_gradient) = evaluate(network)?;
-                        (alpha, new_gradient, new_loss)
+                        match evaluate(network)? {
+                            LBFGSEvaluation::Finite(new_loss, new_gradient) => {
+                                Some((alpha, new_gradient, new_loss))
+                            }
+                            LBFGSEvaluation::RejectedNonFinite => None,
+                            LBFGSEvaluation::BudgetExhausted => {
+                                return Err(ArkanError::line_search_failed(
+                                    "LBFGS evaluation budget exhausted",
+                                ))
+                            }
+                        }
                     }
+                };
+                let Some((alpha, new_gradient, new_loss)) = accepted_point else {
+                    numerical_failure = true;
+                    return Err(ArkanError::nan_encountered(
+                        0,
+                        "LBFGS numerical trials exhausted",
+                    ));
                 };
                 let accepted: Vec<f32> = params
                     .iter()

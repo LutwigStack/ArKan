@@ -329,3 +329,218 @@ fn deserialized_invalid_adam_state_is_rejected_when_bound_to_network() {
     assert!(adam.step(&mut net, &wg, &bg, None).is_err());
     assert_eq!(LBFGS::flatten_params(&net), before);
 }
+
+#[test]
+fn lbfgs_line_search_recovers_from_nonfinite_trials_before_accepting() {
+    for method in [
+        LineSearchMethod::StrongWolfe,
+        LineSearchMethod::Backtracking,
+    ] {
+        for safety in [SafetyConfig::default(), SafetyConfig::strict()] {
+            let mut net = network(false);
+            net.layers[0].weights[0] = 10.0;
+            let mut optimizer = LBFGS::new(
+                &net,
+                LBFGSConfig {
+                    max_iter: 1,
+                    line_search_fn: method,
+                    safety,
+                    ..Default::default()
+                },
+            );
+            let mut rejected = 0;
+            let loss = optimizer
+                .step_lbfgs(&mut net, |net| {
+                    let params = LBFGS::flatten_params(net);
+                    let x = params[0] as f64;
+                    let loss = x.exp() + (-x).exp();
+                    let mut gradient = vec![0.0; params.len()];
+                    gradient[0] = (x.exp() - (-x).exp()) as f32;
+                    if !loss.is_finite() || !gradient[0].is_finite() {
+                        rejected += 1;
+                    }
+                    Ok((loss, gradient))
+                })
+                .unwrap();
+            assert!(rejected > 0);
+            assert!(loss < 3.0, "{method:?}: loss={loss}");
+            let x = net.layers[0].weights[0] as f64;
+            assert_eq!(loss, x.exp() + (-x).exp());
+            assert!(optimizer.num_evals() > 2 && optimizer.num_evals() <= 25);
+            assert!(optimizer
+                .two_loop_recursion(&vec![1.0; LBFGS::flatten_params(&net).len()])
+                .iter()
+                .all(|g| g.is_finite()));
+        }
+    }
+}
+
+#[test]
+fn lbfgs_closure_error_after_numerical_rejection_is_preserved() {
+    for method in [
+        LineSearchMethod::StrongWolfe,
+        LineSearchMethod::Backtracking,
+    ] {
+        let mut net = network(false);
+        net.layers[0].weights[0] = 1.0;
+        let before = LBFGS::flatten_params(&net);
+        let mut optimizer = LBFGS::new(
+            &net,
+            LBFGSConfig {
+                line_search_fn: method,
+                ..Default::default()
+            },
+        );
+        let mut calls = 0;
+        let error = optimizer
+            .step_lbfgs(&mut net, |net| {
+                calls += 1;
+                match calls {
+                    1 => quadratic(net, 1.0),
+                    2 => Ok((f64::INFINITY, vec![0.0; before.len()])),
+                    _ => Err(ArkanError::optimizer(
+                        "objective error after rejected trial",
+                    )),
+                }
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("objective error after rejected trial"));
+        assert_eq!(LBFGS::flatten_params(&net), before);
+        assert_eq!(calls, 3);
+    }
+}
+
+#[test]
+fn lbfgs_malformed_trial_gradient_is_rejected_without_backtracking() {
+    for method in [
+        LineSearchMethod::StrongWolfe,
+        LineSearchMethod::Backtracking,
+    ] {
+        let mut net = network(false);
+        net.layers[0].weights[0] = 1.0;
+        let before = LBFGS::flatten_params(&net);
+        let mut optimizer = LBFGS::new(
+            &net,
+            LBFGSConfig {
+                line_search_fn: method,
+                ..Default::default()
+            },
+        );
+        let mut calls = 0;
+        assert!(optimizer
+            .step_lbfgs(&mut net, |net| {
+                calls += 1;
+                if calls == 1 {
+                    quadratic(net, 1.0)
+                } else {
+                    Ok((f64::INFINITY, vec![]))
+                }
+            })
+            .is_err());
+        assert_eq!(calls, 2);
+        assert_eq!(LBFGS::flatten_params(&net), before);
+    }
+}
+
+#[test]
+fn lbfgs_rejects_nonfinite_trial_gradients_even_when_trial_loss_decreases() {
+    for method in [
+        LineSearchMethod::StrongWolfe,
+        LineSearchMethod::Backtracking,
+    ] {
+        let mut net = network(false);
+        net.layers[0].weights[0] = 1.0;
+        let mut optimizer = LBFGS::new(
+            &net,
+            LBFGSConfig {
+                max_iter: 1,
+                line_search_fn: method,
+                safety: SafetyConfig::strict(),
+                ..Default::default()
+            },
+        );
+        let mut calls = 0;
+        let loss = optimizer
+            .step_lbfgs(&mut net, |net| {
+                calls += 1;
+                let (loss, mut gradient) = quadratic(net, 1.0)?;
+                if calls == 2 {
+                    gradient[0] = f32::NAN;
+                }
+                Ok((loss, gradient))
+            })
+            .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(loss, 0.125);
+        assert_eq!(net.layers[0].weights[0], 0.5);
+    }
+}
+
+#[test]
+fn lbfgs_numerical_trial_exhaustion_applies_safety_policy_and_rolls_back() {
+    for method in [
+        LineSearchMethod::StrongWolfe,
+        LineSearchMethod::Backtracking,
+    ] {
+        for safety in [SafetyConfig::default(), SafetyConfig::strict()] {
+            let mut net = network(false);
+            net.layers[0].weights[0] = 1.0;
+            let before = LBFGS::flatten_params(&net);
+            let mut optimizer = LBFGS::new(
+                &net,
+                LBFGSConfig {
+                    max_eval: Some(2),
+                    line_search_fn: method,
+                    safety,
+                    ..Default::default()
+                },
+            );
+            let mut calls = 0;
+            let result = optimizer.step_lbfgs(&mut net, |net| {
+                calls += 1;
+                if calls == 1 {
+                    quadratic(net, 1.0)
+                } else {
+                    Ok((f64::INFINITY, vec![0.0; before.len()]))
+                }
+            });
+            if safety.skip_step_on_nan {
+                assert_eq!(result.unwrap(), 0.5);
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(LBFGS::flatten_params(&net), before);
+            assert_eq!(calls, 2);
+            assert_eq!(optimizer.num_evals(), 2);
+        }
+    }
+}
+
+#[test]
+fn lbfgs_invalid_initial_objective_never_enters_line_search() {
+    for safety in [SafetyConfig::default(), SafetyConfig::strict()] {
+        let mut net = network(false);
+        let before = LBFGS::flatten_params(&net);
+        let mut optimizer = LBFGS::new(
+            &net,
+            LBFGSConfig {
+                safety,
+                ..Default::default()
+            },
+        );
+        let mut calls = 0;
+        let result = optimizer.step_lbfgs(&mut net, |_| {
+            calls += 1;
+            Ok((f64::INFINITY, vec![0.0; before.len()]))
+        });
+        if safety.skip_step_on_nan {
+            assert_eq!(result.unwrap(), f64::INFINITY);
+        } else {
+            assert!(result.is_err());
+        }
+        assert_eq!(calls, 1);
+        assert_eq!(LBFGS::flatten_params(&net), before);
+    }
+}
