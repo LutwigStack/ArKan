@@ -85,6 +85,38 @@ pub fn compute_knots(grid_size: usize, order: usize, grid_range: (f32, f32)) -> 
         .collect()
 }
 
+/// Validate generated knots without allocating at runtime validation boundaries.
+pub(crate) fn validate_spline(
+    grid_size: usize,
+    order: usize,
+    grid_range: (f32, f32),
+) -> Result<(), crate::config::ConfigError> {
+    use crate::config::{ConfigError, MAX_GRID_SIZE, MAX_SPLINE_ORDER};
+    if grid_size == 0 || grid_size > MAX_GRID_SIZE {
+        return Err(ConfigError::InvalidGridSize(grid_size));
+    }
+    if order == 0 || order > MAX_SPLINE_ORDER {
+        return Err(ConfigError::InvalidSplineOrder(order));
+    }
+    let (min, max) = grid_range;
+    if !min.is_finite() || !max.is_finite() || min >= max {
+        return Err(ConfigError::InvalidGridRange);
+    }
+    let h = (max - min) / grid_size as f32;
+    let mut previous = min - order as f32 * h;
+    if !previous.is_finite() {
+        return Err(ConfigError::InvalidGridRange);
+    }
+    for i in 1..grid_size + 2 * order + 1 {
+        let knot = min + (i as f32 - order as f32) * h;
+        if !knot.is_finite() || knot <= previous {
+            return Err(ConfigError::InvalidGridRange);
+        }
+        previous = knot;
+    }
+    Ok(())
+}
+
 /// Flag OR-ed into a stored span index when the forward pass clamped that
 /// `(sample, feature)` to the grid range.
 ///

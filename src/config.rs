@@ -330,7 +330,7 @@ impl KanConfig {
     ///   spacing is not representable in `f32` at that magnitude (e.g. `(1e6, 1e6 + 1.0)`
     ///   with `grid_size = 64`: consecutive knots collide and the basis collapses)
     /// - Normalization arrays don't match `input_dim`
-    /// - Any `input_std[i] <= 0` (callers wanting EPSILON clamping must apply it before validation)
+    /// - Non-finite means/stds, or any `input_std[i] <= 0` (apply EPSILON clamping before validation)
     /// - `simd_width` is not 4, 8, or 16
     ///
     /// # Example
@@ -358,34 +358,19 @@ impl KanConfig {
                 "output_dim must be > 0",
             )));
         }
-        if self.grid_size == 0 || self.grid_size > MAX_GRID_SIZE {
-            return Err(ConfigError::InvalidGridSize(self.grid_size));
-        }
-        if self.spline_order == 0 || self.spline_order > MAX_SPLINE_ORDER {
-            return Err(ConfigError::InvalidSplineOrder(self.spline_order));
-        }
-        if self.grid_range.0 >= self.grid_range.1 {
-            return Err(ConfigError::InvalidGridRange);
-        }
-        // `min < max` is not enough: the knot vector also has to survive f32.
-        // `grid_range = (1e6, 1e6 + 1.0)` with `grid_size = 64` asks for a spacing of
-        // 1.5625e-2 where the f32 ULP at 1e6 is 0.0625, so consecutive knots round to
-        // the same value, every Cox-de Boor denominator is zero, and the layer silently
-        // degenerates into its bias with no gradient anywhere. Reject it here rather
-        // than let the hot loop paper over it.
-        // `all` rather than `any(<=)` so a NaN endpoint - which slips past the
-        // comparison above - is rejected here too.
-        let knots =
-            crate::spline::compute_knots(self.grid_size, self.spline_order, self.grid_range);
-        if !knots.windows(2).all(|w| w[1] > w[0]) {
-            return Err(ConfigError::InvalidGridRange);
-        }
+        self.validate_layer_config()
+    }
+
+    /// Validates the configuration consumed by standalone layer constructors.
+    pub(crate) fn validate_layer_config(&self) -> Result<(), ConfigError> {
+        crate::spline::validate_spline(self.grid_size, self.spline_order, self.grid_range)?;
         if self.input_mean.len() != self.input_dim {
             return Err(ConfigError::MismatchedNormalization("input_mean"));
         }
         if self.input_std.len() != self.input_dim {
             return Err(ConfigError::MismatchedNormalization("input_std"));
         }
+        validate_finite_normalization(&self.input_mean, &self.input_std)?;
         // Reject non-positive input_std — silently clamping to EPSILON would distort features.
         // Callers wanting EPSILON clamping must apply it explicitly before calling validate().
         if self.input_std.iter().any(|&s| s <= 0.0) {
@@ -413,7 +398,8 @@ impl KanConfig {
     ///
     /// Returns [`ConfigError::MismatchedNormalization`] if `mean.len()` or `std.len()`
     /// does not equal `input_dim`. This replaces a previous `debug_assert` that was
-    /// silently ignored in release builds.
+    /// silently ignored in release builds. Non-finite statistics return
+    /// [`ConfigError::NonFiniteNormalization`] before changing either array.
     pub fn set_normalization(&mut self, mean: Vec<f32>, std: Vec<f32>) -> Result<(), ConfigError> {
         if mean.len() != self.input_dim {
             return Err(ConfigError::MismatchedNormalization("input_mean"));
@@ -421,10 +407,22 @@ impl KanConfig {
         if std.len() != self.input_dim {
             return Err(ConfigError::MismatchedNormalization("input_std"));
         }
+        validate_finite_normalization(&mean, &std)?;
         self.input_mean = mean;
         self.input_std = std.into_iter().map(|s| s.max(EPSILON)).collect();
         Ok(())
     }
+}
+
+/// Check before clamping, which would otherwise silently convert NaN to EPSILON.
+pub(crate) fn validate_finite_normalization(mean: &[f32], std: &[f32]) -> Result<(), ConfigError> {
+    if mean.iter().any(|x| !x.is_finite()) {
+        return Err(ConfigError::NonFiniteNormalization("input_mean"));
+    }
+    if std.iter().any(|x| !x.is_finite()) {
+        return Err(ConfigError::NonFiniteNormalization("input_std"));
+    }
+    Ok(())
 }
 
 /// Per-layer configuration (for advanced use cases).
@@ -481,6 +479,10 @@ pub enum ConfigError {
     /// Normalization arrays don't match input dimension.
     #[error("Mismatched normalization array: {0}")]
     MismatchedNormalization(&'static str),
+
+    /// Normalization statistics must be finite.
+    #[error("Non-finite normalization value: {0}")]
+    NonFiniteNormalization(&'static str),
 
     /// SIMD width is not a valid value (4, 8, or 16).
     #[error("SIMD width must be 4, 8, or 16, got {0}")]
