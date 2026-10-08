@@ -111,7 +111,6 @@ pub struct BakedLayer {
 ///
 /// The hot path (between entry normalization and final dequant) uses no f32.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct BakedModel {
     /// Original configuration for reference/validation.
     pub config: KanConfig,
@@ -159,27 +158,6 @@ fn quantized_grid(range: (f32, f32), grid: usize) -> ArkanResult<(i32, i32, i32)
         ));
     }
     Ok((lo as i32, ((hi as i64 - 1).max(lo as i64)) as i32, h as i32))
-}
-
-// Keep the version-2 field order and validate every serde model import.
-#[cfg(feature = "serde")]
-impl<'de> Deserialize<'de> for BakedModel {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Wire {
-            config: KanConfig,
-            layers: Vec<BakedLayer>,
-            uncalibrated: bool,
-        }
-        let wire = Wire::deserialize(deserializer)?;
-        let model = Self {
-            config: wire.config,
-            layers: wire.layers,
-            uncalibrated: wire.uncalibrated,
-        };
-        model.validate().map_err(serde::de::Error::custom)?;
-        Ok(model)
-    }
 }
 
 impl BakedModel {
@@ -274,74 +252,7 @@ impl BakedModel {
     ///
     /// Bump this whenever the bincode layout changes in a breaking way.
     #[cfg(feature = "serde")]
-    const FORMAT_VERSION: u32 = 2;
-
-    /// Serializes the baked model to a self-describing byte vector.
-    ///
-    /// Layout:
-    /// ```text
-    /// [0..12]  magic   — MAGIC_BAKED (b"KAN_BAKED_v1")
-    /// [12..16] version — u32 little-endian format version (currently 2)
-    /// [16..]   body    — bincode-encoded BakedModel
-    /// ```
-    ///
-    /// Requires the `serde` feature.
-    #[cfg(feature = "serde")]
-    pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
-        use crate::MAGIC_BAKED;
-
-        let body = bincode::serialize(self)?;
-        let mut out = Vec::with_capacity(MAGIC_BAKED.len() + 4 + body.len());
-        out.extend_from_slice(MAGIC_BAKED);
-        out.extend_from_slice(&Self::FORMAT_VERSION.to_le_bytes());
-        out.extend_from_slice(&body);
-        Ok(out)
-    }
-
-    /// Deserializes a baked model from bytes produced by [`BakedModel::to_bytes`].
-    ///
-    /// Returns a clear `Err` — never panics — for:
-    /// - Input shorter than the 16-byte header.
-    /// - Wrong magic bytes (not an ArKan baked-model file).
-    /// - Wrong format version (produced by a different library version).
-    /// - Corrupt bincode body or invalid executable shapes, scales or metadata.
-    ///
-    /// Requires the `serde` feature.
-    #[cfg(feature = "serde")]
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        use crate::MAGIC_BAKED;
-
-        let header_len = MAGIC_BAKED.len() + 4; // 12 + 4 = 16
-
-        if bytes.len() < header_len {
-            return Err(Box::new(bincode::ErrorKind::Custom(format!(
-                "BakedModel::from_bytes: input too short ({} bytes, need at least {})",
-                bytes.len(),
-                header_len
-            ))));
-        }
-
-        let (magic_bytes, rest) = bytes.split_at(MAGIC_BAKED.len());
-        if magic_bytes != MAGIC_BAKED.as_ref() {
-            return Err(Box::new(bincode::ErrorKind::Custom(format!(
-                "BakedModel::from_bytes: wrong magic bytes (got {:?}, expected {:?}). \
-                 Is this an ArKan baked-model file?",
-                magic_bytes, MAGIC_BAKED
-            ))));
-        }
-
-        let version = u32::from_le_bytes(rest[..4].try_into().unwrap());
-        if version != Self::FORMAT_VERSION {
-            return Err(Box::new(bincode::ErrorKind::Custom(format!(
-                "BakedModel::from_bytes: format version mismatch (got {}, expected {}). \
-                 Re-bake the model with the current library version.",
-                version,
-                Self::FORMAT_VERSION
-            ))));
-        }
-
-        bincode::deserialize(&rest[4..])
-    }
+    pub(crate) const FORMAT_VERSION: u32 = 2;
 }
 
 #[cfg(test)]

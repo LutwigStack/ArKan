@@ -25,6 +25,30 @@ fn network(order: usize) -> KanNetwork {
             .unwrap(),
     )
 }
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn model_snapshot_rejects_invalid_cpu_conversion_and_sync() {
+    let b = backend();
+    let mut cpu = network(3);
+    let gpu = GpuNetwork::from_cpu(&b, &cpu).unwrap();
+    let before = cpu.layers[0].weights.clone();
+    cpu.config.input_dim = 0;
+    assert!(GpuNetwork::from_cpu(&b, &cpu).is_err());
+    assert!(gpu.sync_weights_to_cpu(&mut cpu).is_err());
+    assert_eq!(cpu.layers[0].weights, before);
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn model_snapshot_rejects_mutated_gpu_geometry_before_execution() {
+    let b = backend();
+    let cpu = network(3);
+    let mut gpu = GpuNetwork::from_cpu(&b, &cpu).unwrap();
+    let mut workspace = gpu.create_workspace(1).unwrap();
+    gpu.layers[0].in_dim += 1;
+    assert!(gpu.forward_batch(&[0.5, -0.2], 1, &mut workspace).is_err());
+}
 fn close(actual: &[f32], expected: &[f32]) {
     assert_eq!(actual.len(), expected.len());
     for (i, (a, b)) in actual.iter().zip(expected).enumerate() {

@@ -160,15 +160,16 @@ impl GpuLayer {
             vec![out_dim],
             Some(max_vram_alloc),
         )?;
-        let inverse: Vec<_> = cpu_layer
+        let stats = cpu_layer.normalization();
+        let inverse: Vec<_> = stats
             .std
             .iter()
             .map(|s| 1.0 / s.max(crate::config::EPSILON))
             .collect();
-        let normalized: Vec<_> = cpu_layer
+        let normalized: Vec<_> = stats
             .mean
             .iter()
-            .zip(&cpu_layer.std)
+            .zip(stats.std)
             .flat_map(|(&m, &std)| [m, std])
             .collect();
         let normalization = GpuTensor::upload_with_limit(
@@ -257,15 +258,16 @@ impl GpuLayer {
     }
 
     pub(crate) fn update_normalization(&self, queue: &wgpu::Queue, cpu_layer: &KanLayer) {
-        let inverse: Vec<_> = cpu_layer
+        let stats = cpu_layer.normalization();
+        let inverse: Vec<_> = stats
             .std
             .iter()
             .map(|s| 1.0 / s.max(crate::config::EPSILON))
             .collect();
-        let normalized: Vec<_> = cpu_layer
+        let normalized: Vec<_> = stats
             .mean
             .iter()
-            .zip(&cpu_layer.std)
+            .zip(stats.std)
             .flat_map(|(&m, &std)| [m, std])
             .collect();
         self.normalization.update(queue, &normalized);

@@ -154,9 +154,13 @@ pub mod config;
 pub mod error;
 pub mod layer;
 pub mod loss;
+pub mod model;
 pub mod network;
 pub mod optimizer;
 pub mod spline;
+
+#[cfg(feature = "serde")]
+mod format;
 
 // GPU backend (only available with "gpu" feature)
 #[cfg(feature = "gpu")]

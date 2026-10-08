@@ -1,0 +1,132 @@
+{
+  "config": {
+    "input_dim": 2,
+    "output_dim": 1,
+    "hidden_dims": [
+      2
+    ],
+    "grid_size": 3,
+    "spline_order": 2,
+    "grid_range": [
+      -2.0,
+      2.0
+    ],
+    "input_mean": [
+      0.25,
+      -0.5
+    ],
+    "input_std": [
+      0.5,
+      2.0
+    ],
+    "multithreading_threshold": 128,
+    "simd_width": 8,
+    "init_seed": 7
+  },
+  "layers": [
+    {
+      "in_dim": 2,
+      "out_dim": 2,
+      "order": 2,
+      "grid_size": 3,
+      "global_basis_size": 5,
+      "local_basis_size": 3,
+      "basis_aligned": 8,
+      "grid_range": [
+        -2.0,
+        2.0
+      ],
+      "mean": [
+        0.25,
+        -0.5
+      ],
+      "std": [
+        0.5,
+        2.0
+      ],
+      "weights": [
+        -0.09375,
+        -0.0625,
+        -0.03125,
+        0.0,
+        0.03125,
+        0.0625,
+        0.09375,
+        0.125,
+        0.15625,
+        0.1875,
+        0.21875,
+        0.25,
+        0.28125,
+        0.3125,
+        0.34375,
+        0.375,
+        0.40625,
+        0.4375,
+        0.46875,
+        0.5
+      ],
+      "bias": [
+        0.0625,
+        0.125
+      ],
+      "simd_width": 8
+    },
+    {
+      "in_dim": 2,
+      "out_dim": 1,
+      "order": 2,
+      "grid_size": 3,
+      "global_basis_size": 5,
+      "local_basis_size": 3,
+      "basis_aligned": 8,
+      "grid_range": [
+        -2.0,
+        2.0
+      ],
+      "mean": [
+        0.125,
+        -0.25
+      ],
+      "std": [
+        1.5,
+        0.75
+      ],
+      "weights": [
+        -0.1875,
+        -0.125,
+        -0.0625,
+        0.0,
+        0.0625,
+        0.125,
+        0.1875,
+        0.25,
+        0.3125,
+        0.375
+      ],
+      "bias": [
+        0.0625
+      ],
+      "simd_width": 8
+    }
+  ],
+  "layer_dims": [
+    2,
+    2,
+    1
+  ],
+  "layer_param_sizes": [
+    [
+      20,
+      2
+    ],
+    [
+      10,
+      1
+    ]
+  ],
+  "default_train_options": {
+    "max_grad_norm": null,
+    "weight_decay": 0.0
+  }
+}

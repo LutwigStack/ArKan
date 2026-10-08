@@ -54,24 +54,12 @@ use crate::buffer::{checked_buffer_size, Workspace};
 use crate::config::KanConfig;
 use crate::error::{ArkanError, ArkanResult};
 use crate::layer::KanLayer;
+use crate::model::{LayerSpec, ModelLayout, Normalization};
 use crate::optimizer::{global_clip_scale, global_grad_norm, Optimizer};
 use crate::spline::SPAN_CLAMPED_FLAG;
 
 #[cfg(feature = "serde")]
-use serde::{Deserialize, Deserializer, Serialize};
-
-/// Magic bytes for serialized network files.
-///
-/// Used to identify ArKan model files and distinguish from other formats.
-#[cfg(feature = "serde")]
-const SERIALIZATION_MAGIC: &[u8; 5] = b"ARKAN";
-
-/// Current serialization format version.
-///
-/// Incremented when the format changes in a backwards-incompatible way.
-/// - v1: Initial versioned format (ArKan 0.3.0+)
-#[cfg(feature = "serde")]
-const SERIALIZATION_VERSION: u32 = 1;
+use serde::{Deserialize, Serialize};
 
 /// Complete KAN network with multiple layers.
 ///
@@ -88,7 +76,6 @@ const SERIALIZATION_VERSION: u32 = 1;
 ///
 /// The network is `Send + Sync` (when `serde` feature is off). Multiple threads
 /// can perform inference on the same network with separate workspaces.
-#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct KanNetwork {
     /// Network configuration.
     pub config: KanConfig,
@@ -96,53 +83,11 @@ pub struct KanNetwork {
     /// Layers: input→hidden\[0\]→...→hidden\[n\]→output.
     pub layers: Vec<KanLayer>,
 
-    /// Cached layer dimensions for quick access.
-    layer_dims: Vec<usize>,
-
-    /// Cached parameter sizes per layer (weights, bias) for train_step.
-    layer_param_sizes: Vec<(usize, usize)>,
+    /// Immutable geometry checked against the legacy public fields.
+    layout: ModelLayout,
 
     /// Default training options (gradient clipping, weight decay).
     pub default_train_options: TrainOptions,
-}
-
-// Retain the version-1 field order, but rebuild runtime caches at the boundary.
-#[cfg(feature = "serde")]
-impl<'de> Deserialize<'de> for KanNetwork {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct NetworkData {
-            config: KanConfig,
-            layers: Vec<KanLayer>,
-            layer_dims: Vec<usize>,
-            layer_param_sizes: Vec<(usize, usize)>,
-            default_train_options: TrainOptions,
-        }
-        let data = NetworkData::deserialize(deserializer)?;
-        data.config.validate().map_err(serde::de::Error::custom)?;
-        // Serialized caches are advisory; valid topology is the source of truth.
-        data.default_train_options
-            .validate()
-            .map_err(serde::de::Error::custom)?;
-        let _ = (data.layer_dims, data.layer_param_sizes);
-        let layer_dims = data.config.layer_dims();
-        let layer_param_sizes = data
-            .layers
-            .iter()
-            .map(|layer| (layer.weights.len(), layer.bias.len()))
-            .collect();
-        let network = Self {
-            config: data.config,
-            layers: data.layers,
-            layer_dims,
-            layer_param_sizes,
-            default_train_options: data.default_train_options,
-        };
-        network
-            .validate_layout()
-            .map_err(serde::de::Error::custom)?;
-        Ok(network)
-    }
 }
 
 /// Training options for a single step.
@@ -201,39 +146,33 @@ impl Default for TrainOptions {
 }
 
 impl KanNetwork {
-    /// Checks public structural fields against the layout used by execution.
-    /// Parameter values are deliberately checked only at import, not in hot calls.
+    pub(crate) fn checked_layout(&self) -> ArkanResult<&ModelLayout> {
+        self.layout.check_legacy(&self.config, &self.layers)?;
+        Ok(&self.layout)
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn layout(&self) -> &ModelLayout {
+        &self.layout
+    }
+
     fn validate_layout(&self) -> ArkanResult<()> {
-        self.config.validate()?;
-        if self.layers.len() != self.config.hidden_dims.len() + 1
-            || self.layer_dims.len() != self.layers.len() + 1
-            || self.layer_param_sizes.len() != self.layers.len()
-            || self.layer_dims.first() != Some(&self.config.input_dim)
-            || self.layer_dims.last() != Some(&self.config.output_dim)
-            || self.layer_dims[1..self.layer_dims.len() - 1] != self.config.hidden_dims
-        {
-            return Err(ArkanError::cpu(
-                "Network topology no longer matches its layout",
-            ));
-        }
-        for (index, layer) in self.layers.iter().enumerate() {
-            layer.validate_layout()?;
-            if layer.in_dim != self.layer_dims[index]
-                || layer.out_dim != self.layer_dims[index + 1]
-                || layer.grid_size != self.config.grid_size
-                || layer.order != self.config.spline_order
-                || layer.grid_range != self.config.grid_range
-                || layer.basis_aligned
-                    != (layer.local_basis_size.div_ceil(self.config.simd_width)
-                        * self.config.simd_width)
-                || (layer.weights.len(), layer.bias.len()) != self.layer_param_sizes[index]
-            {
-                return Err(ArkanError::cpu(
-                    "Layer topology no longer matches its network",
-                ));
-            }
-        }
-        Ok(())
+        self.checked_layout().map(|_| ())
+    }
+
+    pub(crate) fn from_parts(
+        config: KanConfig,
+        layers: Vec<KanLayer>,
+        default_train_options: TrainOptions,
+    ) -> ArkanResult<Self> {
+        default_train_options.validate()?;
+        let layout = ModelLayout::from_layers(&config, &layers)?;
+        Ok(Self {
+            config,
+            layers,
+            layout,
+            default_train_options,
+        })
     }
 
     /// Creates a new KAN network from configuration.
@@ -267,24 +206,14 @@ impl KanNetwork {
         for i in 0..layer_dims.len() - 1 {
             let in_dim = layer_dims[i];
             let out_dim = layer_dims[i + 1];
-            // `try_new_at`, not `try_new`: a shared `init_seed` reseeds the same RNG
-            // per layer, so two layers of the same shape would otherwise get
-            // bit-identical weights.
-            layers.push(KanLayer::try_new_at(in_dim, out_dim, &config, i)?);
+            let normalization = (i == 0).then_some(Normalization {
+                mean: &config.input_mean,
+                std: &config.input_std,
+            });
+            let spec = LayerSpec::new(in_dim, out_dim, &config, normalization)?;
+            layers.push(KanLayer::try_from_spec(spec, config.init_seed, i)?);
         }
-
-        let layer_param_sizes: Vec<(usize, usize)> = layers
-            .iter()
-            .map(|l| (l.weights.len(), l.bias.len()))
-            .collect();
-
-        Ok(Self {
-            config,
-            layers,
-            layer_dims,
-            layer_param_sizes,
-            default_train_options: TrainOptions::default(),
-        })
+        Self::from_parts(config, layers, TrainOptions::default())
     }
 
     /// Creates network from configuration (alias for [`new`](Self::new)).
@@ -405,7 +334,7 @@ impl KanNetwork {
         workspace.try_reserve(1, &self.config)?;
 
         // Calculate max dimension for ping-pong buffers
-        let max_dim = self.layer_dims.iter().copied().max().unwrap_or(1);
+        let max_dim = self.layout.layer_dims().iter().copied().max().unwrap_or(1);
         workspace.layer_output.try_resize(max_dim)?;
         workspace.layer_input.try_resize(max_dim)?;
 
@@ -623,7 +552,8 @@ impl KanNetwork {
         }
 
         let max_hidden = self
-            .layer_dims
+            .layout
+            .layer_dims()
             .iter()
             .copied()
             .max()
@@ -889,14 +819,15 @@ impl KanNetwork {
 
         if batch_size == 0 {
             // Clear recorded history as well as accepting the empty output shape.
-            workspace.try_prepare_training(0, &self.config, &self.layer_dims)?;
+            workspace.try_prepare_training(0, &self.config, self.layout.layer_dims())?;
             return Ok(());
         }
 
-        workspace.try_prepare_training(batch_size, &self.config, &self.layer_dims)?;
+        workspace.try_prepare_training(batch_size, &self.config, self.layout.layer_dims())?;
 
         let max_hidden = self
-            .layer_dims
+            .layout
+            .layer_dims()
             .iter()
             .copied()
             .max()
@@ -1144,7 +1075,7 @@ impl KanNetwork {
         // This is "decoupled" weight decay (like AdamW), not L2 regularization.
         // Biases are NOT decayed, following standard practice.
         // =====================================================================
-        for (i, layer) in self.layers.iter_mut().enumerate() {
+        for (i, layer) in self.try_parameters_mut()?.iter_mut().enumerate() {
             if opts.weight_decay > 0.0 {
                 let decay = opts.weight_decay;
                 for w in layer.weights.iter_mut() {
@@ -1285,14 +1216,14 @@ impl KanNetwork {
         }
 
         if batch_size == 0 {
-            workspace.try_prepare_grad_buffers(&self.layer_param_sizes)?;
+            workspace.try_prepare_grad_buffers(self.layout.parameter_sizes())?;
             workspace.zero_grads();
-            workspace.try_prepare_training(0, &self.config, &self.layer_dims)?;
+            workspace.try_prepare_training(0, &self.config, self.layout.layer_dims())?;
             return Ok(0.0);
         }
 
         // Ensure workspace has gradient buffers for all layers
-        workspace.try_prepare_grad_buffers(&self.layer_param_sizes)?;
+        workspace.try_prepare_grad_buffers(self.layout.parameter_sizes())?;
 
         // Forward pass with history capture using workspace predictions buffer
         let pred_size = checked_buffer_size(batch_size, output_dim)?;
@@ -1358,7 +1289,13 @@ impl KanNetwork {
         // Backward pass through all layers
         // staging_buffer holds the current layer's output gradient (dL/dy).
         // It's initialized with grad_output and updated each iteration.
-        let max_dim = self.layer_dims.iter().copied().max().unwrap_or(output_dim);
+        let max_dim = self
+            .layout
+            .layer_dims()
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(output_dim);
         let staging_size = checked_buffer_size(batch_size, max_dim)?;
         workspace.staging_buffer.try_resize(staging_size)?;
 
@@ -1540,116 +1477,6 @@ impl KanNetwork {
         self.try_create_workspace(max_batch)
             .expect("KanNetwork::create_workspace: buffer size overflow")
     }
-
-    /// Saves network to bytes using bincode with version header.
-    ///
-    /// The format includes:
-    /// - Magic bytes: `ARKAN` (5 bytes)
-    /// - Version: u32 (4 bytes)
-    /// - Network data: bincode serialized
-    ///
-    /// Requires the `serde` feature.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use arkan::{KanConfig, KanNetwork};
-    ///
-    /// let network = KanNetwork::new(KanConfig::preset());
-    /// let bytes = network.to_bytes().unwrap();
-    ///
-    /// // Bytes start with magic header "ARKAN"
-    /// assert_eq!(&bytes[..5], b"ARKAN");
-    /// ```
-    #[cfg(feature = "serde")]
-    pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
-        use std::io::Write;
-
-        let mut bytes = Vec::new();
-        // Magic bytes
-        bytes
-            .write_all(SERIALIZATION_MAGIC)
-            .map_err(|e| bincode::Error::from(bincode::ErrorKind::Io(e)))?;
-        // Version
-        bytes
-            .write_all(&SERIALIZATION_VERSION.to_le_bytes())
-            .map_err(|e| bincode::Error::from(bincode::ErrorKind::Io(e)))?;
-        // Network data
-        let network_bytes = bincode::serialize(self)?;
-        bytes.extend(network_bytes);
-        Ok(bytes)
-    }
-
-    /// Loads network from bytes with version validation.
-    ///
-    /// Requires the `serde` feature.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if:
-    /// - Magic bytes don't match
-    /// - Version is incompatible
-    /// - Deserialization fails
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use arkan::{KanConfig, KanNetwork};
-    ///
-    /// // Create network and serialize
-    /// let original = KanNetwork::new(KanConfig::preset());
-    /// let bytes = original.to_bytes().unwrap();
-    ///
-    /// // Deserialize
-    /// let loaded = KanNetwork::from_bytes(&bytes).unwrap();
-    /// assert_eq!(loaded.param_count(), original.param_count());
-    /// ```
-    #[cfg(feature = "serde")]
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        const HEADER_SIZE: usize = SERIALIZATION_MAGIC.len() + 4; // magic + version
-
-        if bytes.len() < HEADER_SIZE {
-            return Err(bincode::Error::from(bincode::ErrorKind::Custom(
-                "Invalid file: too short for header".to_string(),
-            )));
-        }
-
-        // Check magic bytes
-        if &bytes[..SERIALIZATION_MAGIC.len()] != SERIALIZATION_MAGIC {
-            return Err(bincode::Error::from(bincode::ErrorKind::Custom(
-                "Invalid file: wrong magic bytes (not an ArKan model)".to_string(),
-            )));
-        }
-
-        // Check version
-        let version_bytes: [u8; 4] = bytes[SERIALIZATION_MAGIC.len()..HEADER_SIZE]
-            .try_into()
-            .unwrap();
-        let version = u32::from_le_bytes(version_bytes);
-
-        if version != SERIALIZATION_VERSION {
-            return Err(bincode::Error::from(bincode::ErrorKind::Custom(format!(
-                "Incompatible model version: expected {}, got {}",
-                SERIALIZATION_VERSION, version
-            ))));
-        }
-
-        // Deserialize network data
-        bincode::deserialize(&bytes[HEADER_SIZE..])
-    }
-
-    /// Loads network from bytes without version check (legacy format).
-    ///
-    /// Use this to load models saved with ArKan < 0.3.0.
-    ///
-    /// # Warning
-    ///
-    /// This method is provided for backwards compatibility only.
-    /// New code should use [`from_bytes`](Self::from_bytes).
-    #[cfg(feature = "serde")]
-    pub fn from_bytes_legacy(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(bytes)
-    }
 }
 
 impl Clone for KanNetwork {
@@ -1657,8 +1484,7 @@ impl Clone for KanNetwork {
         Self {
             config: self.config.clone(),
             layers: self.layers.clone(),
-            layer_dims: self.layer_dims.clone(),
-            layer_param_sizes: self.layer_param_sizes.clone(),
+            layout: self.layout.clone(),
             default_train_options: self.default_train_options,
         }
     }
@@ -1707,6 +1533,8 @@ fn compute_masked_mse_loss_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "serde")]
+    use crate::format::network::{SERIALIZATION_MAGIC, SERIALIZATION_VERSION};
 
     #[test]
     fn test_network_creation() {

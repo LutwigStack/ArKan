@@ -47,6 +47,7 @@
 
 use crate::buffer::{Workspace, MAX_BUFFER_ELEMENTS};
 use crate::config::{KanConfig, EPSILON};
+use crate::model::{LayerSpec, Normalization};
 use crate::spline::{
     compute_basis, compute_basis_and_deriv, compute_knots, find_span, SPAN_CLAMPED_FLAG,
     SPAN_INDEX_MASK,
@@ -54,9 +55,6 @@ use crate::spline::{
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use wide::{f32x4, f32x8};
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Deserializer, Serialize};
 
 /// Recovers the knot span from a span index stored by the forward pass.
 ///
@@ -97,7 +95,6 @@ fn span_of(stored: u32) -> usize {
 /// assert_eq!(layer.param_count(), 4 * 8 * (config.grid_size + config.spline_order) + 8);
 /// ```
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct KanLayer {
     /// Input dimension.
     pub in_dim: usize,
@@ -116,7 +113,6 @@ pub struct KanLayer {
     /// Grid range (min, max) for input normalization.
     pub grid_range: (f32, f32),
     /// Precomputed knot vector (recomputed after deserialization).
-    #[cfg_attr(feature = "serde", serde(skip))]
     knots: Vec<f32>,
     /// Per-input normalization mean.
     pub mean: Vec<f32>,
@@ -129,67 +125,6 @@ pub struct KanLayer {
     /// SIMD width for aligned operations.
     #[allow(dead_code)]
     simd_width: usize,
-}
-
-// Custom Deserialize implementation that recomputes knots after loading
-#[cfg(feature = "serde")]
-impl<'de> Deserialize<'de> for KanLayer {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // Helper struct for deserialization (same fields minus knots)
-        #[derive(Deserialize)]
-        struct KanLayerData {
-            in_dim: usize,
-            out_dim: usize,
-            order: usize,
-            grid_size: usize,
-            global_basis_size: usize,
-            local_basis_size: usize,
-            basis_aligned: usize,
-            grid_range: (f32, f32),
-            mean: Vec<f32>,
-            std: Vec<f32>,
-            weights: Vec<f32>,
-            bias: Vec<f32>,
-            simd_width: usize,
-        }
-
-        let data = KanLayerData::deserialize(deserializer)?;
-
-        crate::spline::validate_spline(data.grid_size, data.order, data.grid_range)
-            .map_err(serde::de::Error::custom)?;
-        // Recompute knots from grid_size, order, and grid_range
-        let knots = compute_knots(data.grid_size, data.order, data.grid_range);
-
-        let layer = KanLayer {
-            in_dim: data.in_dim,
-            out_dim: data.out_dim,
-            order: data.order,
-            grid_size: data.grid_size,
-            global_basis_size: data.global_basis_size,
-            local_basis_size: data.local_basis_size,
-            basis_aligned: data.basis_aligned,
-            grid_range: data.grid_range,
-            knots,
-            mean: data.mean,
-            std: data.std,
-            weights: data.weights,
-            bias: data.bias,
-            simd_width: data.simd_width,
-        };
-        layer.validate_layout().map_err(serde::de::Error::custom)?;
-        if layer
-            .weights
-            .iter()
-            .chain(&layer.bias)
-            .any(|x| !x.is_finite())
-        {
-            return Err(serde::de::Error::custom("non-finite layer parameters"));
-        }
-        Ok(layer)
-    }
 }
 
 /// Reusable bounded scratch for deterministic parallel backward passes.
@@ -285,27 +220,30 @@ impl KanLayer {
         config: &KanConfig,
         layer_index: usize,
     ) -> Result<Self, crate::ArkanError> {
-        use crate::config::ConfigError;
+        let normalization =
+            (layer_index == 0 && in_dim == config.input_dim).then_some(Normalization {
+                mean: &config.input_mean,
+                std: &config.input_std,
+            });
+        let spec = LayerSpec::new(in_dim, out_dim, config, normalization)?;
+        Self::try_from_spec(spec, config.init_seed, layer_index)
+    }
+
+    pub(crate) fn try_from_spec(
+        spec: LayerSpec<'_>,
+        init_seed: Option<u64>,
+        layer_index: usize,
+    ) -> crate::ArkanResult<Self> {
         use crate::ArkanError;
-        use std::borrow::Cow;
-
-        if in_dim == 0 {
-            return Err(ArkanError::Config(ConfigError::InvalidDimension(
-                Cow::Borrowed("input dimension must be positive"),
-            )));
-        }
-        if out_dim == 0 {
-            return Err(ArkanError::Config(ConfigError::InvalidDimension(
-                Cow::Borrowed("output dimension must be positive"),
-            )));
-        }
-
-        config.validate_layer_config()?;
-
-        let order = config.spline_order;
-        let grid_size = config.grid_size;
-        let simd_width = config.simd_width;
-        let grid_range = config.grid_range;
+        let LayerSpec {
+            in_dim,
+            out_dim,
+            order,
+            grid_size,
+            grid_range,
+            simd_width,
+            normalization,
+        } = spec;
 
         // Global basis: one B-spline per knot interval that can be active
         let global_basis_size = grid_size
@@ -337,21 +275,18 @@ impl KanLayer {
 
         let knots = compute_knots(grid_size, order, grid_range);
 
-        // Only position zero consumes network input statistics; standalone layers use position zero.
-        // Hidden layers use identity normalization (mean=0, std=1)
-        let (mean, std) = if layer_index == 0 && in_dim == config.input_dim {
-            (
-                config.input_mean.clone(),
-                config.input_std.iter().map(|s| s.max(EPSILON)).collect(),
-            )
-        } else {
-            (vec![0.0; in_dim], vec![1.0; in_dim])
+        let (mean, std) = match normalization {
+            Some(stats) => (
+                stats.mean.to_vec(),
+                stats.std.iter().map(|s| s.max(EPSILON)).collect(),
+            ),
+            None => (vec![0.0; in_dim], vec![1.0; in_dim]),
         };
 
         // Initialize weights with small random values (Xavier-like)
         // KAN needs larger initialization because B-splines have bounded support
         let scale = (2.0 / (in_dim + out_dim) as f32).sqrt();
-        let mut rng: SmallRng = if let Some(seed) = config.init_seed {
+        let mut rng: SmallRng = if let Some(seed) = init_seed {
             // `seed_from_u64` runs SplitMix64 to fill the state, so consecutive
             // seeds give unrelated streams - offsetting by the layer's position is
             // enough to stop two same-shaped layers being bit-identical.
@@ -1609,5 +1544,53 @@ mod tests {
         // Empty input should return Ok
         let result = layer.try_forward_batch(&inputs, &mut outputs, &mut workspace);
         assert!(result.is_ok());
+    }
+}
+
+impl KanLayer {
+    pub(crate) fn normalization(&self) -> Normalization<'_> {
+        Normalization {
+            mean: &self.mean,
+            std: &self.std,
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn wire_simd_width(&self) -> usize {
+        self.simd_width
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn from_record(data: crate::format::layer::LayerRecord) -> crate::ArkanResult<Self> {
+        crate::spline::validate_spline(data.grid_size, data.order, data.grid_range)?;
+        // Recompute knots from grid_size, order, and grid_range
+        let knots = compute_knots(data.grid_size, data.order, data.grid_range);
+
+        let layer = KanLayer {
+            in_dim: data.in_dim,
+            out_dim: data.out_dim,
+            order: data.order,
+            grid_size: data.grid_size,
+            global_basis_size: data.global_basis_size,
+            local_basis_size: data.local_basis_size,
+            basis_aligned: data.basis_aligned,
+            grid_range: data.grid_range,
+            knots,
+            mean: data.mean,
+            std: data.std,
+            weights: data.weights,
+            bias: data.bias,
+            simd_width: data.simd_width,
+        };
+        layer.validate_layout()?;
+        if layer
+            .weights
+            .iter()
+            .chain(&layer.bias)
+            .any(|x| !x.is_finite())
+        {
+            return Err(crate::ArkanError::cpu("non-finite layer parameters"));
+        }
+        Ok(layer)
     }
 }

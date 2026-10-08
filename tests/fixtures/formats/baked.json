@@ -1,0 +1,140 @@
+{
+  "config": {
+    "input_dim": 2,
+    "output_dim": 1,
+    "hidden_dims": [
+      2
+    ],
+    "grid_size": 3,
+    "spline_order": 2,
+    "grid_range": [
+      -2.0,
+      2.0
+    ],
+    "input_mean": [
+      0.25,
+      -0.5
+    ],
+    "input_std": [
+      0.5,
+      2.0
+    ],
+    "multithreading_threshold": 128,
+    "simd_width": 8,
+    "init_seed": 7
+  },
+  "layers": [
+    {
+      "weights_i8": [
+        -64,
+        -42,
+        -21,
+        0,
+        21,
+        42,
+        64,
+        85,
+        106,
+        127,
+        56,
+        64,
+        71,
+        79,
+        87,
+        95,
+        103,
+        111,
+        119,
+        127
+      ],
+      "q_bias": [
+        1387179,
+        1040384
+      ],
+      "requant_m0": [
+        480976233,
+        320650812
+      ],
+      "requant_shift": [
+        25,
+        23
+      ],
+      "norm_a_fixed": [
+        536870912,
+        134217728
+      ],
+      "norm_b_fixed": [
+        -32768,
+        16384
+      ],
+      "norm_shift": 12,
+      "q_rmin": -131072,
+      "q_rmax": 131071,
+      "h_q16": 87381,
+      "mean": [
+        0.25,
+        -0.5
+      ],
+      "std": [
+        0.5,
+        2.0
+      ],
+      "in_dim": 2,
+      "out_dim": 2,
+      "order": 2,
+      "grid_size": 3,
+      "global_basis_size": 5,
+      "s_act_out": 318145730.0
+    },
+    {
+      "weights_i8": [
+        -64,
+        -42,
+        -21,
+        0,
+        21,
+        42,
+        64,
+        85,
+        106,
+        127
+      ],
+      "q_bias": [
+        693589
+      ],
+      "requant_m0": [
+        317709080
+      ],
+      "requant_shift": [
+        22
+      ],
+      "norm_a_fixed": [
+        301989886,
+        603979772
+      ],
+      "norm_b_fixed": [
+        -5461,
+        21845
+      ],
+      "norm_shift": 41,
+      "q_rmin": -131072,
+      "q_rmax": 131071,
+      "h_q16": 87381,
+      "mean": [
+        0.125,
+        -0.25
+      ],
+      "std": [
+        1.5,
+        0.75
+      ],
+      "in_dim": 2,
+      "out_dim": 1,
+      "order": 2,
+      "grid_size": 3,
+      "global_basis_size": 5,
+      "s_act_out": 840605250.0
+    }
+  ],
+  "uncalibrated": false
+}

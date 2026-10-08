@@ -258,10 +258,8 @@ pub struct GpuNetwork {
     pub input_dim: usize,
     /// Output dimension.
     pub output_dim: usize,
-    /// Layer dimensions.
-    layer_dims: Vec<usize>,
-    /// B-spline order (2-5).
-    spline_order: usize,
+    /// Immutable CPU geometry used by GPU packing and execution.
+    layout: crate::model::ModelLayout,
 
     /// Maximum VRAM allocation per buffer.
     max_vram_alloc: u64,
@@ -271,12 +269,88 @@ pub struct GpuNetwork {
 }
 
 impl GpuNetwork {
+    fn validate_layout(&self) -> ArkanResult<()> {
+        if self.input_dim != self.layout.layer_dims()[0]
+            || Some(&self.output_dim) != self.layout.layer_dims().last()
+            || self.layers.len() != self.layout.layers().len()
+        {
+            return Err(ArkanError::validation(
+                "GPU network topology no longer matches its layout",
+            ));
+        }
+        for (layer, expected) in self.layers.iter().zip(self.layout.layers()) {
+            let padded = expected.global_basis.div_ceil(4) * 4;
+            let weights = expected.in_dim * expected.out_dim * padded;
+            let uniforms = &layer.uniforms;
+            if (
+                layer.in_dim,
+                layer.out_dim,
+                layer.order,
+                layer.grid_size,
+                layer.global_basis_size,
+            ) != (
+                expected.in_dim,
+                expected.out_dim,
+                expected.order,
+                expected.grid_size,
+                expected.global_basis,
+            ) || layer.basis_padded != padded
+                || layer.basis_vec4s != padded / 4
+                || (uniforms.grid_min, uniforms.grid_max) != expected.grid_range
+                || (
+                    uniforms.in_dim as usize,
+                    uniforms.out_dim as usize,
+                    uniforms.order as usize,
+                    uniforms.grid_size as usize,
+                    uniforms.basis_padded as usize,
+                ) != (
+                    expected.in_dim,
+                    expected.out_dim,
+                    expected.order,
+                    expected.grid_size,
+                    padded,
+                )
+                || layer.weights.shape != [weights]
+                || layer.bias.shape != [expected.out_dim]
+                || layer.normalization.shape != [expected.in_dim, 2]
+                || layer.std_inv.shape != [expected.in_dim]
+                || layer.weights.buffer.size() < weights as u64 * 4
+                || layer.bias.buffer.size() < expected.out_dim as u64 * 4
+            {
+                return Err(ArkanError::validation(
+                    "GPU layer metadata no longer matches its layout",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_workspace(&self, workspace: &GpuWorkspace) -> ArkanResult<()> {
+        self.validate_layout()?;
+        if workspace.in_dim != self.input_dim
+            || workspace.out_dim != self.output_dim
+            || workspace
+                .input
+                .as_ref()
+                .map_or(true, |t| t.shape.len() != 2 || t.shape[1] != self.input_dim)
+            || workspace.output.as_ref().map_or(true, |t| {
+                t.shape.len() != 2 || t.shape[1] != self.output_dim
+            })
+        {
+            return Err(ArkanError::validation(
+                "GPU workspace dimensions do not match the model",
+            ));
+        }
+        Ok(())
+    }
+
     /// Creates a GPU network from a CPU network.
     ///
     /// Uploads weights, bias and per-feature normalization to GPU memory.
     /// Subnormal standard deviations are rejected before execution because GPU
     /// float arithmetic may flush them to zero.
     pub fn from_cpu(backend: &WgpuBackend, cpu_network: &KanNetwork) -> ArkanResult<Self> {
+        let layout = cpu_network.checked_layout()?.clone();
         let device = backend.device_arc();
         let queue = backend.queue_arc();
 
@@ -310,15 +384,9 @@ impl GpuNetwork {
         // Get dimensions
         let input_dim = cpu_network.config.input_dim;
         let output_dim = cpu_network.config.output_dim;
-        let spline_order = cpu_network.config.spline_order;
 
         // Store max_vram_alloc from backend
         let max_vram_alloc = backend.max_vram_alloc();
-
-        // layer_dims: [input_dim, hidden_0, hidden_1, ..., output_dim]
-        // Used for intermediate buffer sizing
-        let mut layer_dims = vec![input_dim];
-        layer_dims.extend(cpu_network.layers.iter().map(|l| l.out_dim));
 
         // Create workspace layout
         let workspace_layout = GpuLayer::create_workspace_bind_group_layout(&device);
@@ -330,8 +398,7 @@ impl GpuNetwork {
             pipeline_cache,
             input_dim,
             output_dim,
-            layer_dims,
-            spline_order,
+            layout,
             max_vram_alloc,
             workspace_layout,
         })
@@ -339,6 +406,7 @@ impl GpuNetwork {
 
     /// Creates a GPU workspace for this network with configured VRAM limit.
     pub fn create_workspace(&self, max_batch: usize) -> ArkanResult<GpuWorkspace> {
+        self.validate_layout()?;
         GpuWorkspace::new_with_limit(
             &self.device,
             max_batch,
@@ -363,6 +431,7 @@ impl GpuNetwork {
     ///
     /// Number of pipelines that were compiled.
     pub fn warmup(&mut self) -> ArkanResult<usize> {
+        self.validate_layout()?;
         let mut compiled = 0;
 
         // Need at least one layer to get the bind group layout
@@ -373,7 +442,10 @@ impl GpuNetwork {
         // Compile forward pipeline for current spline order
         if self
             .pipeline_cache
-            .get_forward_pipeline_for_order(&first_layer.bind_group_layout, self.spline_order)
+            .get_forward_pipeline_for_order(
+                &first_layer.bind_group_layout,
+                self.layout.layers()[0].order,
+            )
             .is_ok()
         {
             compiled += 1;
@@ -429,6 +501,7 @@ impl GpuNetwork {
     ///
     /// Returns error if buffer creation fails.
     pub fn init_training(&mut self) -> crate::ArkanResult<()> {
+        self.validate_layout()?;
         for layer in &mut self.layers {
             layer.init_training(&self.device)?;
         }
@@ -502,6 +575,7 @@ impl GpuNetwork {
         input: &[f32],
         workspace: &mut GpuWorkspace,
     ) -> ArkanResult<Vec<f32>> {
+        self.validate_workspace(workspace)?;
         if input.len() != self.input_dim {
             return Err(ArkanError::shape_mismatch(
                 &[self.input_dim],
@@ -530,6 +604,7 @@ impl GpuNetwork {
         batch_size: usize,
         workspace: &mut GpuWorkspace,
     ) -> ArkanResult<Vec<f32>> {
+        self.validate_workspace(workspace)?;
         // Validate input
         let expected_input_len = batch_size
             .checked_mul(self.input_dim)
@@ -600,6 +675,7 @@ impl GpuNetwork {
         batch_size: usize,
         workspace: &mut GpuWorkspace,
     ) -> ArkanResult<GpuForwardHandle> {
+        self.validate_workspace(workspace)?;
         // Validate input
         let expected_input_len = batch_size
             .checked_mul(self.input_dim)
@@ -677,7 +753,7 @@ impl GpuNetwork {
         }
 
         // Multi-layer: need intermediate buffers
-        workspace.ensure_intermediates(&self.device, &self.layer_dims, batch_size)?;
+        workspace.ensure_intermediates(&self.device, self.layout.layer_dims(), batch_size)?;
 
         // Execute layers sequentially
         let num_layers = self.layers.len();
@@ -701,9 +777,10 @@ impl GpuNetwork {
         layer.update_batch_size(&self.queue, batch_size);
 
         // Get or create pipeline for this spline order
-        let pipeline = self
-            .pipeline_cache
-            .get_forward_pipeline_for_order(&layer.bind_group_layout, self.spline_order)?;
+        let pipeline = self.pipeline_cache.get_forward_pipeline_for_order(
+            &layer.bind_group_layout,
+            self.layout.layers()[0].order,
+        )?;
 
         // Create workspace bind group
         let workspace_bg =
@@ -769,7 +846,7 @@ impl GpuNetwork {
         // Get pipeline for this spline order
         let pipeline = self
             .pipeline_cache
-            .get_forward_pipeline_for_order(bind_group_layout, self.spline_order)?;
+            .get_forward_pipeline_for_order(bind_group_layout, self.layout.layers()[0].order)?;
 
         // Create command encoder
         let mut encoder = self
@@ -965,27 +1042,10 @@ impl GpuNetwork {
     }
 
     fn validate_cpu_sync_layout(&self, cpu_network: &KanNetwork) -> ArkanResult<()> {
-        if cpu_network.layers.len() != self.layers.len() {
-            return Err(ArkanError::validation(
-                "CPU and GPU network layer count mismatch",
-            ));
+        self.validate_layout()?;
+        if cpu_network.checked_layout()? != &self.layout {
+            return Err(ArkanError::validation("CPU and GPU checked layouts differ"));
         }
-
-        // Preflight all layers before writing a prefix of the network.
-        for (gpu, cpu) in self.layers.iter().zip(&cpu_network.layers) {
-            cpu.validate_layout()?;
-            if (gpu.in_dim, gpu.out_dim, gpu.global_basis_size, gpu.order)
-                != (cpu.in_dim, cpu.out_dim, cpu.global_basis_size, cpu.order)
-                || (gpu.uniforms.grid_min, gpu.uniforms.grid_max) != cpu.grid_range
-                || cpu.mean.len() != gpu.in_dim
-                || cpu.std.len() != gpu.in_dim
-            {
-                return Err(ArkanError::validation(
-                    "CPU and GPU layer topology/grid mismatch",
-                ));
-            }
-        }
-
         Ok(())
     }
 
@@ -1011,6 +1071,7 @@ impl GpuNetwork {
         batch_size: usize,
         workspace: &mut GpuWorkspace,
     ) -> ArkanResult<Vec<f32>> {
+        self.validate_workspace(workspace)?;
         // Validate input
         let expected_input_len = batch_size
             .checked_mul(self.input_dim)
@@ -1026,12 +1087,7 @@ impl GpuNetwork {
         workspace.ensure_capacity(&self.device, batch_size)?;
 
         // Prepare training buffers (z_values, span_indices per layer)
-        // Build layer_dims array: [in_dim, out_dim_0, out_dim_1, ...]
-        let mut layer_dims = vec![self.input_dim];
-        for layer in &self.layers {
-            layer_dims.push(layer.out_dim);
-        }
-        workspace.prepare_training(&self.device, &layer_dims, batch_size)?;
+        workspace.prepare_training(&self.device, self.layout.layer_dims(), batch_size)?;
 
         // Upload input
         workspace.upload_input(&self.queue, input)?;
@@ -1071,7 +1127,7 @@ impl GpuNetwork {
         }
 
         // Multi-layer: need intermediate buffers
-        workspace.ensure_intermediates(&self.device, &self.layer_dims, batch_size)?;
+        workspace.ensure_intermediates(&self.device, self.layout.layer_dims(), batch_size)?;
 
         // Execute layers sequentially
         let num_layers = self.layers.len();
@@ -1106,7 +1162,10 @@ impl GpuNetwork {
         // Get or create pipeline
         let pipeline = self
             .pipeline_cache
-            .get_forward_training_pipeline_for_order(&layer.bind_group_layout, self.spline_order)?;
+            .get_forward_training_pipeline_for_order(
+                &layer.bind_group_layout,
+                self.layout.layers()[0].order,
+            )?;
 
         // Create training bind group (input, output, z_values, span_indices)
         let training_bg = workspace.get_or_create_training_bind_group(
@@ -1167,7 +1226,10 @@ impl GpuNetwork {
         let bind_group_layout = &layer.bind_group_layout;
         let pipeline = self
             .pipeline_cache
-            .get_forward_training_pipeline_for_order(bind_group_layout, self.spline_order)?;
+            .get_forward_training_pipeline_for_order(
+                bind_group_layout,
+                self.layout.layers()[0].order,
+            )?;
 
         // Create training bind group for this layer's I/O
         let training_bg = workspace.get_or_create_training_layer_bind_group(
@@ -1382,7 +1444,10 @@ impl GpuNetwork {
         // must be selected by `spline_order` exactly like the forward ones.
         let weights_pipeline = self
             .pipeline_cache
-            .get_backward_weights_pipeline_for_order(&backward_layer_layout, self.spline_order)?;
+            .get_backward_weights_pipeline_for_order(
+                &backward_layer_layout,
+                self.layout.layers()[0].order,
+            )?;
 
         // Create command encoder
         let mut encoder = self
@@ -1463,9 +1528,10 @@ impl GpuNetwork {
 
         // Dispatch input gradients shader (if needed)
         if compute_input_grad {
-            let input_pipeline = self
-                .pipeline_cache
-                .get_backward_input_pipeline_for_order(&backward_layer_layout, self.spline_order)?;
+            let input_pipeline = self.pipeline_cache.get_backward_input_pipeline_for_order(
+                &backward_layer_layout,
+                self.layout.layers()[0].order,
+            )?;
 
             let total_inputs = batch_size * in_dim;
             let workgroups = workgroup_count(total_inputs, WORKGROUP_SIZE);
@@ -2184,6 +2250,7 @@ impl GpuNetwork {
         batch_size: usize,
         workspace: &GpuWorkspace,
     ) -> ArkanResult<()> {
+        self.validate_workspace(workspace)?;
         if workspace.training_batch != Some(batch_size)
             || workspace.z_values.len() != self.layers.len()
             || workspace.span_indices.len() != self.layers.len()

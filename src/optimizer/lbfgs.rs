@@ -184,19 +184,19 @@ impl LBFGS {
     /// Restores parameters from a flat vector.
     pub fn restore_params(network: &mut KanNetwork, params: &[f32]) {
         let mut offset = 0;
-        for layer in &mut network.layers {
+        for layer in network
+            .try_parameters_mut()
+            .expect("LBFGS parameter layout changed")
+            .iter_mut()
+        {
             let w_len = layer.weights.len();
             layer
                 .weights
-                .as_mut_slice()
                 .copy_from_slice(&params[offset..offset + w_len]);
             offset += w_len;
 
             let b_len = layer.bias.len();
-            layer
-                .bias
-                .as_mut_slice()
-                .copy_from_slice(&params[offset..offset + b_len]);
+            layer.bias.copy_from_slice(&params[offset..offset + b_len]);
             offset += b_len;
         }
     }
@@ -609,6 +609,7 @@ impl LBFGS {
     where
         F: FnMut(&mut KanNetwork) -> ArkanResult<(f64, Vec<f32>)>,
     {
+        network.checked_layout()?;
         validate_safety(&self.config.safety, None)?;
         if !self.config.lr.is_finite()
             || self.config.lr <= 0.0

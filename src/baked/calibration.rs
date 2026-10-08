@@ -43,40 +43,13 @@ impl BakedModel {
         network: &KanNetwork,
         calibration: Option<&[f32]>,
     ) -> ArkanResult<Self> {
-        network.config.validate()?;
+        network.checked_layout()?;
         let config = network.config.clone();
-        let dims = config.layer_dims();
-        if network.layers.len() != config.num_layers() {
-            return Err(ArkanError::cpu(
-                "baked network layer count disagrees with config",
-            ));
-        }
         for (i, layer) in network.layers.iter().enumerate() {
-            let weights = checked_weights(layer.in_dim, layer.out_dim, layer.global_basis_size)?;
             if !(2..=5).contains(&layer.order) {
                 return Err(ArkanError::cpu(format!(
                     "spline_order {} is not supported by baked inference; supported range is 2..=5",
                     layer.order
-                )));
-            }
-            layer.validate_layout()?;
-            if layer.in_dim != dims[i]
-                || layer.out_dim != dims[i + 1]
-                || layer.in_dim == 0
-                || layer.out_dim == 0
-                || layer.order != config.spline_order
-                || layer.grid_size != config.grid_size
-                || layer.global_basis_size != layer.grid_size + layer.order
-                || layer.local_basis_size != layer.order + 1
-                || layer.basis_aligned < layer.local_basis_size
-                || layer.grid_range != config.grid_range
-                || layer.weights.len() != weights
-                || layer.bias.len() != layer.out_dim
-                || layer.mean.len() != layer.in_dim
-                || layer.std.len() != layer.in_dim
-            {
-                return Err(ArkanError::cpu(format!(
-                    "baked layer {i}: invalid shape or spline_order; supported orders are 2..=5"
                 )));
             }
             if !layer
@@ -337,8 +310,8 @@ impl BakedModel {
                 q_rmin,
                 q_rmax,
                 h_q16,
-                mean: layer.mean.clone(),
-                std: layer.std.clone(),
+                mean: layer.normalization().mean.to_vec(),
+                std: layer.normalization().std.to_vec(),
                 in_dim,
                 out_dim,
                 order,

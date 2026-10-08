@@ -370,15 +370,15 @@ fn validate_shape(expected: usize, actual: usize) -> ArkanResult<()> {
 }
 
 fn validate_grad_shapes(
-    network: &KanNetwork,
+    parameters: &crate::model::ParametersMut<'_>,
     weights: &[Vec<f32>],
     biases: &[Vec<f32>],
 ) -> ArkanResult<()> {
-    validate_shape(network.layers.len(), weights.len())?;
-    validate_shape(network.layers.len(), biases.len())?;
-    for ((layer, wg), bg) in network.layers.iter().zip(weights).zip(biases) {
-        validate_shape(layer.weights.len(), wg.len())?;
-        validate_shape(layer.bias.len(), bg.len())?;
+    validate_shape(parameters.len(), weights.len())?;
+    validate_shape(parameters.len(), biases.len())?;
+    for (((pw, pb), wg), bg) in parameters.iter().zip(weights).zip(biases) {
+        validate_shape(pw.len(), wg.len())?;
+        validate_shape(pb.len(), bg.len())?;
     }
     Ok(())
 }

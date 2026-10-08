@@ -349,7 +349,8 @@ impl Optimizer for Adam {
         bias_grads: &[Vec<f32>],
         max_grad_norm: Option<f32>,
     ) -> ArkanResult<()> {
-        validate_grad_shapes(network, weight_grads, bias_grads)?;
+        let mut parameters = network.try_parameters_mut()?;
+        validate_grad_shapes(&parameters, weight_grads, bias_grads)?;
         validate_safety(&self.config.safety, max_grad_norm)?;
         validate_nonnegative(self.config.lr as f64, "learning rate")?;
         validate_nonnegative(self.config.weight_decay as f64, "weight decay")?;
@@ -362,11 +363,13 @@ impl Optimizer for Adam {
                 "Adam requires betas in [0, 1) and finite positive epsilon",
             ));
         }
-        validate_shape(network.layers.len(), self.layer_states.len())?;
-        for (layer, state) in network.layers.iter().zip(&self.layer_states) {
+        validate_shape(parameters.len(), self.layer_states.len())?;
+        for ((parameter_weights, parameter_bias), state) in
+            parameters.iter().zip(&self.layer_states)
+        {
             for (params, tensor) in [
-                (layer.weights.as_slice(), &state.weights),
-                (layer.bias.as_slice(), &state.bias),
+                (parameter_weights, &state.weights),
+                (parameter_bias, &state.bias),
             ] {
                 validate_shape(params.len(), tensor.m.len())?;
                 validate_shape(params.len(), tensor.v.len())?;
@@ -382,10 +385,12 @@ impl Optimizer for Adam {
         };
 
         if self.config.safety.fail_on_nan || self.config.safety.skip_step_on_nan {
-            for (i, (layer, state)) in network.layers.iter().zip(&self.layer_states).enumerate() {
+            for (i, ((parameter_weights, parameter_bias), state)) in
+                parameters.iter().zip(&self.layer_states).enumerate()
+            {
                 for (params, grads, tensor) in [
-                    (layer.weights.as_slice(), &weights[i], &state.weights),
-                    (layer.bias.as_slice(), &biases[i], &state.bias),
+                    (parameter_weights, &weights[i], &state.weights),
+                    (parameter_bias, &biases[i], &state.bias),
                 ] {
                     let t = (tensor.t + 1) as i32;
                     let correction = (
@@ -409,23 +414,13 @@ impl Optimizer for Adam {
             }
         }
 
-        for (i, layer) in network.layers.iter_mut().enumerate() {
+        for (i, layer) in parameters.iter_mut().enumerate() {
             let state = &mut self.layer_states[i];
 
             // Update parameters
-            Self::update_params(
-                layer.weights.as_mut_slice(),
-                &weights[i],
-                &mut state.weights,
-                &self.config,
-            );
+            Self::update_params(layer.weights, &weights[i], &mut state.weights, &self.config);
 
-            Self::update_params(
-                layer.bias.as_mut_slice(),
-                &biases[i],
-                &mut state.bias,
-                &self.config,
-            );
+            Self::update_params(layer.bias, &biases[i], &mut state.bias, &self.config);
         }
 
         Ok(())
@@ -708,17 +703,20 @@ impl Optimizer for SGD {
         bias_grads: &[Vec<f32>],
         max_grad_norm: Option<f32>,
     ) -> ArkanResult<()> {
-        validate_grad_shapes(network, weight_grads, bias_grads)?;
+        let mut parameters = network.try_parameters_mut()?;
+        validate_grad_shapes(&parameters, weight_grads, bias_grads)?;
         validate_safety(&self.config.safety, max_grad_norm)?;
         validate_nonnegative(self.config.lr as f64, "learning rate")?;
         validate_nonnegative(self.config.weight_decay as f64, "weight decay")?;
         if !(0.0..1.0).contains(&self.config.momentum) {
             return Err(ArkanError::optimizer("SGD momentum must be in [0, 1)"));
         }
-        validate_shape(network.layers.len(), self.velocities.len())?;
-        for (layer, (vw, vb)) in network.layers.iter().zip(&self.velocities) {
-            validate_shape(layer.weights.len(), vw.len())?;
-            validate_shape(layer.bias.len(), vb.len())?;
+        validate_shape(parameters.len(), self.velocities.len())?;
+        for ((parameter_weights, parameter_bias), (vw, vb)) in
+            parameters.iter().zip(&self.velocities)
+        {
+            validate_shape(parameter_weights.len(), vw.len())?;
+            validate_shape(parameter_bias.len(), vb.len())?;
         }
         let Some((weights_grads, biases_grads)) =
             prepare_gradients(weight_grads, bias_grads, &self.config.safety, max_grad_norm)?
@@ -726,15 +724,17 @@ impl Optimizer for SGD {
             return Ok(());
         };
         if self.config.safety.fail_on_nan || self.config.safety.skip_step_on_nan {
-            for (i, (layer, (vw, vb))) in network.layers.iter().zip(&self.velocities).enumerate() {
+            for (i, ((parameter_weights, parameter_bias), (vw, vb))) in
+                parameters.iter().zip(&self.velocities).enumerate()
+            {
                 for (params, grads, velocity, decay) in [
                     (
-                        layer.weights.as_slice(),
+                        parameter_weights,
                         &weights_grads[i],
                         vw.as_slice(),
                         self.config.weight_decay,
                     ),
-                    (layer.bias.as_slice(), &biases_grads[i], vb.as_slice(), 0.0),
+                    (parameter_bias, &biases_grads[i], vb.as_slice(), 0.0),
                 ] {
                     for j in 0..params.len() {
                         let values = Self::updated_values(
@@ -751,21 +751,16 @@ impl Optimizer for SGD {
                 }
             }
         }
-        for (i, layer) in network.layers.iter_mut().enumerate() {
+        for (i, layer) in parameters.iter_mut().enumerate() {
             let (vw, vb) = &mut self.velocities[i];
             for (params, grads, velocity, decay) in [
                 (
-                    layer.weights.as_mut_slice(),
+                    layer.weights,
                     &weights_grads[i],
                     vw.as_mut_slice(),
                     self.config.weight_decay,
                 ),
-                (
-                    layer.bias.as_mut_slice(),
-                    &biases_grads[i],
-                    vb.as_mut_slice(),
-                    0.0,
-                ),
+                (layer.bias, &biases_grads[i], vb.as_mut_slice(), 0.0),
             ] {
                 for j in 0..params.len() {
                     let values =
