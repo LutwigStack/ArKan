@@ -151,9 +151,12 @@
 pub mod baked;
 pub mod buffer;
 pub mod config;
+pub mod cpu;
 pub mod error;
 pub mod layer;
 pub mod loss;
+pub mod math;
+pub mod memory;
 pub mod model;
 pub mod network;
 pub mod optimizer;
