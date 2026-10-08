@@ -88,7 +88,7 @@ impl BakedModel {
             let layer0 = &self.layers[0];
             let (r_min, r_max) = self.config.grid_range;
             for i in 0..layer0.in_dim {
-                let std_i = layer0.std[i].max(EPSILON);
+                let std_i = layer0.std[i];
                 let z_f = ((input[i] - layer0.mean[i]) / std_i).clamp(r_min, r_max);
                 act_a[i] = (z_f * 65536.0).round() as i32;
             }

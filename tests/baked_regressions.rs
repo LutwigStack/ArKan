@@ -296,3 +296,92 @@ fn fallible_bake_rejects_stale_order_knots_with_and_without_calibration() {
         "stale order cache must return Err without panicking"
     );
 }
+
+fn normalized_fixture(hidden: bool, std: f32) -> KanNetwork {
+    let mut config = network(1, (-3.0, 3.0)).config;
+    if hidden {
+        config.hidden_dims = vec![1];
+    }
+    let mut net = KanNetwork::new(config);
+    if hidden {
+        // Constant 0.75 * std. Keep weights above the existing quantization floor,
+        // and use binary fractions so the activation scales represent it exactly.
+        let weight = if std == 1.0 { 1.0 } else { 16.0 * std };
+        net.layers[0].weights.fill(weight);
+        net.layers[0].bias.fill(0.75 * std - weight);
+    }
+    let layer = net.layers.last_mut().unwrap();
+    layer.weights = (0..8).map(|i| i as f32).collect();
+    layer.bias.fill(0.0);
+    layer.mean[0] = if hidden { 0.25 * std } else { 0.0 };
+    layer.std[0] = std;
+    net
+}
+
+fn check_small_std_normalization(hidden: bool) {
+    let mut controls = Vec::new();
+    for std in [1.0, if hidden { 2.0f32.powi(-22) } else { 1e-8 }] {
+        let net = normalized_fixture(hidden, std);
+        // Import must preserve the same supported statistics as direct mutation.
+        #[cfg(feature = "serde")]
+        let net = KanNetwork::from_bytes(&net.to_bytes().unwrap()).unwrap();
+        let input = [if hidden { 0.0 } else { 0.5 * std }];
+        let mut cpu = [f32::NAN];
+        net.try_forward_single(&input, &mut cpu, &mut net.create_workspace(1))
+            .unwrap();
+        assert!((cpu[0] - 3.9166665).abs() < 1e-5, "CPU {cpu:?}");
+        for (mode, calibration) in [None, Some(input.as_slice())].into_iter().enumerate() {
+            let baked = BakedModel::try_from_network(&net, calibration).unwrap();
+            #[cfg(feature = "serde")]
+            let baked = BakedModel::from_bytes(&baked.to_bytes().unwrap()).unwrap();
+            assert_eq!(baked.layers.last().unwrap().std[0], std);
+            let mut actual = [f32::NAN];
+            let mut workspace = baked.create_workspace();
+            baked.forward_with_workspace(&input, &mut actual, &mut workspace);
+            assert!(
+                (actual[0] - cpu[0]).abs() < 0.03,
+                "hidden={hidden}, std={std}, mode={mode}: {actual:?} vs {cpu:?}"
+            );
+            let mut convenience = [f32::NAN];
+            baked.forward(&input, &mut convenience);
+            assert_eq!(actual, convenience);
+            if std == 1.0 {
+                controls.push(actual[0]);
+            } else {
+                assert!(
+                    (actual[0] - controls[mode]).abs() < 0.01,
+                    "normalized-equivalent fixtures differ: {} vs {}",
+                    actual[0],
+                    controls[mode]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn baked_entry_uses_actual_positive_small_std() {
+    check_small_std_normalization(false);
+}
+
+#[test]
+fn baked_hidden_uses_actual_positive_small_std() {
+    check_small_std_normalization(true);
+}
+
+#[test]
+fn unrepresentable_hidden_normalization_is_rejected() {
+    let mut rejected = Vec::new();
+    for (mean, std) in [(0.0, 1e-20), (0.01, 1e-8)] {
+        let mut net = normalized_fixture(true, 1.0);
+        net.layers[1].mean[0] = mean;
+        net.layers[1].std[0] = std;
+        for calibration in [None, Some(&[0.0][..])] {
+            rejected.push(BakedModel::try_from_network(&net, calibration).is_err());
+        }
+    }
+    assert_eq!(
+        rejected, [true; 4],
+        "hidden scale and offset must be representable in both calibration modes"
+    );
+}

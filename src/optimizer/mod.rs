@@ -98,7 +98,8 @@ pub trait Optimizer: Send + Sync {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` on success, or an error if:
+    /// Returns `Ok(())` after an applied update or a numerical skip under
+    /// [`SafetyConfig::skip_step_on_nan`], or an error if:
     /// - Gradient/parameter shape mismatch
     /// - NaN detected (if `fail_on_nan` is enabled)
     /// - Numerical issues in the optimizer
@@ -188,17 +189,19 @@ pub trait Optimizer: Send + Sync {
 // COMMON CONFIGURATION
 // =============================================================================
 
-/// Parameter group for per-layer or per-parameter-set optimization.
+/// Parameter-group metadata retained for configuration and checkpoint compatibility.
 ///
-/// Allows different learning rates, weight decay, and other hyperparameters
-/// for different parts of the network.
+/// Current optimizers do not consume this type: overrides, layer selections,
+/// gradient scaling and freezing have no runtime effect. They support one group;
+/// configure it through [`AdamConfig`], [`SGDConfig`] or [`LBFGSConfig`] and
+/// [`Optimizer::set_lr`].
 ///
 /// # Example
 ///
 /// ```rust
 /// use arkan::optimizer::ParamGroup;
 ///
-/// // Custom group with overrides
+/// // Store metadata; this does not configure an optimizer
 /// let group = ParamGroup {
 ///     lr_override: Some(0.0001),
 ///     weight_decay_override: Some(0.01),
@@ -208,22 +211,22 @@ pub trait Optimizer: Send + Sync {
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ParamGroup {
-    /// Override learning rate for this group. If None, uses optimizer default.
+    /// Stored learning-rate override; unused by current optimizers.
     pub lr_override: Option<f64>,
 
-    /// Override weight decay for this group. If None, uses optimizer default.
+    /// Stored weight-decay override; unused by current optimizers.
     pub weight_decay_override: Option<f64>,
 
-    /// Override betas (for Adam) for this group. If None, uses optimizer default.
+    /// Stored Adam betas override; unused by current optimizers.
     pub betas_override: Option<(f64, f64)>,
 
-    /// If false, parameters in this group are frozen (no gradient updates).
+    /// Stored gradient-enable flag; setting false does not freeze parameters at runtime.
     pub requires_grad: bool,
 
-    /// Per-group gradient scaling factor for AMP.
+    /// Stored per-group AMP scaling factor; unused by current optimizers.
     pub grad_scaling: Option<f64>,
 
-    /// Layer indices that belong to this group.
+    /// Stored layer selection; unused by current optimizers.
     pub layer_indices: Vec<usize>,
 }
 
@@ -237,7 +240,7 @@ impl ParamGroup {
         }
     }
 
-    /// Creates a frozen group (no gradient updates).
+    /// Creates metadata with `requires_grad = false`; this does not freeze runtime updates.
     pub fn frozen(layer_indices: Vec<usize>) -> Self {
         Self {
             requires_grad: false,
@@ -246,7 +249,7 @@ impl ParamGroup {
         }
     }
 
-    /// Creates a group with custom learning rate.
+    /// Creates metadata with a learning-rate override; this does not change runtime updates.
     pub fn with_lr(layer_indices: Vec<usize>, lr: f64) -> Self {
         Self {
             requires_grad: true,
@@ -376,6 +379,13 @@ fn check_finite(values: &[f32], safety: &SafetyConfig, context: &str) -> ArkanRe
         }
     }
     Ok(false)
+}
+
+/// Internal transaction result; public `Optimizer::step` retains its unit return type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StepOutcome {
+    Applied,
+    Skipped,
 }
 
 type PreparedGradients<'a> = (Cow<'a, [Vec<f32>]>, Cow<'a, [Vec<f32>]>);

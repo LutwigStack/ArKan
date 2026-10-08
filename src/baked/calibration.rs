@@ -38,7 +38,8 @@ impl BakedModel {
     /// Empty calibration uses the same uncalibrated heuristic as `None`.
     /// Nonempty calibration must contain complete samples and finite values.
     /// Grid endpoints and interval spacing must fit Q15.16; sub-tick ranges
-    /// retain the single-tick fallback, with reduced precision.
+    /// retain the single-tick fallback, with reduced precision. Hidden normalization
+    /// multipliers and offsets must fit the fixed-point representation.
     pub fn try_from_network(
         network: &KanNetwork,
         calibration: Option<&[f32]>,
@@ -256,9 +257,25 @@ impl BakedModel {
             // inputs (KanLayer::new), so k = 0 unless a caller has hand-set
             // per-input normalization on a hidden layer; even k = 20 still beats the
             // 3 bits this replaces by a factor of 128.
+            // Hidden normalization is executed in fixed point; entry normalization uses f32.
+            if l > 0 {
+                for (&mean, &std) in layer.mean.iter().zip(&layer.std) {
+                    let a = 65536.0 / (s_act_prev as f64 * std as f64);
+                    let b = -mean as f64 / std as f64 * 65536.0;
+                    if !a.is_finite()
+                        || a.round() > ((1i64 << 30) - 1) as f64
+                        || !b.is_finite()
+                        || !(i32::MIN as f64..=i32::MAX as f64).contains(&b.round())
+                    {
+                        return Err(ArkanError::cpu(format!(
+                            "baked layer {l}: normalization exceeds fixed-point range"
+                        )));
+                    }
+                }
+            }
             let norm_shift: u32 = {
                 let a_z_max = (0..in_dim)
-                    .map(|i| 65536.0 / (s_act_prev as f64 * layer.std[i].max(EPSILON) as f64))
+                    .map(|i| 65536.0 / (s_act_prev as f64 * layer.std[i] as f64))
                     .fold(0.0f64, f64::max);
                 if a_z_max > 0.0 && a_z_max.is_finite() {
                     // Target A_FIXED in [2^29, 2^30) for the largest a_z.
@@ -279,7 +296,7 @@ impl BakedModel {
             // q_z = q_in >> 62 = 0, which is the right answer, not a collapse.
             let norm_a_fixed: Vec<i32> = (0..in_dim)
                 .map(|i| {
-                    let std_i = layer.std[i].max(EPSILON) as f64;
+                    let std_i = layer.std[i] as f64;
                     let a = 65536.0 / (s_act_prev as f64 * std_i) * (1u64 << norm_shift) as f64;
                     (a.round() as i64).clamp(1, (1i64 << 30) - 1) as i32
                 })
@@ -291,7 +308,7 @@ impl BakedModel {
             // half a Q16 tick, ~2e-5 of a grid interval at grid_range (-1,1), G = 5.
             let norm_b_fixed: Vec<i32> = (0..in_dim)
                 .map(|i| {
-                    let std_i = layer.std[i].max(EPSILON) as f64;
+                    let std_i = layer.std[i] as f64;
                     let b = -layer.mean[i] as f64 / std_i * 65536.0;
                     b.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32
                 })

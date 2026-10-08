@@ -341,14 +341,14 @@ impl Clone for Adam {
 // TRAIT IMPLEMENTATION FOR ADAM
 // =============================================================================
 
-impl Optimizer for Adam {
-    fn step(
+impl Adam {
+    pub(crate) fn step_with_outcome(
         &mut self,
         network: &mut KanNetwork,
         weight_grads: &[Vec<f32>],
         bias_grads: &[Vec<f32>],
         max_grad_norm: Option<f32>,
-    ) -> ArkanResult<()> {
+    ) -> ArkanResult<StepOutcome> {
         let mut parameters = network.try_parameters_mut()?;
         validate_grad_shapes(&parameters, weight_grads, bias_grads)?;
         validate_safety(&self.config.safety, max_grad_norm)?;
@@ -381,7 +381,7 @@ impl Optimizer for Adam {
         let Some((weights, biases)) =
             prepare_gradients(weight_grads, bias_grads, &self.config.safety, max_grad_norm)?
         else {
-            return Ok(());
+            return Ok(StepOutcome::Skipped);
         };
 
         if self.config.safety.fail_on_nan || self.config.safety.skip_step_on_nan {
@@ -407,7 +407,7 @@ impl Optimizer for Adam {
                             correction,
                         );
                         if check_finite(&values, &self.config.safety, "Adam update or state")? {
-                            return Ok(());
+                            return Ok(StepOutcome::Skipped);
                         }
                     }
                 }
@@ -423,7 +423,20 @@ impl Optimizer for Adam {
             Self::update_params(layer.bias, &biases[i], &mut state.bias, &self.config);
         }
 
-        Ok(())
+        Ok(StepOutcome::Applied)
+    }
+}
+
+impl Optimizer for Adam {
+    fn step(
+        &mut self,
+        network: &mut KanNetwork,
+        weight_grads: &[Vec<f32>],
+        bias_grads: &[Vec<f32>],
+        max_grad_norm: Option<f32>,
+    ) -> ArkanResult<()> {
+        self.step_with_outcome(network, weight_grads, bias_grads, max_grad_norm)
+            .map(|_| ())
     }
 
     fn zero_grad(&mut self, network: &mut KanNetwork) -> ArkanResult<()> {
@@ -695,14 +708,14 @@ impl Clone for SGD {
 // TRAIT IMPLEMENTATION FOR SGD
 // =============================================================================
 
-impl Optimizer for SGD {
-    fn step(
+impl SGD {
+    pub(crate) fn step_with_outcome(
         &mut self,
         network: &mut KanNetwork,
         weight_grads: &[Vec<f32>],
         bias_grads: &[Vec<f32>],
         max_grad_norm: Option<f32>,
-    ) -> ArkanResult<()> {
+    ) -> ArkanResult<StepOutcome> {
         let mut parameters = network.try_parameters_mut()?;
         validate_grad_shapes(&parameters, weight_grads, bias_grads)?;
         validate_safety(&self.config.safety, max_grad_norm)?;
@@ -721,7 +734,7 @@ impl Optimizer for SGD {
         let Some((weights_grads, biases_grads)) =
             prepare_gradients(weight_grads, bias_grads, &self.config.safety, max_grad_norm)?
         else {
-            return Ok(());
+            return Ok(StepOutcome::Skipped);
         };
         if self.config.safety.fail_on_nan || self.config.safety.skip_step_on_nan {
             for (i, ((parameter_weights, parameter_bias), (vw, vb))) in
@@ -745,7 +758,7 @@ impl Optimizer for SGD {
                             decay,
                         );
                         if check_finite(&values, &self.config.safety, "SGD update or state")? {
-                            return Ok(());
+                            return Ok(StepOutcome::Skipped);
                         }
                     }
                 }
@@ -771,7 +784,20 @@ impl Optimizer for SGD {
             }
         }
 
-        Ok(())
+        Ok(StepOutcome::Applied)
+    }
+}
+
+impl Optimizer for SGD {
+    fn step(
+        &mut self,
+        network: &mut KanNetwork,
+        weight_grads: &[Vec<f32>],
+        bias_grads: &[Vec<f32>],
+        max_grad_norm: Option<f32>,
+    ) -> ArkanResult<()> {
+        self.step_with_outcome(network, weight_grads, bias_grads, max_grad_norm)
+            .map(|_| ())
     }
 
     fn zero_grad(&mut self, network: &mut KanNetwork) -> ArkanResult<()> {

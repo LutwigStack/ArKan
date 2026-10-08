@@ -425,10 +425,11 @@ pub(crate) fn validate_finite_normalization(mean: &[f32], std: &[f32]) -> Result
     Ok(())
 }
 
-/// Per-layer configuration (for advanced use cases).
+/// Per-layer metadata retained for configuration and serialization compatibility.
 ///
-/// Most users should use [`KanConfig`] instead. This struct is useful
-/// for fine-grained control over individual layers.
+/// Current network and layer constructors do not consume this type, so its fields
+/// have no runtime effect. Use [`KanConfig`] to configure a network, or the explicit
+/// arguments to [`KanLayer::try_new`](crate::KanLayer::try_new) for a standalone layer.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LayerConfig {

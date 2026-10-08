@@ -12,7 +12,7 @@ use crate::gpu::pipeline::{workgroup_count, PipelineCache, WORKGROUP_SIZE};
 use crate::gpu::workspace::GpuWorkspace;
 use crate::loss::{masked_bce_with_logits, masked_mse};
 use crate::network::{KanNetwork, TrainOptions};
-use crate::optimizer::{Adam, Optimizer, SGD};
+use crate::optimizer::{Adam, Optimizer, StepOutcome, SGD};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -52,18 +52,17 @@ fn unpad_weights(
     result
 }
 
-// Adam and SGD leave parameters/state untouched on Err; only the extra decay needs rollback.
+// First-order skips/errors leave parameters/state untouched; roll back the extra decay too.
 fn step_cpu_with_decay(
-    optimizer: &mut impl Optimizer,
     cpu_network: &mut KanNetwork,
-    grad_weights: &[Vec<f32>],
-    grad_biases: &[Vec<f32>],
+    lr: f32,
     opts: &TrainOptions,
-) -> ArkanResult<()> {
+    step: impl FnOnce(&mut KanNetwork) -> ArkanResult<StepOutcome>,
+) -> ArkanResult<StepOutcome> {
     let original_weights = if opts.weight_decay > 0.0 {
         let mut parameters = cpu_network.try_parameters_mut()?;
         let original: Vec<Vec<f32>> = parameters.iter().map(|(w, _)| w.to_vec()).collect();
-        let factor = 1.0 - optimizer.get_lr(0)? as f32 * opts.weight_decay;
+        let factor = 1.0 - lr * opts.weight_decay;
         for layer in parameters.iter_mut() {
             for weight in layer.weights {
                 *weight *= factor;
@@ -74,15 +73,15 @@ fn step_cpu_with_decay(
         None
     };
 
-    if let Err(error) = optimizer.step(cpu_network, grad_weights, grad_biases, opts.max_grad_norm) {
+    let outcome = step(cpu_network);
+    if !matches!(outcome, Ok(StepOutcome::Applied)) {
         if let Some(original) = original_weights {
             for (layer, weights) in cpu_network.try_parameters_mut()?.iter_mut().zip(original) {
                 layer.weights.copy_from_slice(&weights);
             }
         }
-        return Err(error);
     }
-    Ok(())
+    outcome
 }
 
 /// Handle for asynchronous GPU forward pass result.
@@ -1812,11 +1811,13 @@ impl GpuNetwork {
             &mut grad_biases,
         )?;
 
-        // 4–5. Preserve additional decay only when the optimizer step succeeds.
-        step_cpu_with_decay(optimizer, cpu_network, &grad_weights, &grad_biases, opts)?;
-
-        // 6. Sync weights from CPU to GPU
-        self.sync_weights(cpu_network)?;
+        // 4–6. Keep additional decay and upload only an applied optimizer update.
+        let outcome = step_cpu_with_decay(cpu_network, optimizer.config.lr, opts, |network| {
+            optimizer.step_with_outcome(network, &grad_weights, &grad_biases, opts.max_grad_norm)
+        })?;
+        if outcome == StepOutcome::Applied {
+            self.sync_weights(cpu_network)?;
+        }
 
         Ok(loss)
     }
@@ -1944,11 +1945,13 @@ impl GpuNetwork {
             &mut grad_biases,
         )?;
 
-        // 4–5. Preserve additional decay only when the optimizer step succeeds.
-        step_cpu_with_decay(optimizer, cpu_network, &grad_weights, &grad_biases, opts)?;
-
-        // 6. Sync weights from CPU to GPU
-        self.sync_weights(cpu_network)?;
+        // 4–6. Keep additional decay and upload only an applied optimizer update.
+        let outcome = step_cpu_with_decay(cpu_network, optimizer.config.lr, opts, |network| {
+            optimizer.step_with_outcome(network, &grad_weights, &grad_biases, opts.max_grad_norm)
+        })?;
+        if outcome == StepOutcome::Applied {
+            self.sync_weights(cpu_network)?;
+        }
 
         Ok(loss)
     }

@@ -163,8 +163,8 @@ impl Training {
 fn assert_cpu_unchanged(actual: &KanNetwork, before: &KanNetwork) {
     assert_eq!(actual.layers.len(), before.layers.len());
     for (actual, before) in actual.layers.iter().zip(&before.layers) {
-        assert_eq!(actual.weights, before.weights, "CPU weights changed on Err");
-        assert_eq!(actual.bias, before.bias, "CPU bias changed on Err");
+        assert_eq!(actual.weights, before.weights, "CPU weights changed");
+        assert_eq!(actual.bias, before.bias, "CPU bias changed");
         assert_eq!(actual.mean, before.mean);
         assert_eq!(actual.std, before.std);
     }
@@ -243,6 +243,8 @@ fn rejected_optimizer_step_rolls_back_additional_hybrid_decay() {
             let before = training.cpu.clone();
             let adam_before = training.adam.clone();
             let sgd_before = training.sgd.clone();
+            let mut gpu_before = model(1.0);
+            training.gpu.sync_weights_to_cpu(&mut gpu_before).unwrap();
             let options = TrainOptions {
                 weight_decay: 0.5,
                 max_grad_norm: None,
@@ -251,6 +253,9 @@ fn rejected_optimizer_step_rolls_back_additional_hybrid_decay() {
             assert_adam_unchanged(&training.adam, &adam_before);
             assert_sgd_unchanged(&training.sgd, &sgd_before);
             assert_cpu_unchanged(&training.cpu, &before);
+            let mut downloaded = model(1.0);
+            training.gpu.sync_weights_to_cpu(&mut downloaded).unwrap();
+            assert_cpu_unchanged(&downloaded, &gpu_before);
         }
     }
 }
@@ -322,5 +327,156 @@ fn successful_hybrid_options_preserve_both_decay_factors() {
         let mut downloaded = model(1.0);
         training.gpu.sync_weights_to_cpu(&mut downloaded).unwrap();
         assert_cpu_unchanged(&downloaded, &training.cpu);
+    }
+}
+
+fn skipped_hybrid_update_preserves_transaction(entry: usize, reason: &str) {
+    let backend = backend();
+    let mut training = Training::new(&backend);
+    training.adam.bump_version();
+    training.sgd.bump_version();
+    // Warm every moment/velocity element, including inactive spline coefficients.
+    let wg = vec![vec![1.0; training.cpu.layers[0].weights.len()]];
+    let bg = vec![vec![1.0; training.cpu.layers[0].bias.len()]];
+    training
+        .adam
+        .step(&mut training.cpu, &wg, &bg, None)
+        .unwrap();
+    training
+        .sgd
+        .step(&mut training.cpu, &wg, &bg, None)
+        .unwrap();
+    training.gpu.sync_weights(&training.cpu).unwrap();
+    let mut gpu_before = model(1.0);
+    training.gpu.sync_weights_to_cpu(&mut gpu_before).unwrap();
+    // A distinct valid CPU snapshot exposes an unwanted upload even after rollback.
+    training.cpu.layers[0]
+        .weights
+        .iter_mut()
+        .for_each(|w| *w += 0.125);
+    training.cpu.layers[0].mean[0] = 0.05;
+    training.cpu.layers[0].std[0] = 1.25;
+    let mut options = TrainOptions {
+        weight_decay: 0.5,
+        max_grad_norm: None,
+    };
+    let target = match reason {
+        "raw gradient" => f32::NAN,
+        "unscale" => {
+            training.adam.config.safety = SafetyConfig::with_amp(1e-320);
+            training.sgd.config.safety = SafetyConfig::with_amp(1e-320);
+            0.0
+        }
+        "prospective update" => {
+            // Raw gradients and extra decay stay finite; Adam's variance and
+            // SGD's parameter update overflow only during optimizer preview.
+            training.sgd.config.lr = f32::MAX;
+            options.weight_decay = if entry == 4 { 1e-40 } else { 0.5 };
+            -1e30
+        }
+        "extra decay" => {
+            training.adam.config.lr = f32::MAX;
+            training.sgd.config.lr = f32::MAX;
+            training.cpu.layers[0].weights.fill(4.0);
+            0.0
+        }
+        _ => unreachable!(),
+    };
+    let before = training.cpu.clone();
+    let adam_before = training.adam.clone();
+    let sgd_before = training.sgd.clone();
+    eprintln!("entry {entry}, skip {reason}");
+    training.step(entry, target, &options).unwrap();
+    assert_adam_unchanged(&training.adam, &adam_before);
+    assert_sgd_unchanged(&training.sgd, &sgd_before);
+    assert_cpu_unchanged(&training.cpu, &before);
+    let mut downloaded = model(1.0);
+    training.gpu.sync_weights_to_cpu(&mut downloaded).unwrap();
+    assert_cpu_unchanged(&downloaded, &gpu_before);
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn hybrid_adam_raw_gradient_skip_rolls_back_additional_decay() {
+    skipped_hybrid_update_preserves_transaction(2, "raw gradient");
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn hybrid_sgd_raw_gradient_skip_rolls_back_additional_decay() {
+    skipped_hybrid_update_preserves_transaction(4, "raw gradient");
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn hybrid_adam_unscale_skip_rolls_back_additional_decay() {
+    skipped_hybrid_update_preserves_transaction(2, "unscale");
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn hybrid_sgd_unscale_skip_rolls_back_additional_decay() {
+    skipped_hybrid_update_preserves_transaction(4, "unscale");
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn hybrid_adam_prospective_update_skip_rolls_back_additional_decay() {
+    skipped_hybrid_update_preserves_transaction(2, "prospective update");
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn hybrid_sgd_prospective_update_skip_rolls_back_additional_decay() {
+    skipped_hybrid_update_preserves_transaction(4, "prospective update");
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn hybrid_adam_nonfinite_extra_decay_is_rolled_back() {
+    skipped_hybrid_update_preserves_transaction(2, "extra decay");
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn hybrid_sgd_nonfinite_extra_decay_is_rolled_back() {
+    skipped_hybrid_update_preserves_transaction(4, "extra decay");
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn successful_zero_lr_hybrid_step_advances_history_and_syncs() {
+    let backend = backend();
+    for entry in [2, 4] {
+        let mut training = Training::new(&backend);
+        training.step(entry, 0.0, &TrainOptions::default()).unwrap();
+        training.adam.config.lr = 0.0;
+        training.sgd.config.lr = 0.0;
+        training.cpu.layers[0]
+            .weights
+            .iter_mut()
+            .for_each(|w| *w += 0.125);
+        let before = training.cpu.clone();
+        let adam_t = training.adam.layer_states[0].weights.t;
+        let velocity = training.sgd.velocities[0].1.as_slice()[0];
+        training
+            .step(
+                entry,
+                -1.0,
+                &TrainOptions {
+                    weight_decay: 0.5,
+                    max_grad_norm: None,
+                },
+            )
+            .unwrap();
+        assert_cpu_unchanged(&training.cpu, &before);
+        if entry == 2 {
+            assert_eq!(training.adam.layer_states[0].weights.t, adam_t + 1);
+        } else {
+            assert_ne!(training.sgd.velocities[0].1.as_slice()[0], velocity);
+        }
+        let mut downloaded = model(1.0);
+        training.gpu.sync_weights_to_cpu(&mut downloaded).unwrap();
+        assert_cpu_unchanged(&downloaded, &before);
     }
 }
