@@ -3,10 +3,9 @@
 This document describes the internal architecture of ArKan, a high-performance
 Kolmogorov-Arnold Network (KAN) library with CPU SIMD and GPU backends.
 
-Checked against the code at **0.4.0** (2026-07-26). Line references point at the
-file they name; if one has drifted, the code wins. See
-[Design constraints](#design-constraints) for the properties that will bite you
-before the fast paths help you.
+The implementation remains a single `arkan` crate. Legacy public imports and
+valid saved-model formats remain compatible across the internal ownership moves.
+See [Design constraints](#design-constraints) for numerical limits.
 
 ## Overview
 
@@ -40,43 +39,52 @@ before the fast paths help you.
 
 ## Module Map
 
-Every file under `src/`. Nothing here is a stub.
+Each responsibility owns executable code, with one definition of every public type.
 
-| Module | Lines | What lives there |
-|---|---|---|
-| `src/lib.rs` | 227 | Crate docs, module declarations, re-exports, `VERSION`, `MAGIC_BAKED` |
-| `src/config.rs` | 939 | `KanConfig`, `KanConfigBuilder`, `LayerConfig`, `validate()`, order/grid limits |
-| `src/network.rs` | 2276 | `KanNetwork`, `TrainOptions`, forward/backward/train-step family, serialization |
-| `src/layer.rs` | 1461 | `KanLayer` — normalization, span lookup, basis evaluation, weight/bias/input gradients |
-| `src/spline.rs` | 569 | Cox-de Boor basis and derivative, knot vectors, `find_span`, `SPAN_CLAMPED_FLAG` |
-| `src/buffer.rs` | 1536 | `AlignedBuffer`, `Tensor`/`TensorView`, `Workspace`, `WorkspaceGuard` |
-| `src/optimizer.rs` | 2527 | `Optimizer` trait, `Adam`, `SGD`, `LBFGS`, `StepLR`, `CosineAnnealingLR`, `SafetyConfig` |
-| `src/loss.rs` | 1871 | Masked MSE/MAE/RMSE/Huber/BCE/cross-entropy, softmax, KAN and physics regularizers |
-| `src/baked.rs` | 1519 | `BakedModel` — int8 fixed-point inference-only path (see below) |
-| `src/error.rs` | 376 | `ArkanError`, `ArkanResult` |
-| `src/gpu/` | 8598 | wgpu backend, behind `feature = "gpu"` (see [GPU Backend](#gpu-backend-srcgpu)) |
+| Owner | Responsibility |
+|---|---|
+| `src/model/` | KanNetwork construction/clone, configuration, immutable checked topology, normalization specifications and parameter-only borrows |
+| `src/math/spline.rs` | Knots, span packing, scalar/SIMD spline basis and derivatives |
+| `src/memory/` | Aligned allocation, checked extents, Tensor/TensorView and aligned-buffer serde |
+| `src/cpu/` | Layer kernels, forward orchestration, workspace/history storage and bounded parallel scratch |
+| `src/training/` | TrainOptions, borrowed ForwardPass/Gradients, one reverse-layer loop, trainers and shared f64 global clipping |
+| `src/optimizer/` | Optimizer trait/safety policy, Adam/SGD, transactional LBFGS/search, schedulers |
+| `src/loss/` | Regression, classification and regularization formulas, including reusable MSE fill |
+| `src/baked/` | Validated calibration/quantization, fixed-point arithmetic and workspace inference |
+| `src/gpu/` | Device/tensor/pipeline/shaders, GPU execution/workspace and native optimizers |
+| `src/format/` | Private stable DTOs, borrowed serializers, checked import and versioned envelopes |
+| `src/error.rs` | Shared public errors, including existing feature-gated GPU variants |
+| `src/lib.rs` | Public module declarations and convenience exports |
+
+`config`, `network`, `layer`, `spline`, and `buffer` remain compatibility facades.
+Their reexports preserve old paths and type identity; no conversion wrappers or
+second copy of a public type is introduced. `gpu`, `optimizer`, `loss` and `baked`
+keep their existing public module paths.
 
 ## Core Components
 
-### 1. Network Layer (`src/network.rs`)
+### 1. Model and checked layout (`src/model/`)
 
-`KanNetwork` is the main entry point. It manages:
-- Network configuration (`KanConfig`)
-- Layer stack (`Vec<KanLayer>`)
-- Default training options
-- Serialization/deserialization
+`KanNetwork` owns configuration, the layer stack, default training options and a
+private immutable layout snapshot. The snapshot includes dimensions, parameter
+extents, spline geometry/range and SIMD alignment. Checked execution, baking,
+GPU conversion and synchronization validate legacy public fields against it.
+Normalization values may still be updated through existing setters or public
+fields; their shape and validity are checked, and conversions consume each
+layer's actual statistics.
 
-Key methods:
-- `forward_single` - Single sample inference (lowest latency)
-- `forward_batch` - Batch inference (highest throughput)
-- `train_step` - Complete training iteration (SGD/Adam/LBFGS)
-- `try_*` variants - Result-returning versions for error handling
+`try_parameters_mut` returns fixed-length weight/bias slices. Adam, SGD, direct
+training and LBFGS restoration consume this boundary; it cannot resize layers,
+change geometry or mutate normalization. Legacy public structural fields remain
+available until a future breaking release, so incompatible edits return errors
+at checked boundaries. Raw layer calls retain their documented caller-managed
+buffer contract.
 
-### 2. Layer (`src/layer.rs`)
+### 2. CPU layer (`src/cpu/layer.rs`)
 
 `KanLayer` implements a single KAN layer with learnable B-spline basis functions.
 
-**Weight layout** (`KanLayer::weight_index`, src/layer.rs:344) — **output
+**Weight layout** (`KanLayer::weight_index`, src/cpu/layer.rs) — **output
 outermost**, not input:
 ```
 weights[(j * in_dim + i) * global_basis_size + k]
@@ -92,13 +100,13 @@ weights[(j * in_dim + i) * global_basis_size + k]
 3. Evaluate the B-spline basis over the local `order + 1` window (SIMD vectorized)
 4. Weighted sum with the learned weights, plus bias
 
-**Normalization is per-layer, and only layer 0 gets real statistics.**
-`KanNetwork::new` calls `set_normalization` on layer 0 only. Every hidden layer
-is constructed with identity normalization (`mean = 0`, `std = 1`) and there is
-no running-statistics update anywhere in the crate. So a hidden layer's `z` *is*
-the previous layer's raw activation, clamped to the **shared** `grid_range`.
-Nothing bounds a KAN layer's output to its own grid range — see
-[Design constraints](#design-constraints).
+**Normalization is explicit at construction.** The network builder supplies
+configured statistics to layer zero and identity statistics to every hidden
+layer, including hidden layers whose width equals the input width. Standalone
+`KanLayer::new` retains its matching-width behavior; `try_new_at` selects by layer
+position. Setters can change each layer's statistics, and no running-statistics
+estimation occurs during training. Hidden identity normalization therefore leaves
+the previous layer's activation unchanged before the shared grid-range clamp.
 
 **Saturation flag (`SPAN_CLAMPED_FLAG`).** Step 1 is a clamp, so `dz/dx` is
 `1/std` inside the range and exactly `0` outside it. Backward has to know which
@@ -107,22 +115,22 @@ that would confuse a saturated input with one that legitimately landed on the
 boundary. So the forward pass records it:
 
 ```rust
-// src/layer.rs:511 — forward_batch, while storing the span index
+// src/cpu/layer.rs — forward_batch, while storing the span index
 let clamped = if z == unclamped { 0 } else { SPAN_CLAMPED_FLAG };
 grid_indices[idx] = span as u32 | clamped;
 ```
 
-`SPAN_CLAMPED_FLAG` is `0x8000_0000` (src/spline.rs:102) — the **high bit of
+`SPAN_CLAMPED_FLAG` is `0x8000_0000` (src/math/spline.rs) — the **high bit of
 the stored span index** in `Workspace::layers_grid_indices`. Backward reads it
-and forces `dz/dx = 0` (src/layer.rs:914 and :1090); consumers of the span
+and forces `dz/dx = 0` (src/cpu/layer.rs); consumers of the span
 itself must mask with `SPAN_INDEX_MASK`. Costs no extra buffer and no signature
 change. The GPU shaders carry the identical scheme
-(src/gpu/shaders.rs:914, :1866).
+(src/gpu/shaders.rs).
 
 `KanLayer::forward_single` does **not** record the flag — it is the inference
-path and never feeds a backward pass (`// ponytail:` at src/layer.rs:413).
+path and never feeds a backward pass (`// ponytail:` at src/cpu/layer.rs).
 
-### 3. Spline Module (`src/spline.rs`)
+### 3. Spline mathematics (`src/math/spline.rs`)
 
 Implements B-spline mathematics:
 
@@ -136,10 +144,10 @@ B_{i,k}(x) = (x - t_i)/(t_{i+k} - t_i) * B_{i,k-1}(x)
 
 SIMD-optimized for orders 2–7 (`MAX_SPLINE_ORDER`). GPU shaders support orders
 2–5 (`MIN_GPU_SPLINE_ORDER`–`MAX_GPU_SPLINE_ORDER`). `BakedModel` also supports
-2–5 only, and **panics** on anything else — `KanConfig::validate()` accepts up
-to 7, so that gap is a documented panic, not a `Result`.
+2–5 only. `BakedModel::try_from_network` returns an error for unsupported orders;
+its legacy `from_network` wrapper panics on conversion errors.
 
-### 4. Buffer Management (`src/buffer.rs`)
+### 4. Memory and CPU workspace (`src/memory/`, `src/cpu/workspace.rs`)
 
 **AlignedBuffer:**
 - 64-byte aligned (CACHE_LINE)
@@ -170,7 +178,7 @@ Unified error type `ArkanError` with variants:
 - `Overflow` - Integer overflow protection
 - `BatchTooLarge` - Workspace capacity exceeded
 
-### 6. Baked Inference (`src/baked.rs`)
+### 6. Baked inference (`src/baked/`)
 
 `BakedModel` is an inference-only, fixed-point rewrite of a trained
 `KanNetwork`. No f32 appears in the hot path between the entry and exit
@@ -202,9 +210,16 @@ f32 input
   └─> exit: output[j] = act[j] / s_act_last                   -> f32
 ```
 
-Calibration (`from_network(net, Some(&calib))`) sets `s_act` from the 99.9th
-percentile of observed activation magnitudes per layer. Without it the scale
-falls back to a coarse heuristic and accuracy degrades badly.
+Calibration (`try_from_network(net, Some(&calib))`) sets `s_act` from the 99.9th
+percentile of observed activation magnitudes per layer. Missing or empty
+calibration uses the heuristic and marks the model `uncalibrated`; the percentile
+sets a scale, not an output ceiling. Conversion preflights the complete CPU
+layout, finite calibration, supported order and fixed-point bounds.
+
+`BakedWorkspace` owns integer activation, span and basis scratch. Create it once
+and call `forward_with_workspace` for allocation-free repeated inference. The
+legacy `forward` convenience method creates scratch on each call. Public baked
+fields retain the validated bake/import invariant required by low-level inference.
 
 **Two things about this pipeline that used to be wrong and are worth knowing**
 (both fixed; see [BENCHMARKS.md](BENCHMARKS.md#baked-int8-inference)):
@@ -271,7 +286,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) { ... }
 | `generate_backward_input_shader(order)` | Input gradient computation | 64×1×1 |
 | `ADAM_SHADER` | On-device Adam optimizer step | 64×1×1 |
 | `SGD_SHADER` | On-device SGD with momentum step | 64×1×1 |
-| `GRAD_CLIP_SHADER` | Global gradient clipping | 64×1×1 |
+| `GRAD_CLIP_SHADER` | Available shader helper; high-level clipping currently downloads gradients | 64×1×1 |
 
 ### Dynamic Shader Generation
 
@@ -309,33 +324,44 @@ Weights are packed into `vec4` for coalesced memory access:
 // GPU: weights_vec4[((j * in_dim + i) * basis + k) / 4]
 ```
 
-## Training Pipeline
+## Training pipeline
 
-```
-1. forward_batch_training()
-   └── Captures layer inputs and grid indices for backward
+`try_forward_for_backward` returns a `ForwardPass` only after a successful checked
+training forward. It holds an immutable model/layout borrow and an exclusive
+Workspace borrow, so parameters, normalization and saved inputs/spans cannot
+change before backward. Callers compute any loss derivative from the output,
+then consume the pass with `backward`. Returned `Gradients` borrow only workspace
+storage, releasing the model for an optimizer update.
 
-2. Loss computation (masked MSE/BCE/cross-entropy/etc.)
-   └── Computes loss and output gradients
+MSE trainers and custom losses share one reverse-layer loop in `training`.
+Shape/history checks and all fallible scratch preparation happen before zeroing
+gradients or taking workspace buffers. Empty batches produce zero parameter
+gradients and skip updates. Reservation alone does not establish a valid pass.
+Legacy public workspace fields and raw backward methods remain available with
+caller-managed validity; the borrowed interface is the safe high-level path.
 
-3. backward() for each layer (reverse order)
-   ├── Weight gradients: sum over batch
-   ├── Bias gradients: sum over batch
-   └── Input gradients: propagate to previous layer
-       └── dz/dx = 0 where SPAN_CLAMPED_FLAG is set, else 1/std
+`masked_mse_into` validates lengths before writes, clears inactive mask entries,
+and fills caller-owned gradients. The allocating MSE API delegates to it; its
+reciprocal multiplication matches training and can differ by a final rounding bit
+from the former allocating division. Logits and probability-domain classification
+APIs are named separately; legacy fused gradient contracts remain available.
 
-4. Gradient clipping (optional)
-   └── Global norm clipping across all parameters
+| Training path | Clipping and decay ownership |
+|---|---|
+| CPU direct SGD | Raw backward, optional f64 global clip, TrainOptions weight-only decoupled decay, SGD update |
+| CPU standalone optimizer | Raw gradients and threshold go to optimizer; AMP unscale, finite checks, clip, update/configured decay |
+| Hybrid GPU + CPU optimizer | Optimizer owns unscale/clip; explicit TrainOptions decay remains additional to optimizer-configured decay |
+| Native GPU with options | Optional downloaded-gradient f64 clipping; native optimizer owns configured decay; TrainOptions decay is not applied again |
 
-5. Parameter update via Optimizer trait
-   ├── SGD: w -= lr * (μ*v + g)  [optional Nesterov, momentum, weight decay]
-   ├── Adam: bias-corrected moment estimates + decoupled weight decay (AdamW)
-   └── LBFGS: two-loop recursion + Strong-Wolfe line search
+Disabled clipping skips the global norm pass and native GPU clipping downloads.
+The GPU options entry points validate the same finite positive clipping threshold.
+Parallel CPU backward keeps bounded reusable scratch and deterministic chunk
+reduction; default warmed allocation guarantees cover the existing no-clipping,
+no-AMP optimizer configuration. Active optimizer preprocessing may allocate.
 
-6. Safety layer (per AdamConfig/SGDConfig/LBFGSConfig.safety: SafetyConfig)
-   ├── NaN detection (fail_on_nan / skip_step_on_nan)
-   └── AMP gradient scaling (grad_scaling_factor)
-```
+LBFGS evaluates a closure at trial parameters, restores parameters/history on
+errors, and shrinks rejected numerical trials within its bounded line search.
+Its example uses the same borrowed backward primitive without a zero-rate update.
 
 ### LR Schedulers
 
@@ -362,37 +388,30 @@ Weights are packed into `vec4` for coalesced memory access:
 
 ## Serialization
 
-Both formats require `feature = "serde"`. Two independent formats, two magics.
+Both formats require `serde`. Private owned DTOs decode saved values, and
+borrowed serialization records preserve field names/order without cloning the
+runtime model. Runtime caches are reconstructed and checked at import.
 
-**`KanNetwork::to_bytes` / `from_bytes`** (`SERIALIZATION_MAGIC`, src/network.rs:66):
-```
-[MAGIC: 5 bytes "ARKAN"]
-[VERSION: 4 bytes u32]
-[CONFIG: bincode-serialized KanConfig]
-[LAYERS: bincode-serialized Vec<KanLayer>]
-```
-Version 1 is the initial versioned format (ArKan 0.3.0+). `KanLayer` has a
-custom `Deserialize` that recomputes the knot vector after load.
+| Format | Envelope | Stable body |
+|---|---|---|
+| Network V1 | `ARKAN` (5 bytes), little-endian u32 version 1 | config, layers, advisory layer_dims/parameter sizes, default TrainOptions |
+| Legacy network | Raw bincode body | Same network field order; accepted by legacy import |
+| Baked V2 | `KAN_BAKED_v1` (12 bytes), little-endian u32 version 2 | config, fixed-point layers, uncalibrated |
 
-**`BakedModel::to_bytes` / `from_bytes`** (`MAGIC_BAKED`, src/lib.rs:200):
-```
-[MAGIC: 12 bytes "KAN_BAKED_v1"]
-[VERSION: 4 bytes u32]
-[BODY: bincode-serialized BakedModel]
-```
-`from_bytes` validates magic and version **before** deserializing and returns a
-descriptive `Err` on mismatch or truncation, not a panic. `FORMAT_VERSION` is 2
-— version 1 predates the per-layer `norm_shift` field and the Q15.16 `norm_b_fixed`
-scale, and is rejected. The two formats are not interchangeable.
+Layer records retain weights/bias/statistics/geometry/SIMD width; knot caches are
+rebuilt. Network advisory caches are rebuilt rather than trusted. Baked import
+checks shape, normalization and integer bounds; version 1 is rejected because
+it predates the current normalization representation. Direct JSON field names
+are preserved. Pre-refactor golden bytes and JSON live in
+`tests/fixtures/formats/` and are checked without regenerating them.
 
 ## Feature Flags
 
-Three, and each one gates real code. `grep -rn 'feature = "X"' src/` is the
-check that keeps this table honest.
+Three feature flags gate their implementation and dependencies.
 
 | Flag | Description | Default | Extra deps |
 |------|-------------|---------|------------|
-| `parallel` | `KanLayer::backward_parallel`, `KanNetwork::forward_batch_parallel`, and the parallel branch of `train_step`'s backward pass above `multithreading_threshold`. Without it those two methods **do not exist** and `multithreading_threshold` is ignored. Gradients are identical either way. | Off | `rayon` |
+| `parallel` | `KanLayer::backward_parallel`, `KanNetwork::forward_batch_parallel`, and the parallel branch of `train_step`'s backward pass above `multithreading_threshold`. Without it those two methods **do not exist** and `multithreading_threshold` is ignored. Reduction is deterministic across thread counts; sequential/parallel numerical parity is tolerance-tested. | Off | `rayon` |
 | `serde` | `to_bytes()` / `from_bytes()` for `KanNetwork` and `BakedModel` | Off | `serde`, `bincode` |
 | `gpu` | GPU backend via wgpu 23 (Vulkan/DX12/Metal/WebGPU) | Off | `wgpu`, `bytemuck`, `pollster`, `log` |
 
@@ -419,10 +438,11 @@ gated nothing.
 Real properties of the current design, not bugs with a ticket. Read these before
 choosing a config.
 
-### `grid_range` is shared by every layer, but only layer 0 is normalized
+### Hidden normalization starts as identity within a shared grid range
 
-`KanNetwork::new` sets `input_mean` / `input_std` on layer 0 only. Hidden layers
-get identity normalization and nothing updates it during training. A hidden
+`KanNetwork::new` assigns `input_mean` / `input_std` to layer 0 only. Hidden layers
+start with identity normalization. Per-layer setters are supported, but training
+does not estimate statistics. With identity normalization, a hidden
 layer therefore sees the previous layer's raw activation, clamped to the same
 `grid_range` you picked for the inputs — and nothing in a KAN layer bounds its
 output to its own grid range.
@@ -506,16 +526,17 @@ shows up as unexplained accuracy loss rather than as a diagnostic.
 Aggregate NRMSE is 0.17–0.59%; the worst-case error on decision-relevant outputs
 (≥1σ) is 0.8–7.9% on a 2-hidden net, down from 34–54% before the three
 fixed-point fixes described in
-[Baked Inference](#6-baked-inference-srcbakedrs) above. `tests/baked_parity.rs`
+[Baked Inference](#6-baked-inference-srcbaked) above. `tests/baked_parity.rs`
 gates the ≥1σ figure at 15%. What is left is absolute-error outliers from int8
 weight quantization, not a systematic scale error.
 
-### `BakedModel` is slower than f32 at batch=1
+### Historical baked measurements
 
-1.4–2.1× on the shipped bench configs. Its win today is size (2.2–3.0×). A
-design that reverses this — a weight-layout change to output-innermost plus
-hoisting the basis evaluation out of the output loop, **not** SIMD — has been
-prototyped and measured, and is **not implemented**.
+Published timing and size figures in [BENCHMARKS.md](BENCHMARKS.md) describe the
+recorded benchmark revision and environment. The current implementation uses
+reusable workspace and computes basis values once per input. Rerun the corrected
+benchmarks before comparing current latency; this architecture refactor makes
+no new speedup claim.
 
 ## Thread Safety
 
@@ -532,3 +553,25 @@ Two API styles:
 
 Use panic-style for performance-critical code with validated inputs.
 Use Result-style when inputs may be malformed or for graceful error handling.
+
+## GPU freshness and later crate extraction
+
+GPU conversion captures the CPU's checked layout and actual per-layer statistics.
+CPU→GPU synchronization refreshes weights, bias and normalization; GPU→CPU reads
+and validates the complete snapshot before changing the destination. Native GPU
+optimizer updates are not automatically reflected in the CPU model. Call the
+explicit sync method before CPU inference, serialization or baking.
+
+GPU execution checks legacy model metadata, tensor ranks and actual storage
+extents. Lazy workspaces allocate before use; valid growth/shrink and hidden-width
+reuse recreate buffers with cache invalidation. Backward uses the saved training
+batch even after another workspace performs inference. Arbitrary replacement of
+raw public GPU buffer/bind-group handles remains caller-controlled. Software
+llvmpipe tests establish correctness evidence, not physical GPU performance.
+
+A later `arkan-core` / `arkan-wgpu` split can build on these ownership boundaries.
+Before extraction, separate GPU-specific error/dependency coupling, define the
+cross-crate checked snapshot/parameter interface, and rerun source/wire fixtures,
+feature/MSRV/package checks and GPU parity. Legacy public structural fields need
+a future breaking release to become private. This change introduces no new
+crate, universal backend trait, model-ID/hash framework or wire version.

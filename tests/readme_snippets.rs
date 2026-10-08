@@ -22,7 +22,7 @@
 // ---------------------------------------------------------------------------
 
 #[test]
-fn readme_baked_usage() {
+fn readme_baked_usage() -> arkan::ArkanResult<()> {
     use arkan::{BakedModel, KanConfig, KanNetwork};
 
     // 1. Train a KanNetwork as usual.
@@ -40,17 +40,19 @@ fn readme_baked_usage() {
         .collect();
 
     // 3. Bake.
-    let baked = BakedModel::from_network(&network, Some(&calibration));
+    let baked = BakedModel::try_from_network(&network, Some(&calibration))?;
 
-    // 4. Run fixed-point inference.
+    // 4. Allocate scratch once and reuse it for fixed-point inference.
+    let mut scratch = baked.create_workspace();
     let input = vec![0.5f32; config.input_dim];
     let mut output = vec![0.0f32; config.output_dim];
-    baked.forward(&input, &mut output);
+    baked.forward_with_workspace(&input, &mut output, &mut scratch);
 
     // 5. Check size.
     println!("Baked model: {} bytes", baked.size_bytes());
 
     assert!(baked.size_bytes() > 0);
+    Ok(())
 }
 
 /// Empty calibration must report the fallback rather than silently collapse output.
@@ -297,5 +299,25 @@ fn benchmarks_native_gpu_training(
     let loss =
         gpu_network.train_step_gpu_native(input, target, batch_size, workspace, &mut optimizer)?;
     let _ = loss;
+    Ok(())
+}
+
+// README: "Custom loss and optimizer"
+#[test]
+fn readme_custom_loss_and_optimizer() -> arkan::ArkanResult<()> {
+    use arkan::{masked_bce_with_logits, KanConfig, KanNetwork, Optimizer, SGDConfig, SGD};
+
+    let mut network = KanNetwork::new(KanConfig::preset());
+    let mut workspace = network.create_workspace(1);
+    let mut optimizer = SGD::new(&network, SGDConfig::with_lr(0.01));
+    let input = vec![0.0; network.config.input_dim];
+    let targets = vec![1.0; network.config.output_dim];
+    let mut logits = vec![0.0; targets.len()];
+    let pass = network.try_forward_for_backward(&input, &mut logits, &mut workspace)?;
+    let (loss, derivative) = masked_bce_with_logits(&logits, &targets, None);
+    let gradients = pass.backward(&derivative)?;
+    optimizer.step(&mut network, gradients.weights, gradients.biases, Some(1.0))?;
+    println!("Loss: {loss}");
+    assert!(loss.is_finite());
     Ok(())
 }

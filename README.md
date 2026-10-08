@@ -138,32 +138,40 @@ and **i32 inter-layer activations** — no f32 in the hot path.
 ```rust
 use arkan::{BakedModel, KanNetwork, KanConfig};
 
-// 1. Train a KanNetwork as usual.
-let config = KanConfig::preset();
-let network = KanNetwork::new(config.clone());
-// ... train ...
+fn main() -> arkan::ArkanResult<()> {
+    // 1. Train a KanNetwork as usual.
+    let config = KanConfig::preset();
+    let network = KanNetwork::new(config.clone());
+    // ... train ...
 
-// 2. Collect a calibration set (flat: n_samples * input_dim f32 values).
-//    Use REAL representative inputs: the 99.9th percentile of the activations
-//    they produce becomes a hard ceiling on the baked model's output.
-//    256–1024 samples is typical. An empty slice does NOT error — it bakes a
-//    degenerate model (measured 100% NRMSE vs f32).
-let n_samples = 256;
-let calibration: Vec<f32> = (0..n_samples * config.input_dim)
-    .map(|i| (i % 17) as f32 / 17.0 - 0.5) // stand-in for your real data
-    .collect();
+    // 2. Collect a calibration set (flat: n_samples * input_dim f32 values).
+    //    Use REAL representative inputs: the 99.9th percentile of the activations
+    //    they produce sets the baked activation scale.
+    //    256–1024 samples is typical. Empty calibration uses the uncalibrated heuristic.
+    let n_samples = 256;
+    let calibration: Vec<f32> = (0..n_samples * config.input_dim)
+        .map(|i| (i % 17) as f32 / 17.0 - 0.5) // stand-in for your real data
+        .collect();
 
-// 3. Bake.
-let baked = BakedModel::from_network(&network, Some(&calibration));
+    // 3. Bake.
+    let baked = BakedModel::try_from_network(&network, Some(&calibration))?;
 
-// 4. Run fixed-point inference.
-let input = vec![0.5f32; config.input_dim];
-let mut output = vec![0.0f32; config.output_dim];
-baked.forward(&input, &mut output);
+    // 4. Allocate scratch once and reuse it for fixed-point inference.
+    let mut scratch = baked.create_workspace();
+    let input = vec![0.5f32; config.input_dim];
+    let mut output = vec![0.0f32; config.output_dim];
+    baked.forward_with_workspace(&input, &mut output, &mut scratch);
 
-// 5. Check size.
-println!("Baked model: {} bytes", baked.size_bytes());
+    // 5. Check size.
+    println!("Baked model: {} bytes", baked.size_bytes());
+    Ok(())
+}
 ```
+
+`try_from_network` rejects unsupported orders, invalid topology/normalization,
+nonfinite calibration and unrepresentable fixed-point values. The legacy
+`from_network` wrapper panics on those errors. `BakedWorkspace` supports repeated
+inference without allocating; `forward` is the allocating convenience wrapper.
 
 ### Serialization (requires `serde` feature)
 
@@ -176,6 +184,9 @@ let baked2 = BakedModel::from_bytes(&bytes)?;
 ```
 
 ### Tradeoffs (honest)
+
+The figures below are the historical 2026-07-26 measurements. Current workspace
+and calibration changes require fresh measurements before drawing latency conclusions.
 
 All measured 2026-07-26 — `cargo test --release --test baked_parity -- --nocapture`
 and `cargo bench --bench baked`. Random-init networks, `grid_range = (-1, 1)`,
@@ -390,13 +401,14 @@ fn main() {
 
 ## **Архитектура**
 
-* **`KanLayer`**: Реализует слой KAN. Хранит сплайновые коэффициенты. Использует локальное окно `order+1` для вычислений, что позволяет эффективно использовать кэш CPU.
-* **`Workspace`**: Ключевая структура для производительности. Содержит выровненные (`AlignedBuffer`) буферы для промежуточных вычислений. Переиспользуется между вызовами.
-* **`spline`**: Модуль с реализацией алгоритма Cox-de Boor, векторизованный через `wide`.
-* **`baked`**: `BakedModel` — inference-only путь в фиксированной точке (int8 веса, Q0.15 базис, i32 межслойные активации).
+Реализации разделены внутри одного crate на `model`, `math`, `memory`, `cpu`,
+`training`, `optimizer`, `loss`, `baked`, `gpu` и внутренний `format`.
+Старые пути `config`, `network`, `layer`, `spline`, `buffer` сохраняют те же типы
+через reexport. Проверенная топология неизменяема; `try_parameters_mut` изменяет
+только коэффициенты и bias. `ForwardPass` удерживает модель и Workspace до backward.
 
-Полная карта модулей, поток данных, механизм `SPAN_CLAMPED_FLAG` и ограничения
-дизайна — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Карта модулей, правила нормализации, clipping, совместимости форматов и будущего
+разделения crates: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## **Лицензия**
 
@@ -499,9 +511,11 @@ release. The `msrv` CI job is what tells us when it moved.
 Read this before adopting. Everything here is measured and reproducible from
 tests in this repository.
 
-**`grid_range` is shared by every layer, but only layer 0 is normalized.**
+**`grid_range` is shared by every layer; hidden normalization starts as identity.**
 `input_mean` / `input_std` are applied to the first layer only; hidden layers are
-built with identity normalization and nothing updates it during training. So a
+built with identity normalization, including equal-width hidden layers. Explicit
+per-layer normalization updates are supported; training does not estimate running
+statistics. With the default hidden statistics, a
 hidden layer's input is the previous layer's **raw activation**, clamped to the
 same `grid_range` you chose for the inputs. Nothing bounds a KAN layer's output
 to its own grid range.
@@ -764,13 +778,52 @@ fn main() {
 
 ## **Architecture**
 
-* **`KanLayer`**: Implements the KAN layer. Stores spline coefficients. Uses a local window `order+1` for calculations, allowing efficient CPU cache usage.
-* **`Workspace`**: Key structure for performance. Contains aligned (`AlignedBuffer`) buffers for intermediate calculations. Reused between calls.
-* **`spline`**: Cox-de Boor basis and derivatives, vectorized through `wide`.
-* **`baked`**: `BakedModel` — the inference-only fixed-point path (int8 weights, Q0.15 basis, i32 inter-layer activations).
+One crate owns the implementations in `model`, `math`, `memory`, `cpu`, `training`,
+`optimizer`, `loss`, `baked`, `gpu`, and the private `format` boundary. The legacy
+`config`, `network`, `layer`, `spline`, and `buffer` imports remain reexports of
+the same types and functions.
 
-Full module map, data flow, the `SPAN_CLAMPED_FLAG` mechanism and the design
-constraints: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+`KanNetwork` retains checked immutable topology. Legacy public structural fields
+remain available for source compatibility, but incompatible edits are rejected
+by checked execution, conversion, and synchronization. Use `try_parameters_mut`
+for fixed-length weight/bias updates. `ForwardPass` borrows the model and workspace
+through backward; its resulting `Gradients` can be passed directly to an optimizer.
+
+### Custom loss and optimizer
+
+```rust
+use arkan::{KanConfig, KanNetwork, SGD, SGDConfig, Optimizer, masked_bce_with_logits};
+
+fn main() -> arkan::ArkanResult<()> {
+    let mut network = KanNetwork::new(KanConfig::preset());
+    let mut workspace = network.create_workspace(1);
+    let mut optimizer = SGD::new(&network, SGDConfig::with_lr(0.01));
+    let input = vec![0.0; network.config.input_dim];
+    let targets = vec![1.0; network.config.output_dim];
+    let mut logits = vec![0.0; targets.len()];
+    let pass = network.try_forward_for_backward(&input, &mut logits, &mut workspace)?;
+    let (loss, derivative) = masked_bce_with_logits(&logits, &targets, None);
+    let gradients = pass.backward(&derivative)?;
+    optimizer.step(&mut network, gradients.weights, gradients.biases, Some(1.0))?;
+    println!("Loss: {loss}");
+    Ok(())
+}
+```
+
+MSE trainers use the same backward loop; `masked_mse_into` fills a reusable output
+gradient buffer. Standalone optimizers unscale AMP gradients before optional global
+clipping. Disabled clipping skips the norm pass. Weight decay belongs to the
+optimizer configuration for `train_step_with_optimizer`; direct SGD uses
+`TrainOptions::weight_decay`. Hybrid GPU options retain their additional explicit
+decay step; native GPU decay belongs to its optimizer configuration.
+
+CPU and GPU parameter/normalization snapshots require explicit synchronization.
+Native GPU updates stay on the GPU until copied back. Serialization uses stable
+V1 network/legacy and V2 baked records, independent of runtime module placement.
+
+Full ownership map, numerical contracts, compatibility limits and the later
+`arkan-core` / `arkan-wgpu` extraction prerequisites:
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## **License**
 

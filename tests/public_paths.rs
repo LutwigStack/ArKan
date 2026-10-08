@@ -13,6 +13,7 @@ fn legacy_imports_and_responsibility_modules_share_types_and_execution() {
     let config: arkan::model::KanConfig = config;
     let mut network: KanNetwork = KanNetwork::new(config);
     let model: &mut arkan::model::KanNetwork = &mut network;
+    let _: arkan::ParametersMut<'_> = model.try_parameters_mut().unwrap();
     let layer: &arkan::layer::KanLayer = &model.layers[0];
     let _: &arkan::cpu::KanLayer = layer;
     let mut workspace: arkan::buffer::Workspace = model.create_workspace(1);
@@ -26,6 +27,23 @@ fn legacy_imports_and_responsibility_modules_share_types_and_execution() {
     let mut output = [0.0];
     model.forward_single(&[0.1, -0.2], &mut output, scratch);
     assert_eq!(output, [0.25]);
+    let pass: arkan::ForwardPass<'_, '_> = model
+        .try_forward_for_backward(&[0.1, -0.2], &mut output, scratch)
+        .unwrap();
+    let _: arkan::Gradients<'_> = pass.backward(&[1.0]).unwrap();
+    let baked = arkan::BakedModel::try_from_network(model, None).unwrap();
+    let mut baked_scratch: arkan::BakedWorkspace = baked.create_workspace();
+    baked.forward_with_workspace(&[0.1, -0.2], &mut output, &mut baked_scratch);
+    assert_eq!(output, [0.25]);
+    let (_loss, logits_gradient) =
+        arkan::masked_categorical_cross_entropy_with_logits(&[0.0, 0.0], &[1.0, 0.0], 2, None);
+    assert_eq!(logits_gradient, [-0.5, 0.5]);
+    let (_loss, probability_gradient) =
+        arkan::masked_categorical_cross_entropy_probabilities(&[0.5, 0.5], &[1.0, 0.0], 2, None);
+    assert_eq!(probability_gradient, [-2.0, 0.0]);
+    let (_, _, _, poker_gradient) =
+        arkan::poker_combined_loss_probabilities(&[0.5; 24], &[0.5; 24], 0.0);
+    assert_eq!(poker_gradient.len(), 24);
     let options: arkan::network::TrainOptions = arkan::training::TrainOptions::default();
     let _: arkan::TrainOptions = options;
     let knots = arkan::spline::compute_knots(3, 2, (-1.0, 1.0));

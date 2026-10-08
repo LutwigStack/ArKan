@@ -86,19 +86,7 @@ pub enum LineSearchMethod {
 ///
 /// `LBFGS` implements `Send + Sync`.
 ///
-/// # Example
-///
-/// ```rust,ignore
-/// use arkan::optimizer::{LBFGS, LBFGSConfig, Optimizer};
-///
-/// let mut optimizer = LBFGS::new(&network, LBFGSConfig::default());
-///
-/// // L-BFGS uses closures for loss evaluation
-/// let loss = optimizer.step_with_closure(|| {
-///     // Compute forward pass and loss
-///     Ok(compute_loss(&network, &inputs, &targets))
-/// })?;
-/// ```
+/// See [`Self::step_lbfgs`] for an executable gradient-evaluation example.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LBFGS {
     /// Configuration.
@@ -592,18 +580,23 @@ impl LBFGS {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use arkan::{KanConfigBuilder, KanNetwork, LBFGS, LBFGSConfig, masked_mse_into};
+    /// let config = KanConfigBuilder::new().input_dim(1).output_dim(1)
+    ///     .hidden_dims(vec![]).normalization(vec![0.0], vec![1.0]).seed(7).build()?;
+    /// let mut network = KanNetwork::new(config);
+    /// let mut optimizer = LBFGS::new(&network, LBFGSConfig::default());
+    /// let mut workspace = network.create_workspace(2);
+    /// let mut output = [0.0; 2];
+    /// let mut derivative = [0.0; 2];
     /// let loss = optimizer.step_lbfgs(&mut network, |net| {
-    ///     let mut ws = net.create_workspace(batch_size);
-    ///     let output = net.forward_batch(&input, &mut output_buf, &mut ws);
-    ///     let loss = compute_mse(&output_buf, &target);
-    ///
-    ///     // Compute gradients
-    ///     net.train_step_with_options(&input, &target, None, 0.0, &mut ws, &opts);
-    ///     let grads = LBFGS::flatten_grads(&ws.weight_grads, &ws.bias_grads);
-    ///
-    ///     Ok((loss as f64, grads))
+    ///     let pass = net.try_forward_for_backward(&[-0.25, 0.5], &mut output, &mut workspace)?;
+    ///     let loss = masked_mse_into(&output, &[0.0, 0.5], None, &mut derivative)?;
+    ///     let gradients = pass.backward(&derivative)?;
+    ///     Ok((loss as f64, LBFGS::flatten_grads(gradients.weights, gradients.biases)))
     /// })?;
+    /// assert!(loss.is_finite());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn step_lbfgs<F>(&mut self, network: &mut KanNetwork, mut closure: F) -> ArkanResult<f64>
     where

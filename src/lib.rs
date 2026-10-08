@@ -171,7 +171,7 @@ mod format;
 pub mod gpu;
 
 // Re-exports for convenience
-pub use baked::BakedModel;
+pub use baked::{BakedModel, BakedWorkspace};
 pub use buffer::{
     checked_buffer_size, checked_buffer_size3, AlignedBuffer, Tensor, TensorView, Workspace,
     WorkspaceGuard, CACHE_LINE, MAX_BUFFER_ELEMENTS,
@@ -185,10 +185,12 @@ pub use layer::KanLayer;
 pub use loss::{
     entropy_regularization, kan_combined_loss, kan_regularization_gradient, l1_sparsity_gradient,
     l1_sparsity_loss, masked_bce_with_logits, masked_categorical_cross_entropy,
-    masked_cross_entropy, masked_huber, masked_mae, masked_mse, masked_rmse, masked_softmax,
-    pde_residual_loss, poker_combined_loss, r_squared, smoothness_gradient, smoothness_penalty,
-    softmax, KanLossConfig,
+    masked_categorical_cross_entropy_probabilities, masked_categorical_cross_entropy_with_logits,
+    masked_cross_entropy, masked_huber, masked_mae, masked_mse, masked_mse_into, masked_rmse,
+    masked_softmax, pde_residual_loss, poker_combined_loss, poker_combined_loss_probabilities,
+    r_squared, smoothness_gradient, smoothness_penalty, softmax, KanLossConfig,
 };
+pub use model::{LayerParametersMut, ParametersMut};
 pub use network::{KanNetwork, TrainOptions};
 pub use optimizer::{
     Adam, AdamConfig, AdamState, CosineAnnealingLR, LBFGSConfig, LineSearchMethod, LrScheduler,
@@ -198,6 +200,7 @@ pub use spline::{
     compute_basis, compute_basis_and_deriv, compute_knots, find_span, normalize_batch,
     SPAN_CLAMPED_FLAG, SPAN_INDEX_MASK,
 };
+pub use training::{ForwardPass, Gradients};
 
 // GPU re-exports (only available with "gpu" feature)
 #[cfg(feature = "gpu")]
