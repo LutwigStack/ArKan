@@ -68,7 +68,10 @@ impl Default for TrainOptions {
 impl KanNetwork {
     /// Full training step: forward + backward + SGD update.
     ///
-    /// Performs a complete training iteration with zero allocations (after warmup).
+    /// Performs a complete training iteration reusing ArKan execution storage after warmup.
+    /// With `parallel`, external-thread calls can still allocate recurring Rayon
+    /// scheduling-queue blocks. Repeated calls inside one enclosing, warmed Rayon
+    /// pool observed zero allocations; this is not a guarantee for arbitrary pools.
     /// Uses [`default_train_options`](Self::default_train_options) for gradient
     /// clipping and weight decay.
     ///

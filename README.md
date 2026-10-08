@@ -42,8 +42,8 @@ x[l+1, j] = Σᵢ φ[l,j,i](x[l, i])      где i = 1..N_in
 
 ## **Ключевые возможности**
 
-* **Zero-Allocation Inference:** Весь `forward` проход выполняется на предвыделенном буфере (`Workspace`). Никаких аллокаций в горячем пути (Hot Path).  
-* **Zero-Allocation Training:** Полный training step (forward + backward + SGD/Adam) также работает без аллокаций при прогретом Workspace.
+* **Zero-Allocation Inference:** Последовательный `forward` проход выполняется на предвыделенном буфере (`Workspace`) без аллокаций при повторном использовании.
+* **Reusable Training Storage:** Полный training step (forward + backward + SGD/Adam) повторно использует память ArKan при прогретом Workspace. Параллельные вызовы из внешнего потока могут выделять блоки очереди планировщика Rayon; подробнее ниже.
 * **SIMD-Optimized B-Splines:** Вычисление базисных функций B-сплайнов векторизовано через крейт `wide` (256-битный `f32x8`, т.е. AVX2 на x86-64). SIMD не является feature-флагом — векторизация включена всегда.  
 * **Cache-Friendly Layout:** Веса хранятся в формате `[Output][Input][Basis]` для последовательного доступа к памяти и минимизации промахов кэша.  
 * **Standalone:** Сборка по умолчанию тянет только `wide`, `rand` и `thiserror`. Никаких `torch` или `burn`, идеально для встраивания.  
@@ -353,7 +353,7 @@ Forward, batch=64, перемерено 2026-06-27. ArKan использует w
 1. **Small Batch Dominance:** На единичных запросах (`batch=1`) ArKan **опережает** PyTorch за счет отсутствия оверхеда интерпретатора и абстракций. Это позволяет совершать \~37,000 инференсов в секунду.
 2. **Mid-Batch Performance:** На средних батчах (16-64) ArKan сохраняет преимущество, демонстрируя хорошую масштабируемость.
 3. **Где ArKan проигрывает:** на батчах 256+ BLAS-ядра PyTorch обгоняют ArKan CPU (см. `docs/BENCHMARKS.md`, замер 2026-06-27). Ниша библиотеки — низкая задержка на batch=1, а не пропускная способность на больших батчах.
-4. **Zero-Allocation Training:** весь training loop (forward + backward + optimizer step) работает без единой аллокации при прогретом Workspace. Проверяется `tests/allocation_budget.rs` — counting `GlobalAlloc` на forward_batch, forward_single, train_step и train_step_with_optimizer (Adam и SGD).
+4. **Reusable Training Storage:** training loop (forward + backward + optimizer step) повторно использует память ArKan при прогретом Workspace. Проверяется `tests/allocation_budget.rs` — counting `GlobalAlloc` на forward_batch, forward_single, train_step и train_step_with_optimizer (Adam и SGD). При включённом `parallel` вызовы из внешнего потока могут регулярно выделять блоки очереди планировщика Rayon. Нулевое число аллокаций наблюдалось для повторных вызовов внутри одного охватывающего их прогретого пула Rayon; это не гарантия для произвольного пула или контекста вызова.
 
 ## **Сравнение с аналогами (Prior Art)**
 
@@ -456,8 +456,8 @@ Equation for a specific weight in ArKan:
 
 ## **Key Features**
 
-* **Zero-Allocation Inference:** The entire `forward` pass runs on a pre-allocated buffer (`Workspace`). No allocations in the Hot Path.  
-* **Zero-Allocation Training:** The full training step (forward + backward + SGD/Adam) also runs without allocations on a warmed-up Workspace.
+* **Zero-Allocation Inference:** Serial `forward` runs on a pre-allocated buffer (`Workspace`) without allocations on reuse.
+* **Reusable Training Storage:** The full training step (forward + backward + SGD/Adam) reuses ArKan storage on a warmed-up Workspace. Parallel calls from external threads can allocate Rayon scheduling-queue blocks; see below.
 * **SIMD-Optimized B-Splines:** B-spline basis evaluation is vectorized via the `wide` crate (256-bit `f32x8`, i.e. AVX2 on x86-64). SIMD is not a feature flag — vectorization is always on.  
 * **Cache-Friendly Layout:** Weights are stored in `[Output][Input][Basis]` format for sequential memory access and minimal cache misses.  
 * **Standalone:** A default build pulls only `wide`, `rand` and `thiserror`. No `torch` or `burn` bloat, ideal for embedding.  
@@ -730,7 +730,7 @@ Comparison of ArKan (Rust) vs. optimized vectorized PyTorch implementation (CPU)
 1. **Small Batch Dominance:** On single requests (`batch=1`), ArKan **outperforms** PyTorch due to the lack of interpreter overhead and abstractions. This allows for \~37,000 inferences per second.
 2. **Mid-Batch Performance:** On medium batches (16-64), ArKan keeps a solid advantage and scales predictably.
 3. **Where ArKan loses:** at batch 256+, PyTorch's BLAS kernels overtake ArKan CPU (see the 2026-06-27 measurement in `docs/BENCHMARKS.md`). This library's niche is batch=1 latency, not large-batch throughput.
-4. **Zero-Allocation Training:** the entire training loop (forward + backward + optimizer step) runs without a single allocation on a warmed-up Workspace. Enforced by `tests/allocation_budget.rs` — a counting `GlobalAlloc` over forward_batch, forward_single, train_step and train_step_with_optimizer (both Adam and SGD).
+4. **Reusable Training Storage:** the training loop (forward + backward + optimizer step) reuses ArKan storage on a warmed-up Workspace. Checked by `tests/allocation_budget.rs` — a counting `GlobalAlloc` over forward_batch, forward_single, train_step and train_step_with_optimizer (both Adam and SGD). With `parallel`, external-thread calls can allocate recurring Rayon scheduling-queue blocks. Repeated calls inside one enclosing, warmed Rayon pool observed zero allocations; arbitrary pools and call contexts are not guaranteed to allocate nothing.
 
 ## **Comparison with Analogues (Prior Art)**
 

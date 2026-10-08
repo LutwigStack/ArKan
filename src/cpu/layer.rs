@@ -747,6 +747,12 @@ impl KanLayer {
         let chunks = self.in_dim / 8;
         for chunk in 0..chunks {
             let i_base = chunk * 8;
+            let mut starts = [0usize; 8];
+            for (lane, start) in starts.iter_mut().enumerate() {
+                let i = i_base + lane;
+                let span = span_of(spans[span_batch_start + i]);
+                *start = self.weight_index(out_idx, i, span - self.order);
+            }
 
             // For each basis function (k), gather weights for 8 inputs
             for k in 0..self.local_basis_size {
@@ -756,12 +762,10 @@ impl KanLayer {
 
                 for lane in 0..8 {
                     let i = i_base + lane;
-                    let span = span_of(spans[span_batch_start + i]);
-                    let start_idx = span - self.order;
                     let basis_start = basis_batch_start + i * self.basis_aligned;
 
                     basis_arr[lane] = basis_values[basis_start + k];
-                    weight_arr[lane] = self.weights[self.weight_index(out_idx, i, start_idx + k)];
+                    weight_arr[lane] = self.weights[starts[lane] + k];
                 }
 
                 let basis_vec = f32x8::new(basis_arr);

@@ -185,10 +185,17 @@ Every table below is labelled. Read the label before you quote the number.
 | **vs efficient-kan GPU (batch=64)** | **ArKan GPU ~1.7x faster** (ArKan 1.30ms vs efficient-kan 2.24ms) |
 | **vs FastKAN GPU** | **FastKAN wins** (RBF not B-splines — different math) |
 | **Memory footprint** | 218.6 KB (weights only) |
-| **Zero-allocation training** | Full train step without allocs |
+| **Reusable training storage** | Warmed train steps reuse ArKan execution storage; see runtime caveat below |
 | **Native GPU training (batch=64)** | **3.96 ms** (see GPU section; not re-measured) |
 | **Baked (int8) vs f32 at batch=1** | **1.4–2.1x SLOWER** — the win is size (2.2–3.0x), not speed |
 | **Baked worst-case error at ≥1σ** | **34–54%** on a 2-hidden net — ranking/argmax only |
+
+Allocation counts depend on call context. Serial/workspace reuse and baked-workspace
+guarantees remain applicable. With `parallel`, repeated calls from an external
+thread can allocate Rayon scheduling-queue blocks, even after warmup. Strict zero
+counts were observed with repeated work inside one enclosing, warmed four-worker
+Rayon pool; this does not guarantee zero allocations for arbitrary pools. Short
+external-call windows that count zero do not establish an indefinite guarantee.
 
 ---
 
@@ -370,7 +377,7 @@ Critical for MCTS/CFR solvers where thousands of single inferences per second ar
 | forward_training | 1.70 ms | ~0% (buffer prep is free) |
 | **full_train_step** | **4.48 ms** | **+163%** |
 
-**Analysis:** Backward pass takes roughly 2.6x the forward pass time, which is typical for gradient computation. Zero-allocation architecture ensures consistent performance.
+**Analysis:** Backward pass takes roughly 2.6x the forward pass time, which is typical for gradient computation. Reused ArKan execution storage avoids storage growth on warmed paths; parallel runtime allocations depend on the call context described above.
 
 ### Training Options Impact (batch=64)
 
@@ -541,7 +548,7 @@ ArKan uses internal SGD. Python competitors use Adam (slightly heavier).
 1. **Low-latency dominance:** ArKan is ~44-56x faster than faithful-PyTorch for batch=1 (same math)
 2. **Mid-batch win:** ArKan is ~1.7x faster at batch=64
 3. **Large batch regression:** At batch=256+, PyTorch BLAS overtakes ArKan CPU — ArKan GPU compensates here
-4. **Zero-allocation benefit:** No GC pauses, consistent latency distribution
+4. **Storage reuse benefit:** Warmed execution avoids new ArKan storage allocations; this alone does not guarantee a latency distribution or exclude parallel runtime allocations.
 5. **GPU compensates:** ArKan GPU provides 4.8x speedup at batch=256 over ArKan CPU, recovering the large-batch gap
 6. **FastKAN comparison:** FastKAN (RBF) is faster than ArKan CPU at all batch sizes but uses different math — the comparison is not apples-to-apples
 

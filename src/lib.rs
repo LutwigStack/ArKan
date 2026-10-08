@@ -4,7 +4,7 @@
 //! [![Documentation](https://docs.rs/arkan/badge.svg)](https://docs.rs/arkan)
 //! [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](https://github.com/your-username/arkan/blob/main/LICENSE)
 //!
-//! **ArKan** is a zero-allocation, SIMD-optimized implementation of
+//! **ArKan** is a SIMD-optimized implementation with reusable execution storage for
 //! [Kolmogorov-Arnold Networks](https://arxiv.org/abs/2404.19756) (KAN)
 //! designed for latency-critical applications like poker solvers and game AI.
 //!
@@ -13,7 +13,7 @@
 //! | Feature | ArKan | PyTorch KAN |
 //! |---------|-------|-------------|
 //! | Single inference, `[21,64,64,24]` | **~15 µs** (`forward_single`) | ~1.5 ms (estimated) |
-//! | Memory allocation | Zero (hot path) | Dynamic |
+//! | Memory allocation | Reused ArKan storage (hot path) | Dynamic |
 //! | Dependencies | `wide`, `rand`, `thiserror` | Heavy |
 //!
 //! The PyTorch figure is extrapolated, not measured at this shape, and ArKan
@@ -62,10 +62,16 @@
 //! let inputs = vec![0.5f32; 64 * config.input_dim];
 //! let targets = vec![0.1f32; 64 * config.output_dim];
 //!
-//! // Single training step (zero-allocation after warmup)
+//! // Single training step (reuses ArKan storage after warmup; see caveat below)
 //! let loss = network.train_step(&inputs, &targets, None, 0.001, &mut workspace);
 //! println!("Loss: {:.4}", loss);
 //! ```
+//!
+//! Warmed workspaces avoid new ArKan execution-storage allocations on reuse paths.
+//! With `parallel`, calls from outside a Rayon worker can still allocate recurring
+//! scheduling-queue blocks. Repeated calls inside one enclosing, warmed Rayon pool
+//! observed zero allocations; arbitrary pools and call contexts are not guaranteed
+//! to allocate nothing.
 //!
 //! ## Architecture
 //!
