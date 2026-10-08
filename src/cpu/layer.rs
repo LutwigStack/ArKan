@@ -536,17 +536,16 @@ impl KanLayer {
     /// Panics if buffer size calculations overflow. Use [`try_forward_batch`](Self::try_forward_batch)
     /// for a fallible version.
     pub fn forward_batch(&self, inputs: &[f32], outputs: &mut [f32], workspace: &mut Workspace) {
-        self.forward_batch_impl(inputs, outputs, workspace, false)
+        self.forward_batch_impl(inputs, outputs, workspace)
             .expect("forward_batch: buffer size overflow")
     }
 
     /// Internal implementation of forward_batch with overflow checking.
-    pub(super) fn forward_batch_impl(
+    fn forward_batch_impl(
         &self,
         inputs: &[f32],
         outputs: &mut [f32],
         workspace: &mut Workspace,
-        parallel_accumulation: bool,
     ) -> crate::ArkanResult<()> {
         use crate::buffer::{checked_buffer_size, checked_buffer_size3};
 
@@ -603,7 +602,7 @@ impl KanLayer {
         }
 
         // Accumulate outputs
-        self.accumulate_batch(workspace, outputs, batch_size, parallel_accumulation);
+        self.accumulate_batch(workspace, outputs, batch_size);
 
         Ok(())
     }
@@ -676,111 +675,59 @@ impl KanLayer {
         }
 
         // Use internal impl that returns Result
-        self.forward_batch_impl(inputs, outputs, workspace, false)
+        self.forward_batch_impl(inputs, outputs, workspace)
     }
 
     /// Accumulates outputs for a batch (internal helper).
     #[inline]
-    fn accumulate_batch(
-        &self,
-        workspace: &Workspace,
-        outputs: &mut [f32],
-        batch_size: usize,
-        parallel_accumulation: bool,
-    ) {
+    fn accumulate_batch(&self, workspace: &Workspace, outputs: &mut [f32], batch_size: usize) {
         let basis_slice = workspace.basis_values.as_slice();
         let spans = &workspace.grid_indices;
-
-        #[cfg(feature = "parallel")]
-        if parallel_accumulation && batch_size > 1 {
-            use rayon::prelude::*;
-            let workers = rayon::current_num_threads();
-            if workers > 1 {
-                let samples_per_chunk = batch_size.div_ceil(workers);
-                // 1 <= samples_per_chunk <= batch_size, so this product is bounded
-                // by batch_size * out_dim, checked by both layer wrappers and training.
-                let chunk_len = samples_per_chunk * self.out_dim;
-                outputs
-                    .par_chunks_mut(chunk_len)
-                    .enumerate()
-                    .for_each(|(chunk, rows)| {
-                        for (row, output) in rows.chunks_mut(self.out_dim).enumerate() {
-                            let b = chunk * samples_per_chunk + row;
-                            self.accumulate_row(
-                                basis_slice,
-                                spans,
-                                b * self.in_dim * self.basis_aligned,
-                                b * self.in_dim,
-                                output,
-                            );
-                        }
-                    });
-                return;
-            }
-        }
-        #[cfg(not(feature = "parallel"))]
-        let _ = parallel_accumulation;
 
         for b in 0..batch_size {
             let span_batch_start = b * self.in_dim;
             let basis_batch_start = b * self.in_dim * self.basis_aligned;
             let out_start = b * self.out_dim;
-            self.accumulate_row(
-                basis_slice,
-                spans,
-                basis_batch_start,
-                span_batch_start,
-                &mut outputs[out_start..out_start + self.out_dim],
-            );
-        }
-    }
 
-    #[inline(always)]
-    fn accumulate_row(
-        &self,
-        basis_slice: &[f32],
-        spans: &[u32],
-        basis_batch_start: usize,
-        span_batch_start: usize,
-        out_slice: &mut [f32],
-    ) {
-        // Initialize outputs with bias
-        out_slice.copy_from_slice(&self.bias);
+            // Initialize outputs with bias
+            let out_slice = &mut outputs[out_start..out_start + self.out_dim];
+            out_slice.copy_from_slice(&self.bias);
 
-        for (j, out) in out_slice.iter_mut().enumerate() {
-            let sum = match self.simd_width {
-                8 if self.local_basis_size <= 8 && self.in_dim >= 8 => self.accumulate_simd8(
-                    basis_slice,
-                    spans,
-                    basis_batch_start,
-                    span_batch_start,
-                    j,
-                ),
-                4 if self.local_basis_size <= 4 && self.in_dim >= 4 => self.accumulate_simd4(
-                    basis_slice,
-                    spans,
-                    basis_batch_start,
-                    span_batch_start,
-                    j,
-                ),
-                _ => {
-                    // Scalar fallback
-                    let mut s = 0.0f32;
-                    for i in 0..self.in_dim {
-                        let span = span_of(spans[span_batch_start + i]);
-                        let start_idx = span - self.order;
-                        let basis_start = basis_batch_start + i * self.basis_aligned;
+            for (j, out) in out_slice.iter_mut().enumerate() {
+                let sum = match self.simd_width {
+                    8 if self.local_basis_size <= 8 && self.in_dim >= 8 => self.accumulate_simd8(
+                        basis_slice,
+                        spans,
+                        basis_batch_start,
+                        span_batch_start,
+                        j,
+                    ),
+                    4 if self.local_basis_size <= 4 && self.in_dim >= 4 => self.accumulate_simd4(
+                        basis_slice,
+                        spans,
+                        basis_batch_start,
+                        span_batch_start,
+                        j,
+                    ),
+                    _ => {
+                        // Scalar fallback
+                        let mut s = 0.0f32;
+                        for i in 0..self.in_dim {
+                            let span = span_of(spans[span_batch_start + i]);
+                            let start_idx = span - self.order;
+                            let basis_start = basis_batch_start + i * self.basis_aligned;
 
-                        for k in 0..self.local_basis_size {
-                            let weight_idx = self.weight_index(j, i, start_idx + k);
-                            s += self.weights[weight_idx] * basis_slice[basis_start + k];
+                            for k in 0..self.local_basis_size {
+                                let weight_idx = self.weight_index(j, i, start_idx + k);
+                                s += self.weights[weight_idx] * basis_slice[basis_start + k];
+                            }
                         }
+                        s
                     }
-                    s
-                }
-            };
+                };
 
-            *out += sum;
+                *out += sum;
+            }
         }
     }
 
