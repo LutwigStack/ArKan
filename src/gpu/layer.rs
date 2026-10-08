@@ -40,6 +40,11 @@ use wgpu::util::DeviceExt;
 /// These buffers are used by GPU-native optimizers ([`GpuAdam`](crate::gpu::GpuAdam), [`GpuSgd`](crate::gpu::GpuSgd))
 /// to update weights entirely on GPU without CPU transfers.
 pub struct GpuLayer {
+    /// Per-feature (mean, std) used by every forward shader.
+    pub(crate) normalization: GpuTensor,
+    /// CPU-derived inverse std used by backward shaders.
+    pub(crate) std_inv: GpuTensor,
+    max_vram_alloc: u64,
     /// Weight tensor [out_dim, in_dim, basis_vec4s] stored as vec4.
     pub weights: GpuTensor,
     /// Bias tensor `(out_dim,)`.
@@ -89,7 +94,13 @@ impl GpuLayer {
     ///
     /// # Returns
     ///
-    /// A new `GpuLayer` with uploaded weights and bias.
+    /// A new `GpuLayer` with uploaded weights, bias and normalization.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed layers and subnormal standard deviations (GPU float
+    /// arithmetic may flush them to zero). Normal positive standard deviations
+    /// below CPU `EPSILON` retain their forward semantics.
     ///
     /// # Weight Packing
     ///
@@ -98,6 +109,17 @@ impl GpuLayer {
     /// - Padded: [out_dim, in_dim, basis_padded] (basis_padded = align4(global_basis_size))
     /// - GPU: [out_dim * in_dim * basis_vec4s] vec4s (basis_vec4s = ceil(basis_padded/4))
     pub fn from_cpu_layer(device: &wgpu::Device, cpu_layer: &KanLayer) -> ArkanResult<Self> {
+        Self::from_cpu_layer_with_limit(device, cpu_layer, crate::gpu::DEFAULT_MAX_VRAM_ALLOC)
+    }
+
+    /// Creates a CPU-equivalent layer with a configured per-buffer memory cap.
+    pub fn from_cpu_layer_with_limit(
+        device: &wgpu::Device,
+        cpu_layer: &KanLayer,
+        max_vram_alloc: u64,
+    ) -> ArkanResult<Self> {
+        cpu_layer.validate_layout()?;
+        Self::validate_normalization(cpu_layer)?;
         let in_dim = cpu_layer.in_dim;
         let out_dim = cpu_layer.out_dim;
         let grid_size = cpu_layer.grid_size;
@@ -105,6 +127,14 @@ impl GpuLayer {
         let global_basis_size = cpu_layer.global_basis_size;
         let basis_padded = pad_to_vec4(global_basis_size);
         let basis_vec4s = basis_padded.div_ceil(4); // ceil division
+
+        GpuTensor::allocation_bytes(
+            device,
+            &[out_dim, in_dim, basis_vec4s, 4],
+            Some(max_vram_alloc),
+        )?;
+        GpuTensor::allocation_bytes(device, &[in_dim, 2], Some(max_vram_alloc))?;
+        GpuTensor::allocation_bytes(device, &[out_dim], Some(max_vram_alloc))?;
 
         // Pack weights into vec4 format
         // Each vec4 contains 4 consecutive basis weights
@@ -117,13 +147,38 @@ impl GpuLayer {
             basis_vec4s,
         );
 
-        let weights = GpuTensor::storage_read(
+        let weights = GpuTensor::upload_with_limit(
             device,
             &packed_weights,
             vec![out_dim * in_dim * basis_vec4s * 4], // Total floats in vec4 array
+            Some(max_vram_alloc),
         )?;
 
-        let bias = GpuTensor::storage_read(device, cpu_layer.bias.as_slice(), vec![out_dim])?;
+        let bias = GpuTensor::upload_with_limit(
+            device,
+            cpu_layer.bias.as_slice(),
+            vec![out_dim],
+            Some(max_vram_alloc),
+        )?;
+        let inverse: Vec<_> = cpu_layer
+            .std
+            .iter()
+            .map(|s| 1.0 / s.max(crate::config::EPSILON))
+            .collect();
+        let normalized: Vec<_> = cpu_layer
+            .mean
+            .iter()
+            .zip(&cpu_layer.std)
+            .flat_map(|(&m, &std)| [m, std])
+            .collect();
+        let normalization = GpuTensor::upload_with_limit(
+            device,
+            &normalized,
+            vec![in_dim, 2],
+            Some(max_vram_alloc),
+        )?;
+        let std_inv =
+            GpuTensor::upload_with_limit(device, &inverse, vec![in_dim], Some(max_vram_alloc))?;
 
         // Create uniforms
         let uniforms = LayerUniforms::from_layer_config(
@@ -162,10 +217,17 @@ impl GpuLayer {
                     binding: 2,
                     resource: uniforms_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: normalization.buffer.as_entire_binding(),
+                },
             ],
         });
 
         Ok(Self {
+            normalization,
+            std_inv,
+            max_vram_alloc,
             weights,
             bias,
             uniforms_buffer,
@@ -182,6 +244,32 @@ impl GpuLayer {
             grad_weights: None,
             grad_bias: None,
         })
+    }
+
+    pub(crate) fn validate_normalization(cpu_layer: &KanLayer) -> ArkanResult<()> {
+        // GPU float arithmetic may flush subnormal values to zero.
+        if cpu_layer.std.iter().any(|&std| std < f32::MIN_POSITIVE) {
+            return Err(crate::ArkanError::validation(
+                "GPU normalization requires normal positive standard deviations",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn update_normalization(&self, queue: &wgpu::Queue, cpu_layer: &KanLayer) {
+        let inverse: Vec<_> = cpu_layer
+            .std
+            .iter()
+            .map(|s| 1.0 / s.max(crate::config::EPSILON))
+            .collect();
+        let normalized: Vec<_> = cpu_layer
+            .mean
+            .iter()
+            .zip(&cpu_layer.std)
+            .flat_map(|(&m, &std)| [m, std])
+            .collect();
+        self.normalization.update(queue, &normalized);
+        self.std_inv.update(queue, &inverse);
     }
 
     /// Creates the bind group layout for static layer resources.
@@ -203,6 +291,16 @@ impl GpuLayer {
                 // Bias (storage, read-only)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -354,32 +452,24 @@ impl GpuLayer {
     ///
     /// Returns [`ArkanError::BufferError`](crate::ArkanError::BufferError) if buffer creation fails.
     pub fn init_training(&mut self, device: &wgpu::Device) -> crate::ArkanResult<()> {
-        use crate::ArkanError;
-
         if self.grad_weights.is_some() {
             return Ok(()); // Already initialized
         }
 
-        // Gradient for weights (same layout as weights: vec4 packed)
-        let grad_weights_zeros = vec![0.0f32; self.weight_count()];
-        self.grad_weights = Some(
-            GpuTensor::storage_rw(
-                device,
-                &grad_weights_zeros,
-                vec![self.out_dim * self.in_dim * self.basis_vec4s * 4],
-            )
-            .map_err(|e| {
-                ArkanError::buffer(format!("Failed to create grad_weights buffer: {}", e))
-            })?,
-        );
-
-        // Gradient for bias
-        let grad_bias_zeros = vec![0.0f32; self.out_dim];
-        self.grad_bias = Some(
-            GpuTensor::storage_rw(device, &grad_bias_zeros, vec![self.out_dim]).map_err(|e| {
-                ArkanError::buffer(format!("Failed to create grad_bias buffer: {}", e))
-            })?,
-        );
+        let weights = GpuTensor::uninit_with_limit(
+            device,
+            vec![self.weight_count()],
+            wgpu::BufferUsages::empty(),
+            Some(self.max_vram_alloc),
+        )?;
+        let bias = GpuTensor::uninit_with_limit(
+            device,
+            vec![self.out_dim],
+            wgpu::BufferUsages::empty(),
+            Some(self.max_vram_alloc),
+        )?;
+        self.grad_weights = Some(weights);
+        self.grad_bias = Some(bias);
 
         Ok(())
     }

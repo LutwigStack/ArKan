@@ -4,7 +4,7 @@
 //! a wgpu buffer with shape metadata.
 
 use crate::error::{ArkanError, ArkanResult};
-use crate::gpu::{exceeds_vram_limit, MAX_VRAM_ALLOC};
+use crate::gpu::MAX_VRAM_ALLOC;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
@@ -87,38 +87,7 @@ impl GpuTensor {
         data: &[f32],
         shape: Vec<usize>,
     ) -> ArkanResult<Self> {
-        let expected_len: usize = shape.iter().product();
-        if data.len() != expected_len {
-            // Infer logical shape for got: e.g., expected [32, 64], got [31, 64]
-            let got_shape = infer_got_shape(data.len(), &shape);
-            return Err(ArkanError::ShapeMismatch {
-                expected: shape,
-                got: got_shape,
-            });
-        }
-
-        let size_bytes = std::mem::size_of_val(data) as u64;
-
-        if exceeds_vram_limit(size_bytes) {
-            return Err(ArkanError::batch_too_large(
-                data.len(),
-                (MAX_VRAM_ALLOC / std::mem::size_of::<f32>() as u64) as usize,
-            ));
-        }
-
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("GpuTensor"),
-            contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-        });
-
-        Ok(Self {
-            buffer,
-            shape,
-            capacity_bytes: size_bytes,
-        })
+        Self::upload_with_limit(device, data, shape, Some(MAX_VRAM_ALLOC))
     }
 
     /// Creates a new GPU tensor with a custom VRAM limit.
@@ -156,25 +125,14 @@ impl GpuTensor {
         shape: Vec<usize>,
         max_vram_alloc: Option<u64>,
     ) -> ArkanResult<Self> {
-        let expected_len: usize = shape.iter().product();
+        let size_bytes = Self::allocation_bytes(device, &shape, max_vram_alloc)?;
+        let expected_len = size_bytes as usize / std::mem::size_of::<f32>();
         if data.len() != expected_len {
             let got_shape = infer_got_shape(data.len(), &shape);
             return Err(ArkanError::ShapeMismatch {
                 expected: shape,
                 got: got_shape,
             });
-        }
-
-        let size_bytes = std::mem::size_of_val(data) as u64;
-
-        // Check limit if specified
-        if let Some(max_alloc) = max_vram_alloc {
-            if size_bytes > max_alloc {
-                return Err(ArkanError::batch_too_large(
-                    data.len(),
-                    (max_alloc / std::mem::size_of::<f32>() as u64) as usize,
-                ));
-            }
         }
 
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -208,15 +166,42 @@ impl GpuTensor {
         shape: Vec<usize>,
         usage: wgpu::BufferUsages,
     ) -> ArkanResult<Self> {
-        let num_elements: usize = shape.iter().product();
-        let size_bytes = (num_elements * std::mem::size_of::<f32>()) as u64;
+        Self::uninit_with_limit(device, shape, usage, Some(MAX_VRAM_ALLOC))
+    }
 
-        if exceeds_vram_limit(size_bytes) {
-            return Err(ArkanError::batch_too_large(
-                num_elements,
-                (MAX_VRAM_ALLOC / std::mem::size_of::<f32>() as u64) as usize,
-            ));
+    /// Checks shape overflow, the configured per-buffer cap and device storage limits.
+    pub(crate) fn allocation_bytes(
+        device: &wgpu::Device,
+        shape: &[usize],
+        max_vram_alloc: Option<u64>,
+    ) -> ArkanResult<u64> {
+        let elements = shape
+            .iter()
+            .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+            .ok_or_else(|| ArkanError::buffer("GPU tensor shape overflow"))?;
+        let bytes = elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| ArkanError::buffer("GPU tensor byte size overflow"))?
+            as u64;
+        let limits = device.limits();
+        let limit = max_vram_alloc
+            .unwrap_or(u64::MAX)
+            .min(limits.max_buffer_size)
+            .min(u64::from(limits.max_storage_buffer_binding_size));
+        if bytes > limit {
+            return Err(ArkanError::batch_too_large(elements, (limit / 4) as usize));
         }
+        Ok(bytes)
+    }
+
+    /// Allocates storage with a custom per-buffer limit, also checking device limits.
+    pub fn uninit_with_limit(
+        device: &wgpu::Device,
+        shape: Vec<usize>,
+        usage: wgpu::BufferUsages,
+        max_vram_alloc: Option<u64>,
+    ) -> ArkanResult<Self> {
+        let size_bytes = Self::allocation_bytes(device, &shape, max_vram_alloc)?;
 
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("GpuTensor (uninit)"),
@@ -245,38 +230,7 @@ impl GpuTensor {
         data: &[f32],
         shape: Vec<usize>,
     ) -> ArkanResult<Self> {
-        let expected_len: usize = shape.iter().product();
-        if data.len() != expected_len {
-            // Infer logical shape for got
-            let got_shape = infer_got_shape(data.len(), &shape);
-            return Err(ArkanError::ShapeMismatch {
-                expected: shape,
-                got: got_shape,
-            });
-        }
-
-        let size_bytes = std::mem::size_of_val(data) as u64;
-
-        if exceeds_vram_limit(size_bytes) {
-            return Err(ArkanError::batch_too_large(
-                data.len(),
-                (MAX_VRAM_ALLOC / std::mem::size_of::<f32>() as u64) as usize,
-            ));
-        }
-
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("GpuTensor (storage read)"),
-            contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-        });
-
-        Ok(Self {
-            buffer,
-            shape,
-            capacity_bytes: size_bytes,
-        })
+        Self::upload_with_limit(device, data, shape, Some(MAX_VRAM_ALLOC))
     }
 
     /// Creates a GPU tensor for use as storage (read-write in shaders).
@@ -293,37 +247,7 @@ impl GpuTensor {
     ///
     /// Returns `ArkanError::BatchTooLarge` if the data size exceeds `MAX_VRAM_ALLOC`.
     pub fn storage_rw(device: &wgpu::Device, data: &[f32], shape: Vec<usize>) -> ArkanResult<Self> {
-        let expected_len: usize = shape.iter().product();
-        if data.len() != expected_len {
-            let got_shape = infer_got_shape(data.len(), &shape);
-            return Err(ArkanError::ShapeMismatch {
-                expected: shape,
-                got: got_shape,
-            });
-        }
-
-        let size_bytes = std::mem::size_of_val(data) as u64;
-
-        if exceeds_vram_limit(size_bytes) {
-            return Err(ArkanError::batch_too_large(
-                data.len(),
-                (MAX_VRAM_ALLOC / std::mem::size_of::<f32>() as u64) as usize,
-            ));
-        }
-
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("GpuTensor (storage rw)"),
-            contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-        });
-
-        Ok(Self {
-            buffer,
-            shape,
-            capacity_bytes: size_bytes,
-        })
+        Self::upload_with_limit(device, data, shape, Some(MAX_VRAM_ALLOC))
     }
 
     /// Downloads tensor data from GPU to CPU.
@@ -647,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_exceeds_vram_limit() {
-        use crate::gpu::MAX_VRAM_ALLOC;
+        use crate::gpu::{exceeds_vram_limit, MAX_VRAM_ALLOC};
 
         // Below limit
         assert!(!exceeds_vram_limit(1024));

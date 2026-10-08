@@ -57,6 +57,7 @@ struct Uniforms {
 @group(0) @binding(0) var<storage, read> weights: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> bias: array<f32>;
 @group(0) @binding(2) var<uniform> config: Uniforms;
+@group(0) @binding(3) var<storage, read> normalization: array<vec2<f32>>;
 
 // Group 1: Dynamic workspace resources
 @group(1) @binding(0) var<storage, read> input: array<f32>;
@@ -133,7 +134,7 @@ fn forward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
         
         // Get input value and normalize to [0, 1]
-        var x = input[input_idx];
+        var x = (input[input_idx] - normalization[in_idx].x) / normalization[in_idx].y;
         
         // Clamp to grid range and normalize
         x = clamp(x, config.grid_min, config.grid_max);
@@ -195,6 +196,7 @@ struct Uniforms {
 @group(0) @binding(0) var<storage, read> weights: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> bias: array<f32>;
 @group(0) @binding(2) var<uniform> config: Uniforms;
+@group(0) @binding(3) var<storage, read> normalization: array<vec2<f32>>;
 
 @group(1) @binding(0) var<storage, read> input: array<f32>;
 @group(1) @binding(1) var<storage, read_write> output: array<f32>;
@@ -267,7 +269,7 @@ fn forward_simple(@builtin(global_invocation_id) global_id: vec3<u32>) {
             continue;
         }
         
-        var x = input[input_idx];
+        var x = (input[input_idx] - normalization[in_idx].x) / normalization[in_idx].y;
         
         // Normalize to [0, 1]
         x = clamp(x, config.grid_min, config.grid_max);
@@ -832,6 +834,7 @@ struct Uniforms {
 @group(0) @binding(0) var<storage, read> weights: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> bias: array<f32>;
 @group(0) @binding(2) var<uniform> config: Uniforms;
+@group(0) @binding(3) var<storage, read> normalization: array<vec2<f32>>;
 
 @group(1) @binding(0) var<storage, read> input: array<f32>;
 @group(1) @binding(1) var<storage, read_write> output: array<f32>;
@@ -908,7 +911,7 @@ fn forward_training_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             continue;
         }
         
-        let raw = input[input_idx];
+        let raw = (input[input_idx] - normalization[in_idx].x) / normalization[in_idx].y;
         var x = raw;
 
         x = clamp(x, config.grid_min, config.grid_max);
@@ -1435,6 +1438,7 @@ struct Uniforms {{
 @group(0) @binding(0) var<storage, read> weights: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> bias: array<f32>;
 @group(0) @binding(2) var<uniform> config: Uniforms;
+@group(0) @binding(3) var<storage, read> normalization: array<vec2<f32>>;
 
 @group(1) @binding(0) var<storage, read> input: array<f32>;
 @group(1) @binding(1) var<storage, read_write> output: array<f32>;
@@ -1486,7 +1490,7 @@ fn forward_main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
             continue;
         }}
         
-        var x = input[input_idx];
+        var x = (input[input_idx] - normalization[in_idx].x) / normalization[in_idx].y;
         
         x = clamp(x, config.grid_min, config.grid_max);
         let t_norm = (x - config.grid_min) / (config.grid_max - config.grid_min);
@@ -1804,6 +1808,7 @@ struct Uniforms {{
 @group(0) @binding(0) var<storage, read> weights: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> bias: array<f32>;
 @group(0) @binding(2) var<uniform> config: Uniforms;
+@group(0) @binding(3) var<storage, read> normalization: array<vec2<f32>>;
 
 @group(1) @binding(0) var<storage, read> input: array<f32>;
 @group(1) @binding(1) var<storage, read_write> output: array<f32>;
@@ -1862,7 +1867,7 @@ fn forward_training_main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
             continue;
         }}
         
-        let raw = input[input_idx];
+        let raw = (input[input_idx] - normalization[in_idx].x) / normalization[in_idx].y;
         var x = raw;
 
         x = clamp(x, config.grid_min, config.grid_max);

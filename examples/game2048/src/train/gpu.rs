@@ -36,12 +36,16 @@ const TARGET_BATCH_SIZE: usize = 256;
 pub struct GpuDqnAgent {
     /// WGPU backend (device/queue).
     backend: WgpuBackend,
-    /// CPU policy network (for weight storage and hybrid updates).
+    /// CPU rollout snapshot, refreshed at rollout/checkpoint boundaries in native mode.
     pub cpu_policy: KanNetwork,
     /// CPU target network.
     pub cpu_target: KanNetwork,
     /// GPU policy network.
     pub gpu_policy: GpuNetwork,
+    /// Fixed GPU target snapshot between target updates.
+    gpu_target: Option<GpuNetwork>,
+    gpu_target_workspace: Option<GpuWorkspace>,
+    cpu_snapshot_dirty: bool,
     /// CPU workspace for single-sample inference.
     cpu_workspace: Workspace,
     /// CPU workspace for batched forward (compute_targets).
@@ -87,17 +91,20 @@ impl GpuDqnAgent {
             .build()?;
 
         let cpu_policy = KanNetwork::new(config.clone());
-        let cpu_target = KanNetwork::new(config.clone());
+        let cpu_target = cpu_policy.clone();
         let cpu_workspace = Workspace::new(&config);
         // Batch workspace for compute_targets optimization
         let cpu_batch_workspace = cpu_policy.create_workspace(TARGET_BATCH_SIZE);
 
         // Initialize WGPU backend
-        let wgpu_opts = WgpuOptions::compute();
+        // This model fits standard storage limits, including software adapters.
+        let wgpu_opts = WgpuOptions::default();
         let backend = WgpuBackend::init(wgpu_opts)?;
 
         // Create GPU network from CPU
         let gpu_policy = GpuNetwork::from_cpu(&backend, &cpu_policy)?;
+        let gpu_target = if native_mode { Some(GpuNetwork::from_cpu(&backend, &cpu_target)?) } else { None };
+        let gpu_target_workspace = gpu_target.as_ref().map(|target| target.create_workspace(TARGET_BATCH_SIZE)).transpose()?;
 
         // GPU workspace for batch training (larger batch = better GPU utilization)
         let gpu_workspace = gpu_policy.create_workspace(GPU_BATCH_SIZE)?;
@@ -115,12 +122,13 @@ impl GpuDqnAgent {
                 epsilon: 1e-8,
                 weight_decay: 0.0,
             };
-            Some(GpuAdam::new(
+            Some(GpuAdam::new_with_limit(
                 backend.device_arc(),
                 backend.queue_arc(),
                 &layer_sizes,
                 gpu_adam_config,
-            ))
+                backend.max_vram_alloc(),
+            )?)
         } else {
             None
         };
@@ -135,6 +143,9 @@ impl GpuDqnAgent {
             cpu_policy,
             cpu_target,
             gpu_policy,
+            gpu_target,
+            gpu_target_workspace,
+            cpu_snapshot_dirty: false,
             cpu_workspace,
             cpu_batch_workspace,
             gpu_workspace,
@@ -257,58 +268,32 @@ impl GpuDqnAgent {
         dones: &[bool],
         gamma: f32,
     ) -> Result<f32, Box<dyn std::error::Error>> {
-        let batch_size = actions.len();
-        let state_dim = 256;  // one-hot: 16 cells * 16 values
-        let action_dim = 4;
+        let targets = self.compute_targets_gpu(states, actions, rewards, next_states, dones, gamma)?;
+        self.train_on_targets_native(states, &targets)
+    }
 
-        // For native mode, we still compute targets on CPU for simplicity
-        let mut targets = vec![0.0f32; batch_size * action_dim];
-
-        for i in 0..batch_size {
-            let state = &states[i * state_dim..(i + 1) * state_dim];
-
-            let mut current_q = vec![0.0f32; 4];
-            self.cpu_policy
-                .forward_single(state, &mut current_q, &mut self.cpu_workspace);
-
-            for a in 0..action_dim {
-                targets[i * action_dim + a] = current_q[a];
-            }
-
-            let action = actions[i];
-            let reward = rewards[i];
-            let done = dones[i];
-
-            let target_q = if done {
-                reward
-            } else {
-                let next_state = &next_states[i * state_dim..(i + 1) * state_dim];
-                let next_q = self.get_target_q_values(next_state);
-                let max_next_q = next_q.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                reward + gamma * max_next_q
-            };
-
-            targets[i * action_dim + action] = target_q;
+    fn compute_targets_gpu(
+        &mut self, states: &[f32], actions: &[usize], rewards: &[f32],
+        next_states: &[f32], dones: &[bool], gamma: f32,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let batch = actions.len();
+        let mut targets = self.gpu_policy.forward_batch(states, batch, &mut self.gpu_workspace)?;
+        let next_q = self.gpu_target.as_mut().ok_or("native GPU target not initialized")?
+            .forward_batch(next_states, batch, self.gpu_target_workspace.as_mut().ok_or("native target workspace not initialized")?)?;
+        for i in 0..batch {
+            let next = next_q[i*4..i*4+4].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            targets[i*4+actions[i]] = if dones[i] { rewards[i] } else { rewards[i]+gamma*next };
         }
+        Ok(targets)
+    }
 
-        // Use native GPU training with GpuAdam (no gradient clipping!)
-        let gpu_opt = self
-            .gpu_optimizer
-            .as_mut()
-            .expect("GpuAdam required for native mode");
-
-        let loss = self.gpu_policy.train_step_gpu_native(
-            states,
-            &targets,
-            batch_size,
-            &mut self.gpu_workspace,
-            gpu_opt,
-        )?;
-
-        // Sync weights back to CPU for inference
-        self.gpu_policy.sync_weights_to_cpu(&mut self.cpu_policy)?;
-
-        Ok(loss)
+    /// Refreshes the CPU rollout policy explicitly after one or more native updates.
+    pub fn sync_rollout_policy(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.native_mode && self.cpu_snapshot_dirty {
+            self.gpu_policy.sync_weights_to_cpu(&mut self.cpu_policy)?;
+            self.cpu_snapshot_dirty = false;
+        }
+        Ok(())
     }
 
     /// Computes Q-learning targets for a batch using PARALLEL forward passes.
@@ -322,6 +307,10 @@ impl GpuDqnAgent {
         dones: &[bool],
         gamma: f32,
     ) -> Vec<f32> {
+        if self.native_mode {
+            return self.compute_targets_gpu(states, actions, rewards, next_states, dones, gamma)
+                .expect("native GPU target computation failed");
+        }
         let batch_size = actions.len();
         let action_dim = 4;
 
@@ -414,14 +403,14 @@ impl GpuDqnAgent {
             gpu_opt,
         )?;
 
-        // Sync weights back to CPU for inference
-        self.gpu_policy.sync_weights_to_cpu(&mut self.cpu_policy)?;
+        self.cpu_snapshot_dirty = true;
 
         Ok(loss)
     }
 
     /// Updates target network.
-    pub fn update_target_network(&mut self) {
+    pub fn update_target_network(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.sync_rollout_policy()?;
         for (policy_layer, target_layer) in self
             .cpu_policy
             .layers
@@ -431,6 +420,10 @@ impl GpuDqnAgent {
             target_layer.weights.copy_from_slice(&policy_layer.weights);
             target_layer.bias.copy_from_slice(&policy_layer.bias);
         }
+        if let Some(target) = &mut self.gpu_target {
+            target.sync_weights(&self.cpu_target)?;
+        }
+        Ok(())
     }
 }
 
@@ -484,7 +477,7 @@ pub fn train_native(
 /// Optimized for high throughput with large batches.
 fn train_impl(
     episodes: usize,
-    _batch_size: usize, // Ignored, we use GPU_BATCH_SIZE
+    batch_size: usize,
     lr: f32,
     gamma: f32,
     replay_capacity: usize,
@@ -495,6 +488,9 @@ fn train_impl(
     native_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::cell::RefCell;
+    if batch_size == 0 || target_update == 0 {
+        return Err("batch size and target update interval must be positive".into());
+    }
     
     let mode_name = if native_mode { "Native" } else { "Hybrid" };
     
@@ -526,11 +522,11 @@ fn train_impl(
     }
 
     // Pre-allocated batch buffers for sampling
-    let mut batch_states = Vec::with_capacity(GPU_BATCH_SIZE * 256);
-    let mut batch_actions = Vec::with_capacity(GPU_BATCH_SIZE);
-    let mut batch_rewards = Vec::with_capacity(GPU_BATCH_SIZE);
-    let mut batch_next_states = Vec::with_capacity(GPU_BATCH_SIZE * 256);
-    let mut batch_dones = Vec::with_capacity(GPU_BATCH_SIZE);
+    let mut batch_states = Vec::with_capacity(batch_size * 256);
+    let mut batch_actions = Vec::with_capacity(batch_size);
+    let mut batch_rewards = Vec::with_capacity(batch_size);
+    let mut batch_next_states = Vec::with_capacity(batch_size * 256);
+    let mut batch_dones = Vec::with_capacity(batch_size);
 
     // Progress bar
     let pb = ProgressBar::new(episodes as u64);
@@ -548,7 +544,7 @@ fn train_impl(
 
     println!();
     println!("Training started (GPU {} + {} parallel envs, batch {})...", 
-             mode_name, NUM_ENVS, GPU_BATCH_SIZE);
+             mode_name, NUM_ENVS, batch_size);
     if native_mode {
         println!("⚠️  WARNING: Native mode has NO gradient clipping!");
     }
@@ -563,6 +559,7 @@ fn train_impl(
 
         // Update shared weights periodically (not every batch for speed)
         if batch_idx % (WEIGHT_SYNC_INTERVAL / NUM_ENVS).max(1) == 0 {
+            gpu_agent.sync_rollout_policy()?;
             let mut weights = shared_weights.write().unwrap();
             *weights = gpu_agent.cpu_policy.layers.iter()
                 .map(|l| (l.weights.clone(), l.bias.clone()))
@@ -662,7 +659,7 @@ fn train_impl(
         // GPU Training: multiple large-batch updates
         // More updates when buffer is fuller for better sample efficiency
         let buffer_len = replay_buffer.read().unwrap().len();
-        let updates_per_batch = if buffer_len >= GPU_BATCH_SIZE * 4 {
+        let updates_per_batch = if buffer_len >= batch_size * 4 {
             batch_count * 2  // More updates when buffer is full
         } else {
             batch_count
@@ -674,11 +671,11 @@ fn train_impl(
         {
             let buffer = replay_buffer.read().unwrap();
 
-            if buffer.len() >= GPU_BATCH_SIZE {
+            if buffer.len() >= batch_size {
                 for _ in 0..updates_per_batch {
                     // Use optimized batch sampling into pre-allocated buffers
                     if buffer.sample_batch_into(
-                        GPU_BATCH_SIZE,
+                        batch_size,
                         &mut batch_states,
                         &mut batch_actions,
                         &mut batch_rewards,
@@ -686,9 +683,11 @@ fn train_impl(
                         &mut batch_dones,
                     ).is_some() {
                         // Compute targets using CPU target network
-                        let targets = gpu_agent.compute_targets(
-                            &batch_states, &batch_actions, &batch_rewards, &batch_next_states, &batch_dones, gamma
-                        );
+                        let targets = if native_mode {
+                            gpu_agent.compute_targets_gpu(&batch_states, &batch_actions, &batch_rewards, &batch_next_states, &batch_dones, gamma)?
+                        } else {
+                            gpu_agent.compute_targets(&batch_states, &batch_actions, &batch_rewards, &batch_next_states, &batch_dones, gamma)
+                        };
 
                         // Train on GPU with large batch
                         let loss_result = if native_mode {
@@ -725,7 +724,7 @@ fn train_impl(
 
         // Update target network
         if completed_episodes % target_update < batch_count || batch_idx == 0 {
-            gpu_agent.update_target_network();
+            gpu_agent.update_target_network()?;
         }
 
         // Progress update
@@ -762,7 +761,7 @@ fn train_impl(
     println!("              TRAINING COMPLETE (GPU {})                ", mode_name);
     println!("═══════════════════════════════════════════════════════════════");
     println!("Parallel envs:      {}", NUM_ENVS);
-    println!("GPU batch size:     {}", GPU_BATCH_SIZE);
+    println!("GPU batch size:     {}", batch_size);
     println!("Total episodes:     {}", episodes);
     println!("Total steps:        {}", total_steps);
     println!("Training steps:     {}", train_steps);
@@ -783,6 +782,8 @@ fn train_impl(
         }
     }
     println!();
+
+    gpu_agent.sync_rollout_policy()?;
 
     // Demo game
     println!("🎮 Demo game with trained agent (greedy policy):");
@@ -806,4 +807,42 @@ fn train_impl(
     history.print_graph();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "Requires GPU adapter"]
+    fn target_starts_as_policy_snapshot() {
+        let agent = GpuDqnAgent::new(0.001, true).unwrap();
+        for (policy, target) in agent.cpu_policy.layers.iter().zip(&agent.cpu_target.layers) {
+            assert!(policy.weights == target.weights, "initial target weights must match policy");
+            assert_eq!(policy.bias, target.bias);
+        }
+    }
+
+    #[test]
+    #[ignore = "Requires GPU adapter"]
+    fn native_update_keeps_cpu_rollout_snapshot_until_sync() {
+        let mut agent = GpuDqnAgent::new(0.001, true).unwrap();
+        let states = vec![0.;256];
+        let targets = vec![1.;4];
+        let snapshot = agent.cpu_policy.clone();
+        agent.train_on_targets_native(&states, &targets).unwrap();
+        for (before, after) in snapshot.layers.iter().zip(&agent.cpu_policy.layers) {
+            assert!(before.weights == after.weights, "native update must preserve CPU rollout snapshot");
+            assert_eq!(before.bias, after.bias);
+        }
+        // Current GPU policy still supplies untaken actions in the DQN target.
+        let policy_q = agent.gpu_policy.forward_batch(&states,1,&mut agent.gpu_workspace).unwrap();
+        let computed = agent.compute_targets(&states,&[0],&[2.],&states,&[true],0.99);
+        assert_eq!(computed[0],2.);
+        for action in 1..4 { assert!((computed[action]-policy_q[action]).abs()<1e-5); }
+        agent.sync_rollout_policy().unwrap();
+        assert!(snapshot.layers.iter().zip(&agent.cpu_policy.layers).any(|(a,b)| a.weights != b.weights || a.bias != b.bias));
+        agent.update_target_network().unwrap();
+        for (policy,target) in agent.cpu_policy.layers.iter().zip(&agent.cpu_target.layers) { assert!(policy.weights==target.weights); }
+    }
 }

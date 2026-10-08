@@ -1,7 +1,8 @@
 //! Fast 2048 game implementation using bitboard representation.
 //!
 //! Each tile is stored as 4 bits (0-15), representing power of 2.
-//! The entire 4x4 board fits in a single u64.
+//! The entire 4x4 board fits in a single u64. Tiles at the maximum
+//! representable value (32768) remain on the board and cannot merge further.
 
 use rand::Rng;
 
@@ -210,12 +211,12 @@ impl Game {
             // 2. Bonus for keeping max tile in corner
             let max_tile = self.board.max_tile();
             let corner_vals = [
-                self.board.get(0, 0),
-                self.board.get(0, 3),
-                self.board.get(3, 0),
-                self.board.get(3, 3),
+                self.board.tile_value(0, 0),
+                self.board.tile_value(0, 3),
+                self.board.tile_value(3, 0),
+                self.board.tile_value(3, 3),
             ];
-            let max_in_corner = corner_vals.iter().any(|&v| v == max_tile as u8);
+            let max_in_corner = corner_vals.iter().any(|&v| v != 0 && v == max_tile);
             if max_in_corner && max_tile >= 64 {
                 r += 0.5;
             }
@@ -313,9 +314,11 @@ impl Game {
             line[i] = 0;
         }
 
+        // ponytail: packed 4-bit tiles stop merging at 32768; use wider storage
+        // and update the one-hot encoding before supporting larger tiles.
         // Merge adjacent equal tiles
         for i in 0..3 {
-            if line[i] != 0 && line[i] == line[i + 1] {
+            if line[i] != 0 && line[i] < 15 && line[i] == line[i + 1] {
                 line[i] += 1; // Double the tile (add 1 to exponent)
                 score += 1 << line[i]; // Score is the merged tile value
                 line[i + 1] = 0;
@@ -347,14 +350,14 @@ impl Game {
         // Check for possible merges
         for row in 0..4 {
             for col in 0..3 {
-                if self.board.get(row, col) == self.board.get(row, col + 1) {
+                if self.board.get(row, col) < 15 && self.board.get(row, col) == self.board.get(row, col + 1) {
                     return;
                 }
             }
         }
         for row in 0..3 {
             for col in 0..4 {
-                if self.board.get(row, col) == self.board.get(row + 1, col) {
+                if self.board.get(row, col) < 15 && self.board.get(row, col) == self.board.get(row + 1, col) {
                     return;
                 }
             }
@@ -450,4 +453,26 @@ mod tests {
         assert_eq!(board.get(1, 2), 5);
         assert_eq!(board.tile_value(1, 2), 32);
     }
+    #[test]
+    fn corner_bonus_compares_tile_values() {
+        for (row, exponent, bonus) in [(0, 7, 0.5), (1, 8, 0.0)] {
+            let mut board = Board::empty();
+            board.set(row, 1, exponent);
+            let mut game = Game { board, score: 0, game_over: false };
+            let (reward, changed) = game.make_move(Direction::Right);
+            assert!(changed);
+            let base = game.compute_monotonicity_bonus() * 0.1
+                + game.board.count_empty() as f32 * 0.05;
+            assert!((reward - base - bonus).abs() < 1e-5, "exponent {exponent}: {reward} versus {}", base + bonus);
+        }
+    }
+
+    #[test]
+    fn maximum_representable_tiles_do_not_wrap_to_empty() {
+        let game = Game { board: Board::empty(), score: 0, game_over: false };
+        let mut line = [15, 15, 0, 0];
+        assert_eq!(game.slide_and_merge_line(&mut line), 0);
+        assert_eq!(line, [15, 15, 0, 0]);
+    }
+
 }

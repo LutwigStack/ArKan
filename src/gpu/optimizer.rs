@@ -134,21 +134,30 @@ impl GpuAdamLayerState {
     ///
     /// Both moments are initialized to zero.
     pub fn new(device: &wgpu::Device, num_params: usize) -> Self {
-        let zeros = vec![0.0f32; num_params];
+        Self::new_with_limit(device, num_params, crate::gpu::DEFAULT_MAX_VRAM_ALLOC)
+            .expect("GPU optimizer state allocation exceeds memory limits")
+    }
 
-        let m = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Adam M Buffer"),
-            contents: bytemuck::cast_slice(&zeros),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let v = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Adam V Buffer"),
-            contents: bytemuck::cast_slice(&zeros),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        Self { m, v, num_params }
+    fn new_with_limit(
+        device: &wgpu::Device,
+        num_params: usize,
+        max_vram_alloc: u64,
+    ) -> ArkanResult<Self> {
+        let m = crate::gpu::GpuTensor::uninit_with_limit(
+            device,
+            vec![num_params],
+            wgpu::BufferUsages::empty(),
+            Some(max_vram_alloc),
+        )?
+        .buffer;
+        let v = crate::gpu::GpuTensor::uninit_with_limit(
+            device,
+            vec![num_params],
+            wgpu::BufferUsages::empty(),
+            Some(max_vram_alloc),
+        )?
+        .buffer;
+        Ok(Self { m, v, num_params })
     }
 
     /// Resets the state to zero.
@@ -199,13 +208,44 @@ impl GpuAdam {
         layer_sizes: &[(usize, usize)],
         config: GpuAdamConfig,
     ) -> Self {
+        Self::new_with_limit(
+            device,
+            queue,
+            layer_sizes,
+            config,
+            crate::gpu::DEFAULT_MAX_VRAM_ALLOC,
+        )
+        .expect("GPU optimizer allocation exceeds memory limits")
+    }
+
+    /// Creates an optimizer after validating every state allocation against the
+    /// configured per-buffer cap and device limits. No parameters are updated on error.
+    pub fn new_with_limit(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        layer_sizes: &[(usize, usize)],
+        config: GpuAdamConfig,
+        max_vram_alloc: u64,
+    ) -> ArkanResult<Self> {
+        for &(weights, bias) in layer_sizes {
+            crate::gpu::GpuTensor::allocation_bytes(&device, &[weights], Some(max_vram_alloc))?;
+            crate::gpu::GpuTensor::allocation_bytes(&device, &[bias], Some(max_vram_alloc))?;
+        }
         // Create Adam states for each layer
         let mut weight_states = Vec::with_capacity(layer_sizes.len());
         let mut bias_states = Vec::with_capacity(layer_sizes.len());
 
         for &(num_weights, num_biases) in layer_sizes {
-            weight_states.push(GpuAdamLayerState::new(&device, num_weights));
-            bias_states.push(GpuAdamLayerState::new(&device, num_biases));
+            weight_states.push(GpuAdamLayerState::new_with_limit(
+                &device,
+                num_weights,
+                max_vram_alloc,
+            )?);
+            bias_states.push(GpuAdamLayerState::new_with_limit(
+                &device,
+                num_biases,
+                max_vram_alloc,
+            )?);
         }
 
         // Create bind group layout
@@ -291,7 +331,7 @@ impl GpuAdam {
             cache: None,
         });
 
-        Self {
+        Ok(Self {
             device,
             queue,
             config,
@@ -300,7 +340,7 @@ impl GpuAdam {
             t: 0,
             pipeline,
             bind_group_layout,
-        }
+        })
     }
 
     /// Performs one Adam update step for a parameter buffer.
@@ -365,7 +405,7 @@ impl GpuAdam {
     /// # Note
     ///
     /// This submits GPU work and does NOT wait for completion.
-    /// Call `queue.submit()` after this to actually execute.
+    /// The commands are submitted before returning; synchronize only for CPU readback.
     pub fn step(
         &mut self,
         layer_params: &[(&wgpu::Buffer, &wgpu::Buffer)],
@@ -376,6 +416,32 @@ impl GpuAdam {
                 &[self.weight_states.len()],
                 &[layer_params.len()],
             ));
+        }
+
+        if layer_grads.len() != layer_params.len() {
+            return Err(ArkanError::shape_mismatch(
+                &[layer_params.len()],
+                &[layer_grads.len()],
+            ));
+        }
+        // Validate every layer before encoding any updates (or advancing Adam time).
+        for (i, ((w, b), (gw, gb))) in layer_params.iter().zip(layer_grads).enumerate() {
+            let expected = [
+                self.weight_states[i].num_params * 4,
+                self.bias_states[i].num_params * 4,
+            ];
+            let got = [
+                w.size() as usize,
+                b.size() as usize,
+                gw.size() as usize,
+                gb.size() as usize,
+            ];
+            if got != [expected[0], expected[1], expected[0], expected[1]] {
+                return Err(ArkanError::shape_mismatch(
+                    &[expected[0], expected[1], expected[0], expected[1]],
+                    &got,
+                ));
+            }
         }
 
         // Increment timestep
@@ -532,18 +598,26 @@ pub struct GpuSgdLayerState {
 impl GpuSgdLayerState {
     /// Creates new SGD state for a parameter buffer.
     pub fn new(device: &wgpu::Device, num_params: usize) -> Self {
-        let zeros = vec![0.0f32; num_params];
+        Self::new_with_limit(device, num_params, crate::gpu::DEFAULT_MAX_VRAM_ALLOC)
+            .expect("GPU optimizer state allocation exceeds memory limits")
+    }
 
-        let velocity = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("SGD Velocity Buffer"),
-            contents: bytemuck::cast_slice(&zeros),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        Self {
+    fn new_with_limit(
+        device: &wgpu::Device,
+        num_params: usize,
+        max_vram_alloc: u64,
+    ) -> ArkanResult<Self> {
+        let velocity = crate::gpu::GpuTensor::uninit_with_limit(
+            device,
+            vec![num_params],
+            wgpu::BufferUsages::empty(),
+            Some(max_vram_alloc),
+        )?
+        .buffer;
+        Ok(Self {
             velocity,
             num_params,
-        }
+        })
     }
 
     /// Resets velocity to zero.
@@ -580,12 +654,43 @@ impl GpuSgd {
         layer_sizes: &[(usize, usize)],
         config: GpuSgdConfig,
     ) -> Self {
+        Self::new_with_limit(
+            device,
+            queue,
+            layer_sizes,
+            config,
+            crate::gpu::DEFAULT_MAX_VRAM_ALLOC,
+        )
+        .expect("GPU optimizer allocation exceeds memory limits")
+    }
+
+    /// Creates an optimizer after validating every state allocation against the
+    /// configured per-buffer cap and device limits. No parameters are updated on error.
+    pub fn new_with_limit(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        layer_sizes: &[(usize, usize)],
+        config: GpuSgdConfig,
+        max_vram_alloc: u64,
+    ) -> ArkanResult<Self> {
+        for &(weights, bias) in layer_sizes {
+            crate::gpu::GpuTensor::allocation_bytes(&device, &[weights], Some(max_vram_alloc))?;
+            crate::gpu::GpuTensor::allocation_bytes(&device, &[bias], Some(max_vram_alloc))?;
+        }
         let mut weight_states = Vec::with_capacity(layer_sizes.len());
         let mut bias_states = Vec::with_capacity(layer_sizes.len());
 
         for &(num_weights, num_biases) in layer_sizes {
-            weight_states.push(GpuSgdLayerState::new(&device, num_weights));
-            bias_states.push(GpuSgdLayerState::new(&device, num_biases));
+            weight_states.push(GpuSgdLayerState::new_with_limit(
+                &device,
+                num_weights,
+                max_vram_alloc,
+            )?);
+            bias_states.push(GpuSgdLayerState::new_with_limit(
+                &device,
+                num_biases,
+                max_vram_alloc,
+            )?);
         }
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -654,7 +759,7 @@ impl GpuSgd {
             cache: None,
         });
 
-        Self {
+        Ok(Self {
             device,
             queue,
             config,
@@ -662,7 +767,7 @@ impl GpuSgd {
             bias_states,
             pipeline,
             bind_group_layout,
-        }
+        })
     }
 
     /// Performs one SGD update step.
@@ -676,6 +781,32 @@ impl GpuSgd {
                 &[self.weight_states.len()],
                 &[layer_params.len()],
             ));
+        }
+
+        if layer_grads.len() != layer_params.len() {
+            return Err(ArkanError::shape_mismatch(
+                &[layer_params.len()],
+                &[layer_grads.len()],
+            ));
+        }
+        // Validate every layer before encoding any updates (or advancing Adam time).
+        for (i, ((w, b), (gw, gb))) in layer_params.iter().zip(layer_grads).enumerate() {
+            let expected = [
+                self.weight_states[i].num_params * 4,
+                self.bias_states[i].num_params * 4,
+            ];
+            let got = [
+                w.size() as usize,
+                b.size() as usize,
+                gw.size() as usize,
+                gb.size() as usize,
+            ];
+            if got != [expected[0], expected[1], expected[0], expected[1]] {
+                return Err(ArkanError::shape_mismatch(
+                    &[expected[0], expected[1], expected[0], expected[1]],
+                    &got,
+                ));
+            }
         }
 
         let mut encoder = self

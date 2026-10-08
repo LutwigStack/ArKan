@@ -273,7 +273,9 @@ pub struct GpuNetwork {
 impl GpuNetwork {
     /// Creates a GPU network from a CPU network.
     ///
-    /// Uploads all layer weights and bias to GPU memory.
+    /// Uploads weights, bias and per-feature normalization to GPU memory.
+    /// Subnormal standard deviations are rejected before execution because GPU
+    /// float arithmetic may flush them to zero.
     pub fn from_cpu(backend: &WgpuBackend, cpu_network: &KanNetwork) -> ArkanResult<Self> {
         let device = backend.device_arc();
         let queue = backend.queue_arc();
@@ -297,7 +299,8 @@ impl GpuNetwork {
                 cpu_layer.global_basis_size,
             )?;
 
-            let gpu_layer = GpuLayer::from_cpu_layer(&device, cpu_layer)?;
+            let gpu_layer =
+                GpuLayer::from_cpu_layer_with_limit(&device, cpu_layer, backend.max_vram_alloc())?;
             layers.push(gpu_layer);
         }
 
@@ -413,7 +416,8 @@ impl GpuNetwork {
 
     /// Initializes gradient buffers for GPU-native training.
     ///
-    /// Call this once before using `train_step_gpu_native()`. This allocates
+    /// Allocates optional layer-owned gradients for callers using `layer_grads()`.
+    /// Native train steps allocate their gradients in the supplied workspace. This allocates
     /// gradient buffers in each layer for use with GPU optimizers.
     ///
     /// # Note
@@ -527,7 +531,9 @@ impl GpuNetwork {
         workspace: &mut GpuWorkspace,
     ) -> ArkanResult<Vec<f32>> {
         // Validate input
-        let expected_input_len = batch_size * self.input_dim;
+        let expected_input_len = batch_size
+            .checked_mul(self.input_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
         if input.len() != expected_input_len {
             return Err(ArkanError::shape_mismatch(
                 &[batch_size, self.input_dim],
@@ -595,7 +601,9 @@ impl GpuNetwork {
         workspace: &mut GpuWorkspace,
     ) -> ArkanResult<GpuForwardHandle> {
         // Validate input
-        let expected_input_len = batch_size * self.input_dim;
+        let expected_input_len = batch_size
+            .checked_mul(self.input_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
         if input.len() != expected_input_len {
             return Err(ArkanError::shape_mismatch(
                 &[batch_size, self.input_dim],
@@ -789,8 +797,7 @@ impl GpuNetwork {
         // Submit
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Wait for this layer to complete before next
-        self.device.poll(wgpu::Maintain::Wait);
+        // Queue submissions preserve layer dependencies; CPU readback owns the wait.
 
         Ok(())
     }
@@ -897,7 +904,6 @@ impl GpuNetwork {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
 
         Ok(())
     }
@@ -921,8 +927,18 @@ impl GpuNetwork {
         batch_size: usize,
         workspace: &mut GpuWorkspace,
     ) -> ArkanResult<Vec<f32>> {
-        // Run forward pass
-        let _ = self.forward_batch(input, batch_size, workspace)?;
+        let expected_len = batch_size
+            .checked_mul(self.input_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
+        if input.len() != expected_len {
+            return Err(ArkanError::shape_mismatch(
+                &[batch_size, self.input_dim],
+                &[input.len()],
+            ));
+        }
+        workspace.ensure_capacity(&self.device, batch_size)?;
+        workspace.upload_input(&self.queue, input)?;
+        self.execute_forward(batch_size, workspace)?;
 
         // Apply softmax in-place
         self.apply_softmax(batch_size, workspace)?;
@@ -931,7 +947,8 @@ impl GpuNetwork {
         workspace.download_output(&self.device, &self.queue, batch_size)
     }
 
-    /// Syncs weights from CPU network to GPU.
+    /// Syncs weights, biases and per-feature normalization from CPU to GPU.
+    /// The layer topology and grid must match the original GPU conversion.
     pub fn sync_weights(&mut self, cpu_network: &KanNetwork) -> ArkanResult<()> {
         if cpu_network.layers.len() != self.layers.len() {
             return Err(ArkanError::validation(
@@ -939,9 +956,26 @@ impl GpuNetwork {
             ));
         }
 
+        // Preflight all layers before writing a prefix of the network.
+        for (gpu, cpu) in self.layers.iter().zip(&cpu_network.layers) {
+            cpu.validate_layout()?;
+            GpuLayer::validate_normalization(cpu)?;
+            if (gpu.in_dim, gpu.out_dim, gpu.global_basis_size, gpu.order)
+                != (cpu.in_dim, cpu.out_dim, cpu.global_basis_size, cpu.order)
+                || (gpu.uniforms.grid_min, gpu.uniforms.grid_max) != cpu.grid_range
+                || cpu.mean.len() != gpu.in_dim
+                || cpu.std.len() != gpu.in_dim
+            {
+                return Err(ArkanError::validation(
+                    "CPU and GPU layer topology/grid mismatch",
+                ));
+            }
+        }
+
         for (gpu_layer, cpu_layer) in self.layers.iter_mut().zip(&cpu_network.layers) {
             gpu_layer.update_weights(&self.queue, cpu_layer);
             gpu_layer.update_bias(&self.queue, cpu_layer);
+            gpu_layer.update_normalization(&self.queue, cpu_layer);
         }
 
         Ok(())
@@ -970,7 +1004,9 @@ impl GpuNetwork {
         workspace: &mut GpuWorkspace,
     ) -> ArkanResult<Vec<f32>> {
         // Validate input
-        let expected_input_len = batch_size * self.input_dim;
+        let expected_input_len = batch_size
+            .checked_mul(self.input_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
         if input.len() != expected_input_len {
             return Err(ArkanError::shape_mismatch(
                 &[batch_size, self.input_dim],
@@ -994,6 +1030,7 @@ impl GpuNetwork {
 
         // Execute forward pass with training data saving
         self.execute_forward_training(batch_size, workspace)?;
+        workspace.training_batch = Some(batch_size);
 
         // Download output
         workspace.download_output(&self.device, &self.queue, batch_size)
@@ -1157,9 +1194,8 @@ impl GpuNetwork {
             pass.dispatch_workgroups(num_workgroups, 1, 1);
         }
 
-        // Submit and wait
+        // Submit; readback owns synchronization.
         self.queue.submit(std::iter::once(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
 
         Ok(())
     }
@@ -1200,8 +1236,12 @@ impl GpuNetwork {
         grad_weights: &mut Vec<Vec<f32>>,
         grad_biases: &mut Vec<Vec<f32>>,
     ) -> ArkanResult<Vec<f32>> {
+        self.validate_training_tape(batch_size, workspace)?;
+
         // Validate
-        let expected_len = batch_size * self.output_dim;
+        let expected_len = batch_size
+            .checked_mul(self.output_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
         if grad_output.len() != expected_len {
             return Err(ArkanError::shape_mismatch(
                 &[batch_size, self.output_dim],
@@ -1223,15 +1263,8 @@ impl GpuNetwork {
             .collect();
         workspace.prepare_grad_buffers(&self.device, &layer_specs)?;
 
-        // Ensure std_inv is set (default to 1.0 if not set)
-        if workspace.std_inv.len() != self.layers.len() {
-            let default_std_inv: Vec<Vec<f32>> =
-                self.layers.iter().map(|l| vec![1.0f32; l.in_dim]).collect();
-            workspace.set_std_inv(&self.device, &self.queue, &default_std_inv)?;
-        }
-
         // Zero gradient buffers
-        workspace.zero_grad_buffers(&self.queue);
+        workspace.zero_bias_grad_buffers(&self.device, &self.queue);
 
         // Upload grad_output to GPU
         workspace.upload_grad_output(&self.queue, grad_output)?;
@@ -1444,7 +1477,6 @@ impl GpuNetwork {
 
         // Submit
         self.queue.submit(std::iter::once(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
 
         Ok(())
     }
@@ -1480,10 +1512,7 @@ impl GpuNetwork {
             .grad_input
             .as_ref()
             .ok_or_else(|| ArkanError::buffer("grad_input not allocated"))?;
-        let std_inv = workspace
-            .std_inv
-            .get(layer_idx)
-            .ok_or_else(|| ArkanError::buffer("std_inv not allocated"))?;
+        let std_inv = &self.layers[layer_idx].std_inv;
 
         Ok(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Backward Workspace BindGroup"),
@@ -1575,7 +1604,9 @@ impl GpuNetwork {
         cpu_network: &mut KanNetwork,
     ) -> ArkanResult<f32> {
         // Validate target shape
-        let expected_target_len = batch_size * self.output_dim;
+        let expected_target_len = batch_size
+            .checked_mul(self.output_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
         if target.len() != expected_target_len {
             return Err(ArkanError::shape_mismatch(
                 &[batch_size, self.output_dim],
@@ -1642,7 +1673,9 @@ impl GpuNetwork {
         opts: &TrainOptions,
     ) -> ArkanResult<f32> {
         // Validate target shape
-        let expected_target_len = batch_size * self.output_dim;
+        let expected_target_len = batch_size
+            .checked_mul(self.output_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
         if target.len() != expected_target_len {
             return Err(ArkanError::shape_mismatch(
                 &[batch_size, self.output_dim],
@@ -1712,7 +1745,9 @@ impl GpuNetwork {
         cpu_network: &mut KanNetwork,
     ) -> ArkanResult<f32> {
         // Validate target shape
-        let expected_target_len = batch_size * self.output_dim;
+        let expected_target_len = batch_size
+            .checked_mul(self.output_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
         if target.len() != expected_target_len {
             return Err(ArkanError::shape_mismatch(
                 &[batch_size, self.output_dim],
@@ -1775,7 +1810,9 @@ impl GpuNetwork {
         opts: &TrainOptions,
     ) -> ArkanResult<f32> {
         // Validate target shape
-        let expected_target_len = batch_size * self.output_dim;
+        let expected_target_len = batch_size
+            .checked_mul(self.output_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
         if target.len() != expected_target_len {
             return Err(ArkanError::shape_mismatch(
                 &[batch_size, self.output_dim],
@@ -1908,7 +1945,9 @@ impl GpuNetwork {
         optimizer: &mut GpuAdam,
     ) -> ArkanResult<f32> {
         // Validate target shape
-        let expected_target_len = batch_size * self.output_dim;
+        let expected_target_len = batch_size
+            .checked_mul(self.output_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
         if target.len() != expected_target_len {
             return Err(ArkanError::shape_mismatch(
                 &[batch_size, self.output_dim],
@@ -1923,7 +1962,6 @@ impl GpuNetwork {
         let (loss, grad_output) = masked_mse(&output, target, None);
 
         // 3. Backward pass - gradients stay on GPU in workspace buffers
-        workspace.zero_grad_buffers(&self.queue);
         self.backward_batch_gpu_only(&grad_output, batch_size, workspace)?;
 
         // 4. GPU optimizer step - updates weights directly on GPU
@@ -1946,7 +1984,9 @@ impl GpuNetwork {
         optimizer: &mut GpuSgd,
     ) -> ArkanResult<f32> {
         // Validate target shape
-        let expected_target_len = batch_size * self.output_dim;
+        let expected_target_len = batch_size
+            .checked_mul(self.output_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
         if target.len() != expected_target_len {
             return Err(ArkanError::shape_mismatch(
                 &[batch_size, self.output_dim],
@@ -1961,7 +2001,6 @@ impl GpuNetwork {
         let (loss, grad_output) = masked_mse(&output, target, None);
 
         // 3. Backward pass
-        workspace.zero_grad_buffers(&self.queue);
         self.backward_batch_gpu_only(&grad_output, batch_size, workspace)?;
 
         // 4. GPU optimizer step
@@ -1987,7 +2026,8 @@ impl GpuNetwork {
     /// * `mask` - Optional mask [batch_size * output_dim]. Only non-zero values contribute to loss.
     /// * `workspace` - GPU workspace for training buffers.
     /// * `optimizer` - GPU Adam optimizer.
-    /// * `options` - Training options (gradient clipping, weight decay).
+    /// * `options` - Gradient clipping options. Native weight decay is configured only
+    ///   by `GpuAdamConfig`; `options.weight_decay` is not applied a second time.
     ///
     /// # Note
     ///
@@ -2005,7 +2045,9 @@ impl GpuNetwork {
         options: &TrainOptions,
     ) -> ArkanResult<f32> {
         // Validate target shape
-        let expected_target_len = batch_size * self.output_dim;
+        let expected_target_len = batch_size
+            .checked_mul(self.output_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
         if target.len() != expected_target_len {
             return Err(ArkanError::shape_mismatch(
                 &[batch_size, self.output_dim],
@@ -2020,7 +2062,6 @@ impl GpuNetwork {
         let (loss, grad_output) = masked_mse(&output, target, mask);
 
         // 3. Backward pass - gradients stay on GPU in workspace buffers
-        workspace.zero_grad_buffers(&self.queue);
         self.backward_batch_gpu_only(&grad_output, batch_size, workspace)?;
 
         // 4. Apply gradient clipping if requested
@@ -2133,6 +2174,29 @@ impl GpuNetwork {
             .write_buffer(buffer, 0, bytemuck::cast_slice(data));
     }
 
+    fn validate_training_tape(
+        &self,
+        batch_size: usize,
+        workspace: &GpuWorkspace,
+    ) -> ArkanResult<()> {
+        if workspace.training_batch != Some(batch_size)
+            || workspace.z_values.len() != self.layers.len()
+            || workspace.span_indices.len() != self.layers.len()
+            || self.layers.iter().enumerate().any(|(i, layer)| {
+                let z = &workspace.z_values[i];
+                z.shape.len() != 2
+                    || z.shape[1] != layer.in_dim
+                    || z.shape[0] < batch_size
+                    || workspace.span_indices[i].size() < z.size_bytes()
+            })
+        {
+            return Err(ArkanError::validation(
+                "backward requires a matching saved training forward batch",
+            ));
+        }
+        Ok(())
+    }
+
     /// Performs backward pass, keeping gradients on GPU (no download).
     ///
     /// This is an internal method used by native GPU training.
@@ -2142,8 +2206,12 @@ impl GpuNetwork {
         batch_size: usize,
         workspace: &mut GpuWorkspace,
     ) -> ArkanResult<()> {
+        self.validate_training_tape(batch_size, workspace)?;
+
         // Validate
-        let expected_len = batch_size * self.output_dim;
+        let expected_len = batch_size
+            .checked_mul(self.output_dim)
+            .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
         if grad_output.len() != expected_len {
             return Err(ArkanError::shape_mismatch(
                 &[batch_size, self.output_dim],
@@ -2158,13 +2226,7 @@ impl GpuNetwork {
             .map(|l| (l.in_dim, l.out_dim, l.basis_padded))
             .collect();
         workspace.prepare_grad_buffers(&self.device, &layer_specs)?;
-
-        // Ensure std_inv is set
-        if workspace.std_inv.len() != self.layers.len() {
-            let default_std_inv: Vec<Vec<f32>> =
-                self.layers.iter().map(|l| vec![1.0f32; l.in_dim]).collect();
-            workspace.set_std_inv(&self.device, &self.queue, &default_std_inv)?;
-        }
+        workspace.zero_bias_grad_buffers(&self.device, &self.queue);
 
         // Upload grad_output to GPU
         workspace.upload_grad_output(&self.queue, grad_output)?;

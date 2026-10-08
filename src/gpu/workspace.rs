@@ -55,6 +55,7 @@ pub struct GpuWorkspace {
     pub intermediates: Vec<GpuTensor>,
 
     // === Training buffers ===
+    pub(crate) training_batch: Option<usize>,
     /// Saved normalized inputs per layer [layer][batch * in_dim].
     pub z_values: Vec<GpuTensor>,
     /// Saved span indices per layer [layer][batch * in_dim].
@@ -63,7 +64,8 @@ pub struct GpuWorkspace {
     pub grad_output: Option<GpuTensor>,
     /// Gradient w.r.t. input (for layer backprop) [batch, max_dim].
     pub grad_input: Option<GpuTensor>,
-    /// 1/std for each input dimension `(in_dim,)` per layer.
+    /// Optional inverse-std storage for direct kernel users. `GpuNetwork` backward
+    /// uses the CPU-derived normalization owned by each `GpuLayer`.
     pub std_inv: Vec<GpuTensor>,
 
     /// Gradient of weights per layer `(layer, out_dim * in_dim * basis_padded)`.
@@ -147,28 +149,27 @@ impl GpuWorkspace {
         out_dim: usize,
         max_vram_alloc: u64,
     ) -> ArkanResult<Self> {
-        let input_size = max_batch * in_dim;
-        let output_size = max_batch * out_dim;
+        GpuTensor::allocation_bytes(device, &[max_batch, in_dim], Some(max_vram_alloc))?;
+        GpuTensor::allocation_bytes(device, &[max_batch, out_dim], Some(max_vram_alloc))?;
 
-        // Check VRAM limits
-        let input_bytes = (input_size * std::mem::size_of::<f32>()) as u64;
-        let output_bytes = (output_size * std::mem::size_of::<f32>()) as u64;
-
-        if input_bytes > max_vram_alloc || output_bytes > max_vram_alloc {
-            return Err(ArkanError::batch_too_large(
-                max_batch,
-                (max_vram_alloc / (in_dim.max(out_dim) * std::mem::size_of::<f32>()) as u64)
-                    as usize,
-            ));
-        }
-
-        let input = GpuTensor::storage_read_write(device, vec![max_batch, in_dim])?;
-        let output = GpuTensor::storage_read_write(device, vec![max_batch, out_dim])?;
+        let input = GpuTensor::uninit_with_limit(
+            device,
+            vec![max_batch, in_dim],
+            wgpu::BufferUsages::empty(),
+            Some(max_vram_alloc),
+        )?;
+        let output = GpuTensor::uninit_with_limit(
+            device,
+            vec![max_batch, out_dim],
+            wgpu::BufferUsages::empty(),
+            Some(max_vram_alloc),
+        )?;
 
         Ok(Self {
             input: Some(input),
             output: Some(output),
             intermediates: Vec::new(),
+            training_batch: None,
             z_values: Vec::new(),
             span_indices: Vec::new(),
             grad_output: None,
@@ -200,6 +201,7 @@ impl GpuWorkspace {
             input: None,
             output: None,
             intermediates: Vec::new(),
+            training_batch: None,
             z_values: Vec::new(),
             span_indices: Vec::new(),
             grad_output: None,
@@ -237,32 +239,32 @@ impl GpuWorkspace {
         }
 
         // Calculate new capacity with some headroom (1.5x requested)
-        let new_capacity = (batch_size * 3 / 2).max(batch_size);
-
-        let input_size = new_capacity * self.in_dim;
-        let output_size = new_capacity * self.out_dim;
-
-        // Check VRAM limits using configured max
-        let input_bytes = (input_size * std::mem::size_of::<f32>()) as u64;
-        let output_bytes = (output_size * std::mem::size_of::<f32>()) as u64;
-
-        if input_bytes > self.max_vram_alloc || output_bytes > self.max_vram_alloc {
-            return Err(ArkanError::batch_too_large(
-                batch_size,
-                (self.max_vram_alloc
-                    / (self.in_dim.max(self.out_dim) * std::mem::size_of::<f32>()) as u64)
-                    as usize,
-            ));
-        }
+        let new_capacity = batch_size
+            .checked_add(batch_size / 2)
+            .ok_or_else(|| ArkanError::buffer("GPU batch capacity overflow"))?;
+        GpuTensor::allocation_bytes(
+            device,
+            &[new_capacity, self.in_dim],
+            Some(self.max_vram_alloc),
+        )?;
+        GpuTensor::allocation_bytes(
+            device,
+            &[new_capacity, self.out_dim],
+            Some(self.max_vram_alloc),
+        )?;
 
         // Allocate new buffers
-        self.input = Some(GpuTensor::storage_read_write(
+        self.input = Some(GpuTensor::uninit_with_limit(
             device,
             vec![new_capacity, self.in_dim],
+            wgpu::BufferUsages::empty(),
+            Some(self.max_vram_alloc),
         )?);
-        self.output = Some(GpuTensor::storage_read_write(
+        self.output = Some(GpuTensor::uninit_with_limit(
             device,
             vec![new_capacity, self.out_dim],
+            wgpu::BufferUsages::empty(),
+            Some(self.max_vram_alloc),
         )?);
 
         self.max_batch = new_capacity;
@@ -287,20 +289,28 @@ impl GpuWorkspace {
         batch_size: usize,
     ) -> ArkanResult<()> {
         // Need n-1 intermediate buffers for n layers
-        let needed = layer_dims.len().saturating_sub(1);
+        let needed = layer_dims.len().saturating_sub(2);
 
         // Check if we need to resize existing intermediates
-        let needs_resize = self.intermediates.len() < needed
+        let needs_resize = self.intermediates.len() != needed
             || self.intermediates.iter().enumerate().any(|(i, t)| {
                 i < needed && (t.shape[0] < batch_size || t.shape[1] != layer_dims[i + 1])
             });
 
         if needs_resize {
+            for &dim in layer_dims.iter().skip(1).take(needed) {
+                GpuTensor::allocation_bytes(device, &[batch_size, dim], Some(self.max_vram_alloc))?;
+            }
             self.intermediates.clear();
 
             for i in 0..needed {
                 let dim = layer_dims[i + 1]; // Output dim of layer i
-                let tensor = GpuTensor::storage_read_write(device, vec![batch_size, dim])?;
+                let tensor = GpuTensor::uninit_with_limit(
+                    device,
+                    vec![batch_size, dim],
+                    wgpu::BufferUsages::empty(),
+                    Some(self.max_vram_alloc),
+                )?;
                 self.intermediates.push(tensor);
             }
 
@@ -331,24 +341,42 @@ impl GpuWorkspace {
         layer_dims: &[usize],
         batch_size: usize,
     ) -> ArkanResult<()> {
+        self.training_batch = None;
         let num_layers = layer_dims.len().saturating_sub(1);
+        for &dim in layer_dims {
+            GpuTensor::allocation_bytes(device, &[batch_size, dim], Some(self.max_vram_alloc))?;
+        }
 
         // Allocate z_values and span_indices for each layer
-        if self.z_values.len() != num_layers {
+        if self.z_values.len() != num_layers
+            || self.span_indices.len() != num_layers
+            || self
+                .z_values
+                .iter()
+                .zip(layer_dims)
+                .any(|(z, &dim)| z.shape[0] < batch_size || z.shape[1] != dim)
+        {
             self.z_values.clear();
             self.span_indices.clear();
 
             for (i, &in_dim) in layer_dims.iter().take(num_layers).enumerate() {
-                let size = batch_size * in_dim;
-
                 // z_values: normalized inputs
-                let z = GpuTensor::storage_read_write(device, vec![batch_size, in_dim])?;
+                let z = GpuTensor::uninit_with_limit(
+                    device,
+                    vec![batch_size, in_dim],
+                    wgpu::BufferUsages::empty(),
+                    Some(self.max_vram_alloc),
+                )?;
                 self.z_values.push(z);
 
                 // span_indices: u32 indices
                 let span_buf = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(&format!("SpanIndices layer {}", i)),
-                    size: (size * std::mem::size_of::<u32>()) as u64,
+                    size: GpuTensor::allocation_bytes(
+                        device,
+                        &[batch_size, in_dim],
+                        Some(self.max_vram_alloc),
+                    )?,
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
@@ -370,9 +398,11 @@ impl GpuWorkspace {
             .as_ref()
             .is_none_or(|g| g.shape[0] < batch_size || g.shape[1] < max_dim);
         if needs_grad_output_realloc {
-            self.grad_output = Some(GpuTensor::storage_read_write(
+            self.grad_output = Some(GpuTensor::uninit_with_limit(
                 device,
                 vec![batch_size, max_dim],
+                wgpu::BufferUsages::empty(),
+                Some(self.max_vram_alloc),
             )?);
             self.invalidate_cache();
         }
@@ -381,11 +411,13 @@ impl GpuWorkspace {
         let needs_grad_input_realloc = self
             .grad_input
             .as_ref()
-            .is_none_or(|g| g.shape[0] < batch_size);
+            .is_none_or(|g| g.shape[0] < batch_size || g.shape[1] < max_dim);
         if needs_grad_input_realloc {
-            self.grad_input = Some(GpuTensor::storage_read_write(
+            self.grad_input = Some(GpuTensor::uninit_with_limit(
                 device,
                 vec![batch_size, max_dim],
+                wgpu::BufferUsages::empty(),
+                Some(self.max_vram_alloc),
             )?);
             self.invalidate_cache();
         }
@@ -405,14 +437,28 @@ impl GpuWorkspace {
         layer_specs: &[(usize, usize, usize)],
     ) -> ArkanResult<()> {
         let num_layers = layer_specs.len();
+        for &(input, output, basis) in layer_specs {
+            GpuTensor::allocation_bytes(
+                device,
+                &[output, input, basis],
+                Some(self.max_vram_alloc),
+            )?;
+            GpuTensor::allocation_bytes(device, &[output], Some(self.max_vram_alloc))?;
+        }
 
         // Check if we need to reallocate
-        let needs_realloc = self.grad_weights.len() != num_layers
+        let needs_realloc = self.grad_bias.len() != num_layers
+            || self
+                .grad_bias
+                .iter()
+                .zip(layer_specs)
+                .any(|(gb, &(_, out, _))| gb.num_elements() != out)
+            || self.grad_weights.len() != num_layers
             || self
                 .grad_weights
                 .iter()
                 .zip(layer_specs.iter())
-                .any(|(gw, &(in_d, out_d, basis))| gw.num_elements() < out_d * in_d * basis);
+                .any(|(gw, &(in_d, out_d, basis))| gw.num_elements() != out_d * in_d * basis);
 
         if needs_realloc {
             self.grad_weights.clear();
@@ -420,10 +466,20 @@ impl GpuWorkspace {
 
             for &(in_dim, out_dim, basis_padded) in layer_specs.iter() {
                 let weight_size = out_dim * in_dim * basis_padded;
-                let gw = GpuTensor::storage_read_write(device, vec![weight_size])?;
+                let gw = GpuTensor::uninit_with_limit(
+                    device,
+                    vec![weight_size],
+                    wgpu::BufferUsages::empty(),
+                    Some(self.max_vram_alloc),
+                )?;
                 self.grad_weights.push(gw);
 
-                let gb = GpuTensor::storage_read_write(device, vec![out_dim])?;
+                let gb = GpuTensor::uninit_with_limit(
+                    device,
+                    vec![out_dim],
+                    wgpu::BufferUsages::empty(),
+                    Some(self.max_vram_alloc),
+                )?;
                 self.grad_bias.push(gb);
             }
 
@@ -443,6 +499,17 @@ impl GpuWorkspace {
             let zeros = vec![0.0f32; gb.num_elements()];
             gb.update(queue, &zeros);
         }
+    }
+
+    /// Weight backward completely writes the validated extent; bias backward accumulates.
+    pub(crate) fn zero_bias_grad_buffers(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Clear bias gradients"),
+        });
+        for gb in &self.grad_bias {
+            encoder.clear_buffer(&gb.buffer, 0, None);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
     }
 
     /// Returns references to gradient buffers for GPU optimizer.
@@ -498,10 +565,18 @@ impl GpuWorkspace {
         _queue: &wgpu::Queue,
         layer_std_inv: &[Vec<f32>],
     ) -> ArkanResult<()> {
+        for values in layer_std_inv {
+            GpuTensor::allocation_bytes(device, &[values.len()], Some(self.max_vram_alloc))?;
+        }
         self.std_inv.clear();
 
         for std_inv_vals in layer_std_inv {
-            let tensor = GpuTensor::storage_read(device, std_inv_vals, vec![std_inv_vals.len()])?;
+            let tensor = GpuTensor::upload_with_limit(
+                device,
+                std_inv_vals,
+                vec![std_inv_vals.len()],
+                Some(self.max_vram_alloc),
+            )?;
             self.std_inv.push(tensor);
         }
 
