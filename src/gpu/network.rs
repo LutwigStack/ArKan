@@ -52,6 +52,39 @@ fn unpad_weights(
     result
 }
 
+// Adam and SGD leave parameters/state untouched on Err; only the extra decay needs rollback.
+fn step_cpu_with_decay(
+    optimizer: &mut impl Optimizer,
+    cpu_network: &mut KanNetwork,
+    grad_weights: &[Vec<f32>],
+    grad_biases: &[Vec<f32>],
+    opts: &TrainOptions,
+) -> ArkanResult<()> {
+    let original_weights = if opts.weight_decay > 0.0 {
+        let mut parameters = cpu_network.try_parameters_mut()?;
+        let original: Vec<Vec<f32>> = parameters.iter().map(|(w, _)| w.to_vec()).collect();
+        let factor = 1.0 - optimizer.get_lr(0)? as f32 * opts.weight_decay;
+        for layer in parameters.iter_mut() {
+            for weight in layer.weights {
+                *weight *= factor;
+            }
+        }
+        Some(original)
+    } else {
+        None
+    };
+
+    if let Err(error) = optimizer.step(cpu_network, grad_weights, grad_biases, opts.max_grad_norm) {
+        if let Some(original) = original_weights {
+            for (layer, weights) in cpu_network.try_parameters_mut()?.iter_mut().zip(original) {
+                layer.weights.copy_from_slice(&weights);
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Handle for asynchronous GPU forward pass result.
 ///
 /// Created by [`GpuNetwork::forward_batch_async`]. This handle allows you to
@@ -1025,10 +1058,7 @@ impl GpuNetwork {
     /// Syncs weights, biases and per-feature normalization from CPU to GPU.
     /// The layer topology and grid must match the original GPU conversion.
     pub fn sync_weights(&mut self, cpu_network: &KanNetwork) -> ArkanResult<()> {
-        self.validate_cpu_sync_layout(cpu_network)?;
-        for layer in &cpu_network.layers {
-            GpuLayer::validate_normalization(layer)?;
-        }
+        self.validate_cpu_upload(cpu_network)?;
 
         for (gpu_layer, cpu_layer) in self.layers.iter_mut().zip(&cpu_network.layers) {
             gpu_layer.update_weights(&self.queue, cpu_layer);
@@ -1036,6 +1066,14 @@ impl GpuNetwork {
             gpu_layer.update_normalization(&self.queue, cpu_layer);
         }
 
+        Ok(())
+    }
+
+    fn validate_cpu_upload(&self, cpu_network: &KanNetwork) -> ArkanResult<()> {
+        self.validate_cpu_sync_layout(cpu_network)?;
+        for layer in &cpu_network.layers {
+            GpuLayer::validate_normalization(layer)?;
+        }
         Ok(())
     }
 
@@ -1672,6 +1710,8 @@ impl GpuNetwork {
         optimizer: &mut Adam,
         cpu_network: &mut KanNetwork,
     ) -> ArkanResult<f32> {
+        self.validate_workspace(workspace)?;
+        self.validate_cpu_upload(cpu_network)?;
         // Validate target shape
         let expected_target_len = batch_size
             .checked_mul(self.output_dim)
@@ -1742,6 +1782,8 @@ impl GpuNetwork {
         opts: &TrainOptions,
     ) -> ArkanResult<f32> {
         opts.validate()?;
+        self.validate_workspace(workspace)?;
+        self.validate_cpu_upload(cpu_network)?;
         // Validate target shape
         let expected_target_len = batch_size
             .checked_mul(self.output_dim)
@@ -1770,18 +1812,8 @@ impl GpuNetwork {
             &mut grad_biases,
         )?;
 
-        // 4. Apply weight decay if specified (AdamW-style decoupled decay)
-        if opts.weight_decay > 0.0 {
-            let lr = optimizer.config.lr;
-            for layer in cpu_network.try_parameters_mut()?.iter_mut() {
-                for w in layer.weights {
-                    *w *= 1.0 - lr * opts.weight_decay;
-                }
-            }
-        }
-
-        // 5. Optimizer step on CPU network with gradient clipping
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, opts.max_grad_norm)?;
+        // 4–5. Preserve additional decay only when the optimizer step succeeds.
+        step_cpu_with_decay(optimizer, cpu_network, &grad_weights, &grad_biases, opts)?;
 
         // 6. Sync weights from CPU to GPU
         self.sync_weights(cpu_network)?;
@@ -1814,6 +1846,8 @@ impl GpuNetwork {
         optimizer: &mut SGD,
         cpu_network: &mut KanNetwork,
     ) -> ArkanResult<f32> {
+        self.validate_workspace(workspace)?;
+        self.validate_cpu_upload(cpu_network)?;
         // Validate target shape
         let expected_target_len = batch_size
             .checked_mul(self.output_dim)
@@ -1880,6 +1914,8 @@ impl GpuNetwork {
         opts: &TrainOptions,
     ) -> ArkanResult<f32> {
         opts.validate()?;
+        self.validate_workspace(workspace)?;
+        self.validate_cpu_upload(cpu_network)?;
         // Validate target shape
         let expected_target_len = batch_size
             .checked_mul(self.output_dim)
@@ -1908,18 +1944,8 @@ impl GpuNetwork {
             &mut grad_biases,
         )?;
 
-        // 4. Apply weight decay override if specified in opts
-        if opts.weight_decay > 0.0 {
-            let lr = optimizer.lr();
-            for layer in cpu_network.try_parameters_mut()?.iter_mut() {
-                for w in layer.weights {
-                    *w *= 1.0 - lr * opts.weight_decay;
-                }
-            }
-        }
-
-        // 5. Optimizer step on CPU network with gradient clipping
-        optimizer.step(cpu_network, &grad_weights, &grad_biases, opts.max_grad_norm)?;
+        // 4–5. Preserve additional decay only when the optimizer step succeeds.
+        step_cpu_with_decay(optimizer, cpu_network, &grad_weights, &grad_biases, opts)?;
 
         // 6. Sync weights from CPU to GPU
         self.sync_weights(cpu_network)?;
@@ -2015,6 +2041,7 @@ impl GpuNetwork {
         workspace: &mut GpuWorkspace,
         optimizer: &mut GpuAdam,
     ) -> ArkanResult<f32> {
+        self.validate_workspace(workspace)?;
         // Validate target shape
         let expected_target_len = batch_size
             .checked_mul(self.output_dim)
@@ -2054,6 +2081,7 @@ impl GpuNetwork {
         workspace: &mut GpuWorkspace,
         optimizer: &mut GpuSgd,
     ) -> ArkanResult<f32> {
+        self.validate_workspace(workspace)?;
         // Validate target shape
         let expected_target_len = batch_size
             .checked_mul(self.output_dim)
@@ -2116,6 +2144,7 @@ impl GpuNetwork {
         options: &TrainOptions,
     ) -> ArkanResult<f32> {
         options.validate()?;
+        self.validate_workspace(workspace)?;
         // Validate target shape
         let expected_target_len = batch_size
             .checked_mul(self.output_dim)
