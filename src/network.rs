@@ -54,11 +54,11 @@ use crate::buffer::{checked_buffer_size, Workspace};
 use crate::config::KanConfig;
 use crate::error::{ArkanError, ArkanResult};
 use crate::layer::KanLayer;
-use crate::optimizer::Optimizer;
+use crate::optimizer::{global_clip_scale, global_grad_norm, Optimizer};
 use crate::spline::SPAN_CLAMPED_FLAG;
 
 #[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Magic bytes for serialized network files.
 ///
@@ -88,7 +88,7 @@ const SERIALIZATION_VERSION: u32 = 1;
 ///
 /// The network is `Send + Sync` (when `serde` feature is off). Multiple threads
 /// can perform inference on the same network with separate workspaces.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct KanNetwork {
     /// Network configuration.
     pub config: KanConfig,
@@ -104,6 +104,45 @@ pub struct KanNetwork {
 
     /// Default training options (gradient clipping, weight decay).
     pub default_train_options: TrainOptions,
+}
+
+// Retain the version-1 field order, but rebuild runtime caches at the boundary.
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for KanNetwork {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct NetworkData {
+            config: KanConfig,
+            layers: Vec<KanLayer>,
+            layer_dims: Vec<usize>,
+            layer_param_sizes: Vec<(usize, usize)>,
+            default_train_options: TrainOptions,
+        }
+        let data = NetworkData::deserialize(deserializer)?;
+        data.config.validate().map_err(serde::de::Error::custom)?;
+        // Serialized caches are advisory; valid topology is the source of truth.
+        data.default_train_options
+            .validate()
+            .map_err(serde::de::Error::custom)?;
+        let _ = (data.layer_dims, data.layer_param_sizes);
+        let layer_dims = data.config.layer_dims();
+        let layer_param_sizes = data
+            .layers
+            .iter()
+            .map(|layer| (layer.weights.len(), layer.bias.len()))
+            .collect();
+        let network = Self {
+            config: data.config,
+            layers: data.layers,
+            layer_dims,
+            layer_param_sizes,
+            default_train_options: data.default_train_options,
+        };
+        network
+            .validate_layout()
+            .map_err(serde::de::Error::custom)?;
+        Ok(network)
+    }
 }
 
 /// Training options for a single step.
@@ -138,6 +177,20 @@ pub struct TrainOptions {
     pub weight_decay: f32,
 }
 
+impl TrainOptions {
+    fn validate(&self) -> ArkanResult<()> {
+        if self
+            .max_grad_norm
+            .is_some_and(|norm| !norm.is_finite() || norm <= 0.0)
+            || !self.weight_decay.is_finite()
+            || self.weight_decay < 0.0
+        {
+            return Err(ArkanError::cpu("Invalid training options"));
+        }
+        Ok(())
+    }
+}
+
 impl Default for TrainOptions {
     fn default() -> Self {
         Self {
@@ -148,6 +201,41 @@ impl Default for TrainOptions {
 }
 
 impl KanNetwork {
+    /// Checks public structural fields against the layout used by execution.
+    /// Parameter values are deliberately checked only at import, not in hot calls.
+    fn validate_layout(&self) -> ArkanResult<()> {
+        self.config.validate()?;
+        if self.layers.len() != self.config.hidden_dims.len() + 1
+            || self.layer_dims.len() != self.layers.len() + 1
+            || self.layer_param_sizes.len() != self.layers.len()
+            || self.layer_dims.first() != Some(&self.config.input_dim)
+            || self.layer_dims.last() != Some(&self.config.output_dim)
+            || self.layer_dims[1..self.layer_dims.len() - 1] != self.config.hidden_dims
+        {
+            return Err(ArkanError::cpu(
+                "Network topology no longer matches its layout",
+            ));
+        }
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.validate_layout()?;
+            if layer.in_dim != self.layer_dims[index]
+                || layer.out_dim != self.layer_dims[index + 1]
+                || layer.grid_size != self.config.grid_size
+                || layer.order != self.config.spline_order
+                || layer.grid_range != self.config.grid_range
+                || layer.basis_aligned
+                    != (layer.local_basis_size.div_ceil(self.config.simd_width)
+                        * self.config.simd_width)
+                || (layer.weights.len(), layer.bias.len()) != self.layer_param_sizes[index]
+            {
+                return Err(ArkanError::cpu(
+                    "Layer topology no longer matches its network",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Creates a new KAN network from configuration.
     ///
     /// Initializes all layers with random weights using Xavier initialization.
@@ -299,6 +387,7 @@ impl KanNetwork {
         output: &mut [f32],
         workspace: &mut Workspace,
     ) -> ArkanResult<()> {
+        self.validate_layout()?;
         if input.len() != self.config.input_dim {
             return Err(ArkanError::shape_mismatch(
                 &[self.config.input_dim],
@@ -310,10 +399,6 @@ impl KanNetwork {
                 &[self.config.output_dim],
                 &[output.len()],
             ));
-        }
-
-        if self.layers.is_empty() {
-            return Ok(());
         }
 
         // Reserve workspace for batch_size=1
@@ -504,6 +589,7 @@ impl KanNetwork {
         output: &mut [f32],
         workspace: &mut Workspace,
     ) -> ArkanResult<()> {
+        self.validate_layout()?;
         let batch_size = input.len() / self.config.input_dim;
 
         // Validate input length
@@ -524,7 +610,7 @@ impl KanNetwork {
             ));
         }
 
-        if self.layers.is_empty() {
+        if batch_size == 0 {
             return Ok(());
         }
 
@@ -639,6 +725,7 @@ impl KanNetwork {
     /// ```
     #[cfg(feature = "parallel")]
     pub fn forward_batch_parallel(&self, input: &[f32], output: &mut [f32]) {
+        self.validate_layout().expect("Invalid network layout");
         use rayon::prelude::*;
         use std::cell::RefCell;
 
@@ -781,6 +868,7 @@ impl KanNetwork {
         output: &mut [f32],
         workspace: &mut Workspace,
     ) -> ArkanResult<()> {
+        self.validate_layout()?;
         let batch_size = input.len() / self.config.input_dim;
 
         let expected_input_len = checked_buffer_size(batch_size, self.config.input_dim)?;
@@ -799,7 +887,9 @@ impl KanNetwork {
             ));
         }
 
-        if self.layers.is_empty() {
+        if batch_size == 0 {
+            // Clear recorded history as well as accepting the empty output shape.
+            workspace.try_prepare_training(0, &self.config, &self.layer_dims)?;
             return Ok(());
         }
 
@@ -1033,7 +1123,16 @@ impl KanNetwork {
         workspace: &mut Workspace,
         opts: &TrainOptions,
     ) -> ArkanResult<f32> {
+        if !learning_rate.is_finite() || learning_rate < 0.0 {
+            return Err(ArkanError::cpu(
+                "Learning rate must be finite and nonnegative",
+            ));
+        }
         let loss = self.try_forward_backward_mse(input, target, mask, workspace, opts)?;
+
+        if input.is_empty() {
+            return Ok(loss);
+        }
 
         // =====================================================================
         // Parameter update: decoupled weight decay + SGD
@@ -1133,7 +1232,9 @@ impl KanNetwork {
     ) -> ArkanResult<f32> {
         let loss = self.try_forward_backward_mse(input, target, mask, workspace, opts)?;
         // Clipping was already applied in-place by the helper; pass None to avoid double-clip.
-        optimizer.step(self, &workspace.weight_grads, &workspace.bias_grads, None)?;
+        if !input.is_empty() {
+            optimizer.step(self, &workspace.weight_grads, &workspace.bias_grads, None)?;
+        }
         Ok(loss)
     }
 
@@ -1150,6 +1251,8 @@ impl KanNetwork {
         workspace: &mut Workspace,
         opts: &TrainOptions,
     ) -> ArkanResult<f32> {
+        self.validate_layout()?;
+        opts.validate()?;
         let batch_size = input.len() / self.config.input_dim;
         let output_dim = self.config.output_dim;
 
@@ -1181,6 +1284,13 @@ impl KanNetwork {
             }
         }
 
+        if batch_size == 0 {
+            workspace.try_prepare_grad_buffers(&self.layer_param_sizes)?;
+            workspace.zero_grads();
+            workspace.try_prepare_training(0, &self.config, &self.layer_dims)?;
+            return Ok(0.0);
+        }
+
         // Ensure workspace has gradient buffers for all layers
         workspace.try_prepare_grad_buffers(&self.layer_param_sizes)?;
 
@@ -1188,12 +1298,17 @@ impl KanNetwork {
         let pred_size = checked_buffer_size(batch_size, output_dim)?;
         workspace.predictions_buffer.try_resize(pred_size)?;
 
-        // Take predictions buffer to avoid borrow conflict
+        workspace.grad_output.try_resize(pred_size)?;
+        // Take predictions buffer to avoid borrow conflict, restoring it on failure.
         let mut predictions_buf = std::mem::take(&mut workspace.predictions_buffer);
-        self.try_forward_batch_training(input, predictions_buf.as_mut_slice(), workspace)?;
+        if let Err(error) =
+            self.try_forward_batch_training(input, predictions_buf.as_mut_slice(), workspace)
+        {
+            workspace.predictions_buffer = predictions_buf;
+            return Err(error);
+        }
 
         // Compute loss and output gradient into workspace buffer
-        workspace.grad_output.try_resize(pred_size)?;
         let loss = compute_masked_mse_loss_into(
             predictions_buf.as_slice(),
             target,
@@ -1229,7 +1344,6 @@ impl KanNetwork {
         //   4. Copy layer_grads → staging_buffer for next iteration
         // =====================================================================
         let num_layers = self.layers.len();
-        let mut total_sq_norm: f32 = 0.0;
 
         // Zero out gradient buffers before accumulating
         for i in 0..num_layers {
@@ -1297,7 +1411,7 @@ impl KanNetwork {
             if use_parallel {
                 // Parallel backward: uses thread-local gradient accumulation
                 #[cfg(feature = "parallel")]
-                layer.backward_parallel(
+                layer.backward_parallel_with_scratch(
                     layer_input_buf.as_slice(),
                     &layer_grid_buf,
                     grad_out_slice,
@@ -1306,6 +1420,7 @@ impl KanNetwork {
                         .map(|b| &mut b.as_mut_slice()[..layer_in_size]),
                     &mut weight_grad,
                     &mut bias_grad,
+                    &mut workspace.parallel_backward_scratch,
                 );
             } else {
                 // Sequential backward: uses workspace basis buffers
@@ -1326,10 +1441,6 @@ impl KanNetwork {
             workspace.layers_inputs[layer_idx] = layer_input_buf;
             workspace.layers_grid_indices[layer_idx] = layer_grid_buf;
 
-            // Накопить норму по параметрам для глобального клиппинга
-            total_sq_norm += weight_grad.iter().map(|g| g * g).sum::<f32>();
-            total_sq_norm += bias_grad.iter().map(|g| g * g).sum::<f32>();
-
             // Return gradient buffers
             workspace.weight_grads[layer_idx] = weight_grad;
             workspace.bias_grads[layer_idx] = bias_grad;
@@ -1349,21 +1460,16 @@ impl KanNetwork {
             }
         }
 
-        // Глобальный клиппинг по всем параметрам, если задан
-        if let Some(max_norm) = opts.max_grad_norm {
-            let norm = total_sq_norm.sqrt();
-            if norm > max_norm && norm > 0.0 {
-                let scale = max_norm / norm;
-                for wg in workspace.weight_grads.iter_mut() {
-                    for g in wg.iter_mut() {
-                        *g *= scale;
-                    }
-                }
-                for bg in workspace.bias_grads.iter_mut() {
-                    for g in bg.iter_mut() {
-                        *g *= scale;
-                    }
-                }
+        let norm = global_grad_norm(&workspace.weight_grads, &workspace.bias_grads);
+        let scale = global_clip_scale(norm, opts.max_grad_norm);
+        if scale != 1.0 {
+            for gradient in workspace
+                .weight_grads
+                .iter_mut()
+                .chain(&mut workspace.bias_grads)
+                .flatten()
+            {
+                *gradient = ((*gradient as f64) * scale) as f32;
             }
         }
 
@@ -1395,6 +1501,7 @@ impl KanNetwork {
     /// ```
     #[must_use = "this returns a Result that should be handled"]
     pub fn try_create_workspace(&self, max_batch: usize) -> ArkanResult<Workspace> {
+        self.validate_layout()?;
         let mut ws = Workspace::new(&self.config);
         ws.try_reserve(max_batch, &self.config)?;
         Ok(ws)
