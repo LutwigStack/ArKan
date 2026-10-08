@@ -30,7 +30,8 @@
 //!
 //! # Gradient Clipping
 //!
-//! All optimizers support gradient clipping via `max_grad_norm` parameter.
+//! First-order optimizers support one global gradient norm threshold via `max_grad_norm`,
+//! across all weight and bias tensors after AMP unscaling.
 //! This helps prevent exploding gradients during training.
 //!
 //! # Weight Decay
@@ -92,7 +93,7 @@ pub trait Optimizer: Send + Sync {
     /// * `network` - Mutable reference to the network being optimized
     /// * `weight_grads` - Weight gradients per layer
     /// * `bias_grads` - Bias gradients per layer
-    /// * `max_grad_norm` - Optional gradient clipping threshold
+    /// * `max_grad_norm` - Optional global norm threshold over all unscaled tensors
     ///
     /// # Returns
     ///
@@ -149,7 +150,8 @@ pub trait Optimizer: Send + Sync {
     /// Bumps the state version and resets optimizer state.
     ///
     /// Call this after Grid Extension or any topology change.
-    /// This clears all momentum/history buffers.
+    /// This clears all momentum/history buffers but does not resize tensor state.
+    /// After a topology shape change, Adam and SGD also require `reinitialize(network)`.
     fn bump_version(&mut self);
 
     /// Gets the learning rate for a parameter group.
@@ -271,8 +273,8 @@ pub struct SafetyConfig {
     /// If Some, gradients are divided by this factor before updates.
     pub grad_scaling_factor: Option<f64>,
 
-    /// If true, unscales gradients before applying weight decay.
-    /// Only relevant when `grad_scaling_factor` is set.
+    /// Compatibility field retained for checkpoints. Gradients are always unscaled
+    /// before clipping and updates; decoupled weight decay acts on parameters.
     pub unscale_before_step: bool,
 }
 
@@ -318,45 +320,126 @@ fn find_nan_in_grads(grads: &[f32]) -> Option<usize> {
     grads.iter().position(|&g| !g.is_finite())
 }
 
-/// Applies gradient scaling for AMP.
-///
-/// Returns scaled gradients if scaling factor is set, otherwise clones input.
-/// Returns `Cow::Borrowed` when no scaling is configured, so the common path copies
-/// nothing. Previously this returned `Vec` unconditionally, and `None => grads.to_vec()`
-/// meant a full clone of every gradient tensor on every step for the default config.
-fn apply_grad_scaling(grads: &[f32], scaling_factor: Option<f64>) -> Cow<'_, [f32]> {
-    match scaling_factor {
-        Some(factor) => {
-            let inv_factor = 1.0 / factor as f32;
-            Cow::Owned(grads.iter().map(|&g| g * inv_factor).collect())
-        }
-        None => Cow::Borrowed(grads),
+/// Euclidean norm across all gradient tensors, with squares accumulated in f64.
+pub(crate) fn global_grad_norm(weight_grads: &[Vec<f32>], bias_grads: &[Vec<f32>]) -> f64 {
+    weight_grads
+        .iter()
+        .chain(bias_grads)
+        .flatten()
+        .map(|&g| (g as f64).powi(2))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// Multiply gradients in f64 before casting back, so tiny scales do not underflow.
+pub(crate) fn global_clip_scale(norm: f64, max_norm: Option<f32>) -> f64 {
+    match max_norm {
+        Some(max) if norm > max as f64 && norm > 0.0 => max as f64 / norm,
+        _ => 1.0,
     }
 }
 
-/// Applies gradient clipping and returns clipped gradients.
-/// Borrows when no clipping applies — which includes the whole
-/// `train_step_with_optimizer` path, where clipping has already been done in place and
-/// `None` is passed to avoid double-clipping. Returning `Vec` there meant copying every
-/// gradient tensor twice per layer per step for nothing.
-fn clip_gradients<'a>(
-    weight_grads: &'a [f32],
-    bias_grads: &'a [f32],
-    max_norm: Option<f32>,
-) -> (Cow<'a, [f32]>, Cow<'a, [f32]>) {
-    if let Some(max_norm) = max_norm {
-        let mut sq: f32 = weight_grads.iter().map(|g| g * g).sum();
-        sq += bias_grads.iter().map(|g| g * g).sum::<f32>();
-        let norm = sq.sqrt();
+fn validate_nonnegative(value: f64, name: &str) -> ArkanResult<()> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(ArkanError::optimizer(format!(
+            "{name} must be finite and nonnegative"
+        )));
+    }
+    Ok(())
+}
 
-        if norm > max_norm && norm > 0.0 {
-            let scale = max_norm / norm;
-            let wg: Vec<f32> = weight_grads.iter().map(|g| g * scale).collect();
-            let bg: Vec<f32> = bias_grads.iter().map(|g| g * scale).collect();
-            return (Cow::Owned(wg), Cow::Owned(bg));
+fn validate_safety(safety: &SafetyConfig, max_norm: Option<f32>) -> ArkanResult<()> {
+    if let Some(factor) = safety.grad_scaling_factor {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err(ArkanError::optimizer(
+                "gradient scaling factor must be finite and positive",
+            ));
         }
     }
-    (Cow::Borrowed(weight_grads), Cow::Borrowed(bias_grads))
+    if let Some(max) = max_norm {
+        validate_nonnegative(max as f64, "max_grad_norm")?;
+    }
+    Ok(())
+}
+
+fn validate_shape(expected: usize, actual: usize) -> ArkanResult<()> {
+    if expected != actual {
+        return Err(ArkanError::tensor_shape_mismatch(&[expected], &[actual]));
+    }
+    Ok(())
+}
+
+fn validate_grad_shapes(
+    network: &KanNetwork,
+    weights: &[Vec<f32>],
+    biases: &[Vec<f32>],
+) -> ArkanResult<()> {
+    validate_shape(network.layers.len(), weights.len())?;
+    validate_shape(network.layers.len(), biases.len())?;
+    for ((layer, wg), bg) in network.layers.iter().zip(weights).zip(biases) {
+        validate_shape(layer.weights.len(), wg.len())?;
+        validate_shape(layer.bias.len(), bg.len())?;
+    }
+    Ok(())
+}
+
+/// Ok(true) preserves the legacy skip policy; strict errors precede every mutation.
+fn check_finite(values: &[f32], safety: &SafetyConfig, context: &str) -> ArkanResult<bool> {
+    if safety.fail_on_nan || safety.skip_step_on_nan {
+        if let Some(index) = find_nan_in_grads(values) {
+            if safety.skip_step_on_nan {
+                return Ok(true);
+            }
+            return Err(ArkanError::nan_encountered(index, context));
+        }
+    }
+    Ok(false)
+}
+
+type PreparedGradients<'a> = (Cow<'a, [Vec<f32>]>, Cow<'a, [Vec<f32>]>);
+
+fn prepare_gradients<'a>(
+    weights: &'a [Vec<f32>],
+    biases: &'a [Vec<f32>],
+    safety: &SafetyConfig,
+    max_norm: Option<f32>,
+) -> ArkanResult<Option<PreparedGradients<'a>>> {
+    for tensor in weights.iter().chain(biases) {
+        if check_finite(tensor, safety, "gradient")? {
+            return Ok(None);
+        }
+    }
+    let unscale = |source: &'a [Vec<f32>]| -> Cow<'a, [Vec<f32>]> {
+        match safety.grad_scaling_factor {
+            Some(factor) => Cow::Owned(
+                source
+                    .iter()
+                    .map(|tensor| tensor.iter().map(|&g| (g as f64 / factor) as f32).collect())
+                    .collect(),
+            ),
+            None => Cow::Borrowed(source),
+        }
+    };
+    let mut wg = unscale(weights);
+    let mut bg = unscale(biases);
+    if safety.grad_scaling_factor.is_some() {
+        for tensor in wg.iter().chain(bg.iter()) {
+            if check_finite(tensor, safety, "unscaled gradient")? {
+                return Ok(None);
+            }
+        }
+    }
+    if max_norm.is_some() {
+        let scale = global_clip_scale(global_grad_norm(&wg, &bg), max_norm);
+        if scale != 1.0 {
+            for tensor in wg.to_mut().iter_mut().chain(bg.to_mut()) {
+                for g in tensor {
+                    *g = (*g as f64 * scale) as f32;
+                }
+            }
+        }
+    }
+    Ok(Some((wg, bg)))
 }
 
 /// Adam optimizer state for a single parameter tensor.
@@ -553,7 +636,8 @@ impl Clone for LayerAdamState {
 ///
 /// # Versioning
 ///
-/// Supports dynamic topology via `bump_version()`. Call this after Grid Extension.
+/// After Grid Extension changes tensor shapes, call `reinitialize(network)` and
+/// `bump_version()` to resize state and update the tracked version.
 ///
 /// # Example
 ///
@@ -622,41 +706,23 @@ impl Adam {
         self.config.lr = lr;
     }
 
-    /// Checks gradients for non-finite values (NaN or ±inf).
-    ///
-    /// Returns Ok(false) if all gradients are finite, Ok(true) to signal
-    /// the step should be skipped, or Err if fail_on_nan is set.
-    fn check_nan_in_layer(
-        weight_grads: &[f32],
-        bias_grads: &[f32],
-        layer_idx: usize,
-        safety: &SafetyConfig,
-    ) -> ArkanResult<bool> {
-        if !safety.fail_on_nan && !safety.skip_step_on_nan {
-            return Ok(false); // No NaN checking needed
-        }
-
-        if let Some(idx) = find_nan_in_grads(weight_grads) {
-            if safety.fail_on_nan && !safety.skip_step_on_nan {
-                return Err(ArkanError::nan_encountered(
-                    idx,
-                    format!("weight gradient at layer {}", layer_idx),
-                ));
-            }
-            return Ok(true); // Skip this step
-        }
-
-        if let Some(idx) = find_nan_in_grads(bias_grads) {
-            if safety.fail_on_nan && !safety.skip_step_on_nan {
-                return Err(ArkanError::nan_encountered(
-                    idx,
-                    format!("bias gradient at layer {}", layer_idx),
-                ));
-            }
-            return Ok(true); // Skip this step
-        }
-
-        Ok(false)
+    fn updated_values(
+        param: f32,
+        grad: f32,
+        m: f32,
+        v: f32,
+        config: &AdamConfig,
+        correction: (f32, f32),
+    ) -> [f32; 3] {
+        let m = config.beta1 * m + (1.0 - config.beta1) * grad;
+        let v = config.beta2 * v + (1.0 - config.beta2) * grad * grad;
+        let update = config.lr * (m / correction.0) / ((v / correction.1).sqrt() + config.epsilon);
+        let decayed = if config.weight_decay > 0.0 {
+            param * (1.0 - config.lr * config.weight_decay)
+        } else {
+            param
+        };
+        [m, v, decayed - update]
     }
 
     /// Updates a single parameter tensor using Adam.
@@ -686,42 +752,17 @@ impl Adam {
 
         state.t += 1;
 
-        let beta1 = config.beta1;
-        let beta2 = config.beta2;
-        let lr = config.lr;
-        let eps = config.epsilon;
-        let decay = config.weight_decay;
-
-        // Bias correction factors
-        let bc1 = 1.0 - beta1.powi(state.t as i32);
-        let bc2 = 1.0 - beta2.powi(state.t as i32);
-
+        let correction = (
+            1.0 - config.beta1.powi(state.t as i32),
+            1.0 - config.beta2.powi(state.t as i32),
+        );
         let m = state.m.as_mut_slice();
         let v = state.v.as_mut_slice();
-
         for i in 0..params.len() {
-            let g = grads[i];
-
-            // Update moments
-            m[i] = beta1 * m[i] + (1.0 - beta1) * g;
-            v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
-
-            // Bias-corrected estimates (PyTorch / paper convention)
-            let m_hat = m[i] / bc1;
-            let v_hat = v[i] / bc2;
-
-            // Compute update: lr * m_hat / (sqrt(v_hat) + eps)
-            // Epsilon is applied to bias-corrected sqrt(v_hat), matching PyTorch.
-            let update = lr * m_hat / (v_hat.sqrt() + eps);
-
-            // Apply weight decay (decoupled, AdamW-style)
-            // Applied BEFORE gradient update for proper decoupling
-            if decay > 0.0 {
-                params[i] *= 1.0 - lr * decay;
-            }
-
-            // Update parameter
-            params[i] -= update;
+            let values = Self::updated_values(params[i], grads[i], m[i], v[i], config, correction);
+            m[i] = values[0];
+            v[i] = values[1];
+            params[i] = values[2];
         }
     }
 }
@@ -748,47 +789,80 @@ impl Optimizer for Adam {
         bias_grads: &[Vec<f32>],
         max_grad_norm: Option<f32>,
     ) -> ArkanResult<()> {
-        // Validate layer count
-        if weight_grads.len() != network.layers.len() || bias_grads.len() != network.layers.len() {
-            return Err(ArkanError::tensor_shape_mismatch(
-                &[network.layers.len()],
-                &[weight_grads.len()],
+        validate_grad_shapes(network, weight_grads, bias_grads)?;
+        validate_safety(&self.config.safety, max_grad_norm)?;
+        validate_nonnegative(self.config.lr as f64, "learning rate")?;
+        validate_nonnegative(self.config.weight_decay as f64, "weight decay")?;
+        if !(0.0..1.0).contains(&self.config.beta1)
+            || !(0.0..1.0).contains(&self.config.beta2)
+            || !self.config.epsilon.is_finite()
+            || self.config.epsilon <= 0.0
+        {
+            return Err(ArkanError::optimizer(
+                "Adam requires betas in [0, 1) and finite positive epsilon",
             ));
         }
-
-        // Check for NaN and handle according to safety config
-        for (i, (wg, bg)) in weight_grads.iter().zip(bias_grads.iter()).enumerate() {
-            let should_skip = Self::check_nan_in_layer(wg, bg, i, &self.config.safety)?;
-            if should_skip {
-                // Skip step due to NaN (warning logged elsewhere if needed)
-                return Ok(());
+        validate_shape(network.layers.len(), self.layer_states.len())?;
+        for (layer, state) in network.layers.iter().zip(&self.layer_states) {
+            for (params, tensor) in [
+                (layer.weights.as_slice(), &state.weights),
+                (layer.bias.as_slice(), &state.bias),
+            ] {
+                validate_shape(params.len(), tensor.m.len())?;
+                validate_shape(params.len(), tensor.v.len())?;
+                if tensor.t >= i32::MAX as usize {
+                    return Err(ArkanError::optimizer("Adam timestep exhausted"));
+                }
             }
         }
+        let Some((weights, biases)) =
+            prepare_gradients(weight_grads, bias_grads, &self.config.safety, max_grad_norm)?
+        else {
+            return Ok(());
+        };
 
-        // Apply AMP scaling if configured
-        let scaling_factor = self.config.safety.grad_scaling_factor;
+        if self.config.safety.fail_on_nan || self.config.safety.skip_step_on_nan {
+            for (i, (layer, state)) in network.layers.iter().zip(&self.layer_states).enumerate() {
+                for (params, grads, tensor) in [
+                    (layer.weights.as_slice(), &weights[i], &state.weights),
+                    (layer.bias.as_slice(), &biases[i], &state.bias),
+                ] {
+                    let t = (tensor.t + 1) as i32;
+                    let correction = (
+                        1.0 - self.config.beta1.powi(t),
+                        1.0 - self.config.beta2.powi(t),
+                    );
+                    for j in 0..params.len() {
+                        let values = Self::updated_values(
+                            params[j],
+                            grads[j],
+                            tensor.m.as_slice()[j],
+                            tensor.v.as_slice()[j],
+                            &self.config,
+                            correction,
+                        );
+                        if check_finite(&values, &self.config.safety, "Adam update or state")? {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
 
         for (i, layer) in network.layers.iter_mut().enumerate() {
             let state = &mut self.layer_states[i];
 
-            // Apply gradient scaling for AMP
-            let wg_scaled = apply_grad_scaling(&weight_grads[i], scaling_factor);
-            let bg_scaled = apply_grad_scaling(&bias_grads[i], scaling_factor);
-
-            // Apply gradient clipping
-            let (wg_clipped, bg_clipped) = clip_gradients(&wg_scaled, &bg_scaled, max_grad_norm);
-
             // Update parameters
             Self::update_params(
                 layer.weights.as_mut_slice(),
-                &wg_clipped,
+                &weights[i],
                 &mut state.weights,
                 &self.config,
             );
 
             Self::update_params(
                 layer.bias.as_mut_slice(),
-                &bg_clipped,
+                &biases[i],
                 &mut state.bias,
                 &self.config,
             );
@@ -1022,6 +1096,27 @@ impl SGD {
         self.config.momentum
     }
 
+    fn updated_values(
+        param: f32,
+        grad: f32,
+        velocity: f32,
+        config: &SGDConfig,
+        decay: f32,
+    ) -> [f32; 2] {
+        let velocity = config.momentum * velocity + grad;
+        let update = if config.nesterov {
+            config.momentum * velocity + grad
+        } else {
+            velocity
+        };
+        let decayed = if decay > 0.0 {
+            param * (1.0 - config.lr * decay)
+        } else {
+            param
+        };
+        [velocity, decayed - config.lr * update]
+    }
+
     /// Resets all velocity buffers to zero.
     pub fn reset(&mut self) {
         for (vw, vb) in &mut self.velocities {
@@ -1053,88 +1148,71 @@ impl Optimizer for SGD {
         bias_grads: &[Vec<f32>],
         max_grad_norm: Option<f32>,
     ) -> ArkanResult<()> {
-        // Validate layer count
-        if weight_grads.len() != network.layers.len() || bias_grads.len() != network.layers.len() {
-            return Err(ArkanError::tensor_shape_mismatch(
-                &[network.layers.len()],
-                &[weight_grads.len()],
-            ));
+        validate_grad_shapes(network, weight_grads, bias_grads)?;
+        validate_safety(&self.config.safety, max_grad_norm)?;
+        validate_nonnegative(self.config.lr as f64, "learning rate")?;
+        validate_nonnegative(self.config.weight_decay as f64, "weight decay")?;
+        if !(0.0..1.0).contains(&self.config.momentum) {
+            return Err(ArkanError::optimizer("SGD momentum must be in [0, 1)"));
         }
-
-        // Check for NaN
-        let safety = &self.config.safety;
-        for (i, (wg, bg)) in weight_grads.iter().zip(bias_grads.iter()).enumerate() {
-            if safety.fail_on_nan || safety.skip_step_on_nan {
-                if let Some(idx) = find_nan_in_grads(wg) {
-                    if safety.fail_on_nan && !safety.skip_step_on_nan {
-                        return Err(ArkanError::nan_encountered(
-                            idx,
-                            format!("weight gradient at layer {}", i),
-                        ));
+        validate_shape(network.layers.len(), self.velocities.len())?;
+        for (layer, (vw, vb)) in network.layers.iter().zip(&self.velocities) {
+            validate_shape(layer.weights.len(), vw.len())?;
+            validate_shape(layer.bias.len(), vb.len())?;
+        }
+        let Some((weights_grads, biases_grads)) =
+            prepare_gradients(weight_grads, bias_grads, &self.config.safety, max_grad_norm)?
+        else {
+            return Ok(());
+        };
+        if self.config.safety.fail_on_nan || self.config.safety.skip_step_on_nan {
+            for (i, (layer, (vw, vb))) in network.layers.iter().zip(&self.velocities).enumerate() {
+                for (params, grads, velocity, decay) in [
+                    (
+                        layer.weights.as_slice(),
+                        &weights_grads[i],
+                        vw.as_slice(),
+                        self.config.weight_decay,
+                    ),
+                    (layer.bias.as_slice(), &biases_grads[i], vb.as_slice(), 0.0),
+                ] {
+                    for j in 0..params.len() {
+                        let values = Self::updated_values(
+                            params[j],
+                            grads[j],
+                            velocity[j],
+                            &self.config,
+                            decay,
+                        );
+                        if check_finite(&values, &self.config.safety, "SGD update or state")? {
+                            return Ok(());
+                        }
                     }
-                    return Ok(()); // Skip step
-                }
-                if let Some(idx) = find_nan_in_grads(bg) {
-                    if safety.fail_on_nan && !safety.skip_step_on_nan {
-                        return Err(ArkanError::nan_encountered(
-                            idx,
-                            format!("bias gradient at layer {}", i),
-                        ));
-                    }
-                    return Ok(()); // Skip step
                 }
             }
         }
-
-        // Apply AMP scaling
-        let scaling_factor = self.config.safety.grad_scaling_factor;
-        let nesterov = self.config.nesterov;
-        let momentum = self.config.momentum;
-        let lr = self.config.lr;
-        let decay = self.config.weight_decay;
-
         for (i, layer) in network.layers.iter_mut().enumerate() {
-            let (ref mut vw, ref mut vb) = self.velocities[i];
-
-            let wg_scaled = apply_grad_scaling(&weight_grads[i], scaling_factor);
-            let bg_scaled = apply_grad_scaling(&bias_grads[i], scaling_factor);
-
-            let (wg_clipped, bg_clipped) = clip_gradients(&wg_scaled, &bg_scaled, max_grad_norm);
-
-            let weights = layer.weights.as_mut_slice();
-            let vw_slice = vw.as_mut_slice();
-
-            for j in 0..weights.len() {
-                // Update velocity: v = μ*v + g
-                vw_slice[j] = momentum * vw_slice[j] + wg_clipped[j];
-
-                // Apply decoupled weight decay BEFORE gradient step
-                if decay > 0.0 {
-                    weights[j] *= 1.0 - lr * decay;
+            let (vw, vb) = &mut self.velocities[i];
+            for (params, grads, velocity, decay) in [
+                (
+                    layer.weights.as_mut_slice(),
+                    &weights_grads[i],
+                    vw.as_mut_slice(),
+                    self.config.weight_decay,
+                ),
+                (
+                    layer.bias.as_mut_slice(),
+                    &biases_grads[i],
+                    vb.as_mut_slice(),
+                    0.0,
+                ),
+            ] {
+                for j in 0..params.len() {
+                    let values =
+                        Self::updated_values(params[j], grads[j], velocity[j], &self.config, decay);
+                    velocity[j] = values[0];
+                    params[j] = values[1];
                 }
-
-                // Nesterov vs standard momentum
-                // Nesterov: θ -= lr * (μ*v + g)
-                // Standard: θ -= lr * v
-                let update = if nesterov {
-                    momentum * vw_slice[j] + wg_clipped[j]
-                } else {
-                    vw_slice[j]
-                };
-                weights[j] -= lr * update;
-            }
-
-            let bias = layer.bias.as_mut_slice();
-            let vb_slice = vb.as_mut_slice();
-
-            for j in 0..bias.len() {
-                vb_slice[j] = momentum * vb_slice[j] + bg_clipped[j];
-                let update = if nesterov {
-                    momentum * vb_slice[j] + bg_clipped[j]
-                } else {
-                    vb_slice[j]
-                };
-                bias[j] -= lr * update;
             }
         }
 
@@ -1190,13 +1268,14 @@ pub struct LBFGSConfig {
     /// Maximum number of iterations per step.
     pub max_iter: usize,
 
-    /// Maximum number of function evaluations per step.
+    /// Maximum number of function evaluations per step, including the initial evaluation.
+    /// None removes this budget; each line search still has its convergence limit.
     pub max_eval: Option<usize>,
 
-    /// Termination tolerance on function value change.
+    /// Termination tolerance on gradient norm.
     pub tolerance_grad: f64,
 
-    /// Termination tolerance on parameter change.
+    /// Termination tolerance on maximum parameter change or absolute loss change.
     pub tolerance_change: f64,
 
     /// Number of corrections to approximate inverse Hessian.
@@ -1246,9 +1325,9 @@ pub enum LineSearchMethod {
 ///
 /// # Atomicity and Rollback
 ///
-/// If line search fails, the optimizer:
-/// 1. Restores parameters to their pre-step values
-/// 2. Returns `Err(LineSearchFailed)`
+/// On an objective error or failed line search, the optimizer:
+/// 1. Restores parameters and history to their pre-step values
+/// 2. Returns the original error
 ///
 /// This ensures no partial updates occur.
 ///
@@ -1386,7 +1465,7 @@ impl LBFGS {
             .sum();
 
         // Skip if curvature condition not satisfied
-        if sy <= 1e-10 {
+        if !sy.is_finite() || sy <= 1e-10 {
             return;
         }
 
@@ -1520,18 +1599,16 @@ impl LBFGS {
         let mut alpha_lo: f64 = 0.0;
         let mut alpha_hi: f64 = ALPHA_MAX;
         let mut f_lo = f0;
-        let mut g_lo = g0.to_vec();
 
         for iter in 0..MAX_LS_ITER {
             // x = x0 + alpha * d
             let x_new: Vec<f32> = x0
                 .iter()
                 .zip(direction.iter())
-                .map(|(&x, &d)| x + alpha as f32 * d)
+                .map(|(&x, &d)| (x as f64 + alpha * d as f64) as f32)
                 .collect();
 
             Self::restore_params(network, &x_new);
-            self.n_eval += 1;
             let (f_new, g_new) = closure(network)?;
 
             // Check for NaN
@@ -1560,12 +1637,10 @@ impl LBFGS {
                     alpha_hi = alpha_lo;
                     alpha_lo = alpha;
                     f_lo = f_new;
-                    g_lo = g_new;
                 } else {
                     // Move to higher alpha
                     alpha_lo = alpha;
                     f_lo = f_new;
-                    g_lo = g_new.clone();
                     alpha = (alpha + alpha_hi) / 2.0;
                     continue;
                 }
@@ -1574,14 +1649,17 @@ impl LBFGS {
             // Zoom phase: binary search in [alpha_lo, alpha_hi]
             if (alpha_hi - alpha_lo).abs() < 1e-10 {
                 // Interval too small
-                return Ok((alpha_lo, g_lo, f_lo));
+                return Err(ArkanError::line_search_failed(
+                    "Strong Wolfe interval exhausted",
+                ));
             }
 
             alpha = (alpha_lo + alpha_hi) / 2.0;
         }
 
-        // Max iterations reached - return best found
-        Ok((alpha_lo, g_lo, f_lo))
+        Err(ArkanError::line_search_failed(
+            "Strong Wolfe search exhausted",
+        ))
     }
 
     /// Backtracking line search with Armijo condition.
@@ -1608,11 +1686,10 @@ impl LBFGS {
             let x_new: Vec<f32> = x0
                 .iter()
                 .zip(direction.iter())
-                .map(|(&x, &d)| x + alpha as f32 * d)
+                .map(|(&x, &d)| (x as f64 + alpha * d as f64) as f32)
                 .collect();
 
             Self::restore_params(network, &x_new);
-            self.n_eval += 1;
             let (f_new, g_new) = closure(network)?;
 
             // Check Armijo condition
@@ -1718,7 +1795,10 @@ impl LBFGS {
     ///
     /// # Rollback Guarantee
     ///
-    /// If line search fails, parameters are restored to their initial values.
+    /// On any evaluation or line-search error, parameters and history are restored.
+    /// The original error is returned. Evaluation counts include failed objective calls.
+    /// The closure must evaluate the supplied parameters without changing topology.
+    /// `max_iter` bounds accepted iterations; `max_eval` includes the initial evaluation.
     ///
     /// # Example
     ///
@@ -1739,103 +1819,169 @@ impl LBFGS {
     where
         F: FnMut(&mut KanNetwork) -> ArkanResult<(f64, Vec<f32>)>,
     {
-        // Save initial parameters for potential rollback
-        let x0 = Self::flatten_params(network);
-
-        // Evaluate closure to get initial loss and gradient
-        self.n_eval += 1;
-        let (f0, g0) = closure(network)?;
-
-        // Check for NaN in loss
-        if f0.is_nan() || !f0.is_finite() {
-            if self.config.safety.fail_on_nan && !self.config.safety.skip_step_on_nan {
-                return Err(ArkanError::nan_encountered(0, "loss"));
-            }
-            if self.config.safety.skip_step_on_nan {
-                return Ok(f0);
+        validate_safety(&self.config.safety, None)?;
+        if !self.config.lr.is_finite()
+            || self.config.lr <= 0.0
+            || self.config.max_iter == 0
+            || self.config.history_size == 0
+            || self
+                .config
+                .max_eval
+                .map(|budget| budget < 2)
+                .unwrap_or(false)
+        {
+            return Err(ArkanError::optimizer(
+                "LBFGS requires positive lr, max_iter and history_size, and max_eval >= 2",
+            ));
+        }
+        validate_nonnegative(self.config.tolerance_grad, "tolerance_grad")?;
+        validate_nonnegative(self.config.tolerance_change, "tolerance_change")?;
+        let original_params = Self::flatten_params(network);
+        let size = original_params.len();
+        validate_shape(self.s_history.len(), self.y_history.len())?;
+        validate_shape(self.s_history.len(), self.rho_history.len())?;
+        for history in self
+            .s_history
+            .iter()
+            .chain(&self.y_history)
+            .chain(self.prev_params.iter())
+            .chain(self.prev_grads.iter())
+        {
+            validate_shape(size, history.len())?;
+            if find_nan_in_grads(history).is_some() {
+                return Err(ArkanError::optimizer("LBFGS history must be finite"));
             }
         }
-
-        // Check convergence on gradient norm
-        let grad_norm = Self::grad_norm(&g0);
-        if grad_norm < self.config.tolerance_grad {
-            return Ok(f0);
+        if self
+            .rho_history
+            .iter()
+            .any(|rho| !rho.is_finite() || *rho <= 0.0)
+        {
+            return Err(ArkanError::optimizer(
+                "LBFGS curvature state must be finite and positive",
+            ));
         }
 
-        // Compute search direction using two-loop recursion
-        let direction = self.two_loop_recursion(&g0);
-
-        // Perform line search based on configured method
-        let (alpha, g_new, f_new) = match self.config.line_search_fn {
-            LineSearchMethod::StrongWolfe => {
-                match self.strong_wolfe_line_search(network, &mut closure, &x0, f0, &g0, &direction)
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        // Rollback on failure
-                        Self::restore_params(network, &x0);
-                        return Err(ArkanError::line_search_failed(
-                            "Strong Wolfe line search failed, parameters restored",
-                        ));
-                    }
+        // Keep parameter and history commits in one transaction, including fixed steps.
+        let original_state = self.clone();
+        let budget = self.config.max_eval.unwrap_or(usize::MAX);
+        let evaluations = std::cell::Cell::new(0usize);
+        let mut numerical_failure = false;
+        let mut initial_loss = None;
+        let result = (|| {
+            let mut evaluate = |net: &mut KanNetwork| -> ArkanResult<(f64, Vec<f32>)> {
+                if evaluations.get() >= budget {
+                    return Err(ArkanError::line_search_failed(
+                        "LBFGS evaluation budget exhausted",
+                    ));
                 }
-            }
-            LineSearchMethod::Backtracking => {
-                match self.backtracking_line_search(network, &mut closure, &x0, f0, &g0, &direction)
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        // Rollback on failure
-                        Self::restore_params(network, &x0);
-                        return Err(ArkanError::line_search_failed(
-                            "Backtracking line search failed, parameters restored",
-                        ));
-                    }
+                if Self::flatten_params(net).iter().any(|p| !p.is_finite()) {
+                    numerical_failure = true;
+                    return Err(ArkanError::nan_encountered(0, "LBFGS trial parameters"));
                 }
-            }
-            LineSearchMethod::NoLineSearch => {
-                // Fixed step size (use lr directly)
-                let alpha = self.config.lr as f64;
-                let x_new: Vec<f32> = x0
+                evaluations.set(evaluations.get() + 1);
+                let (loss, gradient) = closure(net)?;
+                initial_loss.get_or_insert(loss);
+                validate_shape(size, gradient.len())?;
+                if !loss.is_finite() || find_nan_in_grads(&gradient).is_some() {
+                    numerical_failure = true;
+                    return Err(ArkanError::nan_encountered(
+                        0,
+                        "LBFGS objective or gradient",
+                    ));
+                }
+                Ok((loss, gradient))
+            };
+            let (mut loss, mut gradient) = evaluate(network)?;
+            let mut params = original_params.clone();
+            for _ in 0..self.config.max_iter {
+                if Self::grad_norm(&gradient) <= self.config.tolerance_grad {
+                    break;
+                }
+                // The initial evaluation consumes one budget unit; a new trial needs another.
+                if evaluations.get() >= budget {
+                    break;
+                }
+                let direction = self.two_loop_recursion(&gradient);
+                if find_nan_in_grads(&direction).is_some() {
+                    return Err(ArkanError::optimizer("LBFGS search direction is nonfinite"));
+                }
+                let (alpha, new_gradient, new_loss) = match self.config.line_search_fn {
+                    LineSearchMethod::StrongWolfe => self.strong_wolfe_line_search(
+                        network,
+                        &mut evaluate,
+                        &params,
+                        loss,
+                        &gradient,
+                        &direction,
+                    )?,
+                    LineSearchMethod::Backtracking => self.backtracking_line_search(
+                        network,
+                        &mut evaluate,
+                        &params,
+                        loss,
+                        &gradient,
+                        &direction,
+                    )?,
+                    LineSearchMethod::NoLineSearch => {
+                        let alpha = self.config.lr as f64;
+                        let trial: Vec<f32> = params
+                            .iter()
+                            .zip(&direction)
+                            .map(|(&x, &d)| (x as f64 + alpha * d as f64) as f32)
+                            .collect();
+                        Self::restore_params(network, &trial);
+                        let (new_loss, new_gradient) = evaluate(network)?;
+                        (alpha, new_gradient, new_loss)
+                    }
+                };
+                let accepted: Vec<f32> = params
                     .iter()
-                    .zip(direction.iter())
-                    .map(|(&x, &d)| x + alpha as f32 * d)
+                    .zip(&direction)
+                    .map(|(&x, &d)| (x as f64 + alpha * d as f64) as f32)
                     .collect();
-
-                Self::restore_params(network, &x_new);
-                self.n_eval += 1;
-                let (f_new, g_new) = closure(network)?;
-
-                (alpha, g_new, f_new)
+                Self::restore_params(network, &accepted);
+                let s: Vec<f32> = accepted
+                    .iter()
+                    .zip(&params)
+                    .map(|(&x, &old)| x - old)
+                    .collect();
+                let y = new_gradient
+                    .iter()
+                    .zip(&gradient)
+                    .map(|(&g, &old)| g - old)
+                    .collect();
+                let parameter_change = s.iter().map(|&v| (v as f64).abs()).fold(0.0, f64::max);
+                let loss_change = (new_loss - loss).abs();
+                self.update_history(s, y);
+                self.prev_params = Some(accepted.clone());
+                self.prev_grads = Some(new_gradient.clone());
+                params = accepted;
+                gradient = new_gradient;
+                loss = new_loss;
+                if parameter_change <= self.config.tolerance_change
+                    || loss_change <= self.config.tolerance_change
+                {
+                    break;
+                }
             }
-        };
-
-        // Compute s and y for history update
-        let x_new = Self::flatten_params(network);
-        let s: Vec<f32> = x_new
-            .iter()
-            .zip(x0.iter())
-            .map(|(&xn, &x0)| xn - x0)
-            .collect();
-        let y: Vec<f32> = g_new
-            .iter()
-            .zip(g0.iter())
-            .map(|(&gn, &g0)| gn - g0)
-            .collect();
-
-        // Update history
-        self.update_history(s, y);
-
-        // Store for next iteration
-        self.prev_params = Some(x_new);
-        self.prev_grads = Some(g_new);
-
-        // Check for step size convergence
-        if alpha.abs() < self.config.tolerance_change {
-            // Step too small, may have converged
+            Ok(loss)
+        })();
+        self.n_eval = original_state.n_eval.saturating_add(evaluations.get());
+        match result {
+            Ok(loss) => Ok(loss),
+            Err(error) => {
+                Self::restore_params(network, &original_params);
+                let n_eval = self.n_eval;
+                *self = original_state;
+                self.n_eval = n_eval;
+                if numerical_failure && self.config.safety.skip_step_on_nan {
+                    Ok(initial_loss.unwrap_or(f64::NAN))
+                } else {
+                    Err(error)
+                }
+            }
         }
-
-        Ok(f_new)
     }
 }
 

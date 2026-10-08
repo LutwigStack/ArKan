@@ -209,11 +209,33 @@ pub fn masked_cross_entropy(
 ///
 /// # Returns
 ///
-/// Tuple of (total_loss, prob_loss, q_loss, gradient)
+/// Tuple of (total_loss, prob_loss, q_loss, gradient).
+/// The probability-head gradient is the legacy fused derivative with respect
+/// to sigmoid logits; pass it directly to the logits head without sigmoid backward.
+/// Use [`poker_combined_loss_probabilities`] for derivatives of these inputs.
 pub fn poker_combined_loss(
     predictions: &[f32],
     targets: &[f32],
     alpha: f32,
+) -> (f32, f32, f32, Vec<f32>) {
+    poker_loss(predictions, targets, alpha, true)
+}
+
+/// Poker objective with derivatives with respect to the supplied probabilities
+/// and Q-values. Clamped probability regions have zero derivative.
+pub fn poker_combined_loss_probabilities(
+    predictions: &[f32],
+    targets: &[f32],
+    alpha: f32,
+) -> (f32, f32, f32, Vec<f32>) {
+    poker_loss(predictions, targets, alpha, false)
+}
+
+fn poker_loss(
+    predictions: &[f32],
+    targets: &[f32],
+    alpha: f32,
+    fused_logits: bool,
 ) -> (f32, f32, f32, Vec<f32>) {
     let n = predictions.len();
     let batch_size = n / 24;
@@ -239,7 +261,15 @@ pub fn poker_combined_loss(
 
                 // BCE: inputs must be probabilities in (EPSILON, 1-EPSILON)
                 prob_loss += m * (-t * p.ln() - (1.0 - t) * (1.0 - p).ln());
-                grad[base + action] = m * (p - t);
+                grad[base + action] = if fused_logits {
+                    m * (p - t)
+                } else if predictions[base + action] > EPSILON
+                    && predictions[base + action] < 1.0 - EPSILON
+                {
+                    m * (p - t) / (p * (1.0 - p))
+                } else {
+                    0.0
+                };
                 prob_count += m;
 
                 // Q-value loss (indices 8..16)
@@ -459,20 +489,36 @@ pub fn masked_softmax(x: &mut [f32], mask: &[f32], dim_size: usize) {
 ///
 /// # Note
 ///
-/// Gradient is `grad_MSE / (2 * RMSE)` to account for the square root.
+/// Gradient is `grad_MSE / (2 * RMSE)` for every nonzero RMSE.
+/// At exact zero the zero subgradient is used. Accumulation in f64 prevents
+/// finite residuals from losing their gradients when f32 squares overflow or underflow.
 pub fn masked_rmse(predictions: &[f32], targets: &[f32], mask: Option<&[f32]>) -> (f32, Vec<f32>) {
-    let (mse, mut grad) = masked_mse(predictions, targets, mask);
-    let rmse = mse.sqrt();
-
-    // Gradient of sqrt(MSE) = grad_MSE / (2 * sqrt(MSE))
-    if rmse > EPSILON {
-        let scale = 0.5 / rmse;
-        for g in &mut grad {
-            *g *= scale;
+    debug_assert_eq!(predictions.len(), targets.len());
+    let mut gradient = vec![0.0; predictions.len()];
+    let mut squared = 0.0f64;
+    let mut count = 0.0f64;
+    for (i, (&prediction, &target)) in predictions.iter().zip(targets).enumerate() {
+        let m = mask.map(|mask| mask[i] as f64).unwrap_or(1.0);
+        if m > 0.0 {
+            let residual = prediction as f64 - target as f64;
+            squared += m * residual * residual;
+            count += m;
         }
     }
-
-    (rmse, grad)
+    let rmse = if count > 0.0 {
+        (squared / count).sqrt()
+    } else {
+        0.0
+    };
+    if rmse > 0.0 {
+        for (i, (&prediction, &target)) in predictions.iter().zip(targets).enumerate() {
+            let m = mask.map(|mask| mask[i] as f64).unwrap_or(1.0);
+            if m > 0.0 {
+                gradient[i] = (m * (prediction as f64 - target as f64) / (count * rmse)) as f32;
+            }
+        }
+    }
+    (rmse as f32, gradient)
 }
 
 /// Masked Mean Absolute Error (L1) loss.
@@ -623,12 +669,38 @@ pub fn masked_bce_with_logits(
 ///
 /// # Returns
 ///
-/// Tuple of (loss, gradient)
+/// Tuple of (loss, gradient). This legacy API returns the fused derivative
+/// with respect to softmax logits for normalized targets (`p - t`). Supply this
+/// gradient directly to the logits head without another softmax backward.
+/// Use [`masked_categorical_cross_entropy_probabilities`] for input derivatives
+/// or [`masked_categorical_cross_entropy_with_logits`] for a stable logits objective.
 pub fn masked_categorical_cross_entropy(
     predictions: &[f32],
     targets: &[f32],
     num_classes: usize,
     mask: Option<&[f32]>,
+) -> (f32, Vec<f32>) {
+    categorical_probability_loss(predictions, targets, num_classes, mask, true)
+}
+
+/// Categorical cross-entropy with derivatives of the supplied probabilities.
+/// Inputs are independent probabilities; no softmax derivative is fused.
+/// Clamped regions have zero derivative. Mask weights normalize per sample.
+pub fn masked_categorical_cross_entropy_probabilities(
+    predictions: &[f32],
+    targets: &[f32],
+    num_classes: usize,
+    mask: Option<&[f32]>,
+) -> (f32, Vec<f32>) {
+    categorical_probability_loss(predictions, targets, num_classes, mask, false)
+}
+
+fn categorical_probability_loss(
+    predictions: &[f32],
+    targets: &[f32],
+    num_classes: usize,
+    mask: Option<&[f32]>,
+    fused_logits: bool,
 ) -> (f32, Vec<f32>) {
     debug_assert_eq!(predictions.len(), targets.len());
     debug_assert!(num_classes > 0);
@@ -653,8 +725,16 @@ pub fn masked_categorical_cross_entropy(
                     loss -= m * t * p.ln();
                 }
 
-                // Gradient: -t/p (for softmax + CE, simplifies to p - t)
-                grad[base + c] = m * (p - t);
+                grad[base + c] = if fused_logits {
+                    m * (p - t)
+                } else if predictions[base + c] > EPSILON
+                    && predictions[base + c] < 1.0 - EPSILON
+                    && t > 0.0
+                {
+                    -m * t / p
+                } else {
+                    0.0
+                };
             }
 
             count += m;
@@ -669,6 +749,56 @@ pub fn masked_categorical_cross_entropy(
     }
 
     (loss, grad)
+}
+
+/// Stable categorical cross-entropy of logits, with derivatives of those logits.
+/// Computes log-sum-exp without probability clipping. Targets may be one-hot
+/// or nonnegative soft labels; sample masks normalize loss and gradient.
+pub fn masked_categorical_cross_entropy_with_logits(
+    logits: &[f32],
+    targets: &[f32],
+    num_classes: usize,
+    mask: Option<&[f32]>,
+) -> (f32, Vec<f32>) {
+    debug_assert_eq!(logits.len(), targets.len());
+    debug_assert!(num_classes > 0);
+    let mut gradient = vec![0.0; logits.len()];
+    let mut loss = 0.0f64;
+    let mut count = 0.0f64;
+    for (sample, (scores, labels)) in logits
+        .chunks_exact(num_classes)
+        .zip(targets.chunks_exact(num_classes))
+        .enumerate()
+    {
+        let m = mask.map(|m| m[sample] as f64).unwrap_or(1.0);
+        if m <= 0.0 {
+            continue;
+        }
+        let maximum = scores
+            .iter()
+            .map(|&z| z as f64)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let sum = scores
+            .iter()
+            .map(|&z| (z as f64 - maximum).exp())
+            .sum::<f64>();
+        let log_sum = sum.ln();
+        let target_sum = labels.iter().map(|&t| t as f64).sum::<f64>();
+        for (class, (&z, &t)) in scores.iter().zip(labels).enumerate() {
+            loss += m * t as f64 * (log_sum - (z as f64 - maximum));
+            let probability = (z as f64 - maximum).exp() / sum;
+            gradient[sample * num_classes + class] =
+                (m * (probability * target_sum - t as f64)) as f32;
+        }
+        count += m;
+    }
+    if count > 0.0 {
+        loss /= count;
+        for g in &mut gradient {
+            *g = (*g as f64 / count) as f32;
+        }
+    }
+    (loss as f32, gradient)
 }
 
 // =============================================================================
@@ -800,7 +930,7 @@ pub fn l1_sparsity_gradient(coefficients: &[f32]) -> Vec<f32> {
 /// $$p_i = \frac{|c_i|^2}{\sum_j |c_j|^2 + \epsilon}$$
 ///
 /// Then compute entropy:
-/// $$H = -\sum_i p_i \log(p_i + \epsilon)$$
+/// $$H = -\sum_{i: p_i > \epsilon} p_i \log(p_i)$$
 ///
 /// # Arguments
 ///
@@ -858,6 +988,43 @@ pub fn entropy_regularization(coefficients: &[f32], group_size: usize) -> f32 {
     }
 
     total_entropy / num_groups as f32
+}
+
+/// Derivative of [`entropy_regularization`], including its epsilon normalization.
+/// At the cutoff `p == EPSILON`, this uses the inactive branch derivative.
+/// Incomplete trailing coefficient groups contribute zero, matching the objective.
+pub fn entropy_regularization_gradient(coefficients: &[f32], group_size: usize) -> Vec<f32> {
+    let mut gradient = vec![0.0; coefficients.len()];
+    if group_size == 0 {
+        return gradient;
+    }
+    let groups = coefficients.len() / group_size;
+    if groups == 0 {
+        return gradient;
+    }
+    for (group, output) in coefficients
+        .chunks_exact(group_size)
+        .zip(gradient.chunks_exact_mut(group_size))
+    {
+        let sum = group.iter().map(|c| c * c).sum::<f32>() + EPSILON;
+        let mean_derivative = group
+            .iter()
+            .map(|c| {
+                let p = c * c / sum;
+                if p > EPSILON {
+                    -p * (p.ln() + 1.0)
+                } else {
+                    0.0
+                }
+            })
+            .sum::<f32>();
+        for (&c, g) in group.iter().zip(output) {
+            let p = c * c / sum;
+            let derivative = if p > EPSILON { -(p.ln() + 1.0) } else { 0.0 };
+            *g = 2.0 * c / sum * (derivative - mean_derivative) / groups as f32;
+        }
+    }
+    gradient
 }
 
 /// Smoothness penalty (second derivative approximation).
@@ -1052,7 +1219,7 @@ pub fn kan_combined_loss(
 
 /// Get regularization gradients for coefficients.
 ///
-/// Returns combined gradient from L1 and smoothness regularization.
+/// Returns combined gradient from L1, entropy, and smoothness regularization.
 /// Call this separately and add to coefficient gradients during training.
 ///
 /// # Arguments
@@ -1071,11 +1238,15 @@ pub fn kan_regularization_gradient(
 ) -> Vec<f32> {
     let l1_grad = l1_sparsity_gradient(coefficients);
     let smooth_grad = smoothness_gradient(coefficients, basis_size);
+    let entropy_grad = entropy_regularization_gradient(coefficients, basis_size);
 
     l1_grad
         .iter()
         .zip(smooth_grad.iter())
-        .map(|(&l1, &sm)| config.lambda_l1 * l1 + config.lambda_smooth * sm)
+        .zip(entropy_grad.iter())
+        .map(|((&l1, &sm), &entropy)| {
+            config.lambda_l1 * l1 + config.lambda_smooth * sm + config.lambda_entropy * entropy
+        })
         .collect()
 }
 
