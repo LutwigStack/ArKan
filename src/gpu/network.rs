@@ -950,6 +950,21 @@ impl GpuNetwork {
     /// Syncs weights, biases and per-feature normalization from CPU to GPU.
     /// The layer topology and grid must match the original GPU conversion.
     pub fn sync_weights(&mut self, cpu_network: &KanNetwork) -> ArkanResult<()> {
+        self.validate_cpu_sync_layout(cpu_network)?;
+        for layer in &cpu_network.layers {
+            GpuLayer::validate_normalization(layer)?;
+        }
+
+        for (gpu_layer, cpu_layer) in self.layers.iter_mut().zip(&cpu_network.layers) {
+            gpu_layer.update_weights(&self.queue, cpu_layer);
+            gpu_layer.update_bias(&self.queue, cpu_layer);
+            gpu_layer.update_normalization(&self.queue, cpu_layer);
+        }
+
+        Ok(())
+    }
+
+    fn validate_cpu_sync_layout(&self, cpu_network: &KanNetwork) -> ArkanResult<()> {
         if cpu_network.layers.len() != self.layers.len() {
             return Err(ArkanError::validation(
                 "CPU and GPU network layer count mismatch",
@@ -959,7 +974,6 @@ impl GpuNetwork {
         // Preflight all layers before writing a prefix of the network.
         for (gpu, cpu) in self.layers.iter().zip(&cpu_network.layers) {
             cpu.validate_layout()?;
-            GpuLayer::validate_normalization(cpu)?;
             if (gpu.in_dim, gpu.out_dim, gpu.global_basis_size, gpu.order)
                 != (cpu.in_dim, cpu.out_dim, cpu.global_basis_size, cpu.order)
                 || (gpu.uniforms.grid_min, gpu.uniforms.grid_max) != cpu.grid_range
@@ -970,12 +984,6 @@ impl GpuNetwork {
                     "CPU and GPU layer topology/grid mismatch",
                 ));
             }
-        }
-
-        for (gpu_layer, cpu_layer) in self.layers.iter_mut().zip(&cpu_network.layers) {
-            gpu_layer.update_weights(&self.queue, cpu_layer);
-            gpu_layer.update_bias(&self.queue, cpu_layer);
-            gpu_layer.update_normalization(&self.queue, cpu_layer);
         }
 
         Ok(())
@@ -1337,9 +1345,12 @@ impl GpuNetwork {
         let out_dim = layer.out_dim;
         let basis_padded = layer.basis_padded;
 
-        // Create backward uniforms buffer
+        // The saved tape owns this batch; another workspace may have changed
+        // the layer's most recent forward batch.
+        let mut uniforms = layer.uniforms;
+        uniforms.batch_size = batch_size as u32;
         let backward_uniforms =
-            crate::gpu::uniforms::BackwardUniforms::new(&layer.uniforms, compute_input_grad);
+            crate::gpu::uniforms::BackwardUniforms::new(&uniforms, compute_input_grad);
         let uniforms_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1347,12 +1358,6 @@ impl GpuNetwork {
                 contents: bytemuck::bytes_of(&backward_uniforms),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
-
-        // Update batch_size in uniforms
-        let mut uniforms = layer.uniforms;
-        uniforms.batch_size = batch_size as u32;
-        self.queue
-            .write_buffer(&layer.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         // Create backward bind group layout (Group 0: weights + uniforms)
         let backward_layer_layout = GpuLayer::create_backward_bind_group_layout(&self.device);
@@ -2283,7 +2288,8 @@ impl GpuNetwork {
         self.sync_weights(cpu_network)
     }
 
-    /// Downloads weights from GPU to CPU network.
+    /// Downloads weights, bias and actual layer normalization to a CPU snapshot.
+    /// All destination layouts and readbacks are checked before it is modified.
     ///
     /// **IMPORTANT**: After native GPU training (`train_step_gpu_native` or
     /// `train_step_gpu_native_with_options`), the trained weights exist only on GPU.
@@ -2309,37 +2315,40 @@ impl GpuNetwork {
     /// # }
     /// ```
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Returns an error if CPU and GPU networks have different layer counts.
+    /// Returns an error if layer layouts/topology/grid differ or a readback fails.
+    /// The destination remains unchanged on error.
     pub fn sync_weights_to_cpu(&self, cpu_network: &mut KanNetwork) -> ArkanResult<()> {
-        if cpu_network.layers.len() != self.layers.len() {
-            return Err(ArkanError::validation(
-                "CPU and GPU network layer count mismatch",
-            ));
+        self.validate_cpu_sync_layout(cpu_network)?;
+
+        // Finish every readback before mutating the destination snapshot.
+        let mut snapshots = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let packed = layer.weights.download(&self.device, &self.queue)?;
+            let weights = Self::unpack_weights_vec4(
+                &packed,
+                layer.out_dim,
+                layer.in_dim,
+                layer.global_basis_size,
+                layer.basis_padded,
+                layer.basis_vec4s,
+            );
+            let bias = layer.bias.download(&self.device, &self.queue)?;
+            let normalization = layer.normalization.download(&self.device, &self.queue)?;
+            snapshots.push((weights, bias, normalization));
         }
 
-        for (gpu_layer, cpu_layer) in self.layers.iter().zip(&mut cpu_network.layers) {
-            // Download and unpack weights
-            let packed = gpu_layer.weights.download(&self.device, &self.queue)?;
-
-            // Unpack vec4 format to original format
-            let unpacked = Self::unpack_weights_vec4(
-                &packed,
-                cpu_layer.out_dim,
-                cpu_layer.in_dim,
-                cpu_layer.global_basis_size,
-                gpu_layer.basis_padded,
-                gpu_layer.basis_vec4s,
-            );
-
-            cpu_layer.weights.copy_from_slice(&unpacked);
-
-            // Download bias
-            let bias_data = gpu_layer.bias.download(&self.device, &self.queue)?;
-            cpu_layer
-                .bias
-                .copy_from_slice(&bias_data[..cpu_layer.out_dim]);
+        for (layer, (weights, bias, normalization)) in cpu_network.layers.iter_mut().zip(snapshots)
+        {
+            layer.weights.copy_from_slice(&weights);
+            layer.bias.copy_from_slice(&bias);
+            // Keep imported normal positive std values exactly; the setter clamps
+            // them to EPSILON and would change forward semantics.
+            for (i, stats) in normalization.chunks_exact(2).enumerate() {
+                layer.mean[i] = stats[0];
+                layer.std[i] = stats[1];
+            }
         }
 
         Ok(())

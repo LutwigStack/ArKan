@@ -270,3 +270,102 @@ fn backward_rejects_batch_without_matching_saved_forward() {
         .backward_batch(&[1.; 4], 4, &mut ws, &mut w, &mut bias)
         .is_err());
 }
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn review_saved_training_batch_survives_other_workspace_forward() {
+    let b = backend();
+    let cpu = network(3);
+    let mut gpu = GpuNetwork::from_cpu(&b, &cpu).unwrap();
+    let mut reference = gpu.create_workspace(4).unwrap();
+    let mut saved = gpu.create_workspace(4).unwrap();
+    let mut other = gpu.create_workspace(1).unwrap();
+    let input = [0.5, -0.2, 0.6, -0.1, 0.4, -0.3, 0.7, 0.];
+    let gradient = [1., 2., 3., 4.];
+    let mut expected_w = vec![];
+    let mut expected_b = vec![];
+    gpu.forward_batch_training(&input, 4, &mut reference)
+        .unwrap();
+    let expected_i = gpu
+        .backward_batch(
+            &gradient,
+            4,
+            &mut reference,
+            &mut expected_w,
+            &mut expected_b,
+        )
+        .unwrap();
+    for training in [false, true] {
+        gpu.forward_batch_training(&input, 4, &mut saved).unwrap();
+        if training {
+            gpu.forward_batch_training(&[0.5, -0.2], 1, &mut other)
+                .unwrap();
+        } else {
+            gpu.forward_batch(&[0.5, -0.2], 1, &mut other).unwrap();
+        }
+        let mut actual_w = vec![];
+        let mut actual_b = vec![];
+        let actual_i = gpu
+            .backward_batch(&gradient, 4, &mut saved, &mut actual_w, &mut actual_b)
+            .unwrap();
+        close(&actual_i, &expected_i);
+        for layer in 0..expected_w.len() {
+            close(&actual_w[layer], &expected_w[layer]);
+            close(&actual_b[layer], &expected_b[layer]);
+        }
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn review_gpu_cpu_snapshot_preserves_actual_layer_normalization() {
+    let b = backend();
+    let mut source = network(3);
+    source.layers[0].mean = vec![0.25, 0.];
+    source.layers[0].std = vec![0.5, 1e-8];
+    source.layers[1].set_normalization(&[0.1, 0.2, -0.1], &[0.4, 0.6, 0.8]);
+    let mut gpu = GpuNetwork::from_cpu(&b, &source).unwrap();
+    // Exercise updated GPU normalization, not just the original conversion.
+    source.layers[1].set_normalization(&[-0.1, 0.1, 0.3], &[0.8, 0.5, 0.4]);
+    gpu.sync_weights_from_cpu(&source).unwrap();
+    let mut destination = network(3);
+    for layer in &mut destination.layers {
+        layer.set_normalization(&vec![0.; layer.in_dim], &vec![1.; layer.in_dim]);
+        layer.weights.fill(0.);
+        layer.bias.fill(-99.);
+    }
+    gpu.sync_weights_to_cpu(&mut destination).unwrap();
+    for (actual, expected) in destination.layers.iter().zip(&source.layers) {
+        assert_eq!(actual.mean, expected.mean);
+        assert_eq!(actual.std, expected.std);
+        assert_eq!(actual.weights, expected.weights);
+        assert_eq!(actual.bias, expected.bias);
+    }
+    let input = [0.25, 0., 0.5, 5e-9, -0.25, -5e-9];
+    let mut gpu_ws = gpu.create_workspace(3).unwrap();
+    let gpu_output = gpu.forward_batch(&input, 3, &mut gpu_ws).unwrap();
+    let mut cpu_ws = destination.create_workspace(3);
+    let mut cpu_output = vec![0.; 3];
+    destination.forward_batch(&input, &mut cpu_output, &mut cpu_ws);
+    close(&cpu_output, &gpu_output);
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn review_gpu_cpu_snapshot_rejects_invalid_late_layer_without_mutation() {
+    let b = backend();
+    let source = network(3);
+    let gpu = GpuNetwork::from_cpu(&b, &source).unwrap();
+    let mut destination = network(3);
+    destination.layers[0].weights.fill(0.);
+    destination.layers[0].bias.fill(-99.);
+    destination.layers[1].mean.clear();
+    let before = destination.clone();
+    assert!(gpu.sync_weights_to_cpu(&mut destination).is_err());
+    for (actual, expected) in destination.layers.iter().zip(&before.layers) {
+        assert_eq!(actual.weights, expected.weights);
+        assert_eq!(actual.bias, expected.bias);
+        assert_eq!(actual.mean, expected.mean);
+        assert_eq!(actual.std, expected.std);
+    }
+}
