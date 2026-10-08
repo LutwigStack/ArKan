@@ -587,13 +587,38 @@ fn test_p1_grid_size_edge_cases() {
     let _ = result;
 }
 
-/// P0: Workspace prepare with zero batch should fail gracefully
+/// P0: Empty batches preserve output shape checks and subsequent workspace reuse.
 #[test]
 fn test_p0_workspace_zero_batch() {
     let config = KanConfig::preset();
+    let network = KanNetwork::new(config.clone());
     let mut workspace = Workspace::new(&config);
+    let input = vec![0.5; 2 * config.input_dim];
+    let mut expected = vec![0.0; 2 * config.output_dim];
+    network
+        .try_forward_batch(&input, &mut expected, &mut Workspace::new(&config))
+        .unwrap();
 
-    // Zero batch - should error, not panic or silently succeed
-    let result = workspace.try_prepare_forward(0, &config);
-    assert!(result.is_err(), "Zero batch should return error");
+    // Exercise both an initially empty workspace and a previously populated one.
+    for _ in 0..2 {
+        workspace.try_prepare_forward(0, &config).unwrap();
+        assert!(workspace.z_buffer.is_empty());
+        assert!(workspace.basis_values.is_empty());
+        assert!(workspace.basis_derivs.is_empty());
+        assert!(workspace.grid_indices.is_empty());
+        network
+            .try_forward_batch(&[], &mut [], &mut workspace)
+            .unwrap();
+        let mut wrong_shape = [123.0];
+        assert!(network
+            .try_forward_batch(&[], &mut wrong_shape, &mut workspace)
+            .is_err());
+        assert_eq!(wrong_shape, [123.0]);
+
+        let mut output = vec![f32::NAN; expected.len()];
+        network
+            .try_forward_batch(&input, &mut output, &mut workspace)
+            .unwrap();
+        assert_eq!(output, expected);
+    }
 }

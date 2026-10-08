@@ -1165,6 +1165,54 @@ impl KanLayer {
     }
 }
 
+impl KanLayer {
+    pub(crate) fn normalization(&self) -> Normalization<'_> {
+        Normalization {
+            mean: &self.mean,
+            std: &self.std,
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn wire_simd_width(&self) -> usize {
+        self.simd_width
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn from_record(data: crate::format::layer::LayerRecord) -> crate::ArkanResult<Self> {
+        crate::math::spline::validate_spline(data.grid_size, data.order, data.grid_range)?;
+        // Recompute knots from grid_size, order, and grid_range
+        let knots = compute_knots(data.grid_size, data.order, data.grid_range);
+
+        let layer = KanLayer {
+            in_dim: data.in_dim,
+            out_dim: data.out_dim,
+            order: data.order,
+            grid_size: data.grid_size,
+            global_basis_size: data.global_basis_size,
+            local_basis_size: data.local_basis_size,
+            basis_aligned: data.basis_aligned,
+            grid_range: data.grid_range,
+            knots,
+            mean: data.mean,
+            std: data.std,
+            weights: data.weights,
+            bias: data.bias,
+            simd_width: data.simd_width,
+        };
+        layer.validate_layout()?;
+        if layer
+            .weights
+            .iter()
+            .chain(&layer.bias)
+            .any(|x| !x.is_finite())
+        {
+            return Err(crate::ArkanError::cpu("non-finite layer parameters"));
+        }
+        Ok(layer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1544,53 +1592,5 @@ mod tests {
         // Empty input should return Ok
         let result = layer.try_forward_batch(&inputs, &mut outputs, &mut workspace);
         assert!(result.is_ok());
-    }
-}
-
-impl KanLayer {
-    pub(crate) fn normalization(&self) -> Normalization<'_> {
-        Normalization {
-            mean: &self.mean,
-            std: &self.std,
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    pub(crate) fn wire_simd_width(&self) -> usize {
-        self.simd_width
-    }
-
-    #[cfg(feature = "serde")]
-    pub(crate) fn from_record(data: crate::format::layer::LayerRecord) -> crate::ArkanResult<Self> {
-        crate::math::spline::validate_spline(data.grid_size, data.order, data.grid_range)?;
-        // Recompute knots from grid_size, order, and grid_range
-        let knots = compute_knots(data.grid_size, data.order, data.grid_range);
-
-        let layer = KanLayer {
-            in_dim: data.in_dim,
-            out_dim: data.out_dim,
-            order: data.order,
-            grid_size: data.grid_size,
-            global_basis_size: data.global_basis_size,
-            local_basis_size: data.local_basis_size,
-            basis_aligned: data.basis_aligned,
-            grid_range: data.grid_range,
-            knots,
-            mean: data.mean,
-            std: data.std,
-            weights: data.weights,
-            bias: data.bias,
-            simd_width: data.simd_width,
-        };
-        layer.validate_layout()?;
-        if layer
-            .weights
-            .iter()
-            .chain(&layer.bias)
-            .any(|x| !x.is_finite())
-        {
-            return Err(crate::ArkanError::cpu("non-finite layer parameters"));
-        }
-        Ok(layer)
     }
 }

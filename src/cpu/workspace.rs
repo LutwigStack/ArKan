@@ -728,6 +728,73 @@ impl<'a> Drop for WorkspaceGuard<'a> {
     }
 }
 
+impl KanNetwork {
+    /// Creates a workspace sized for this network (fallible version).
+    ///
+    /// The workspace is preallocated for the given maximum batch size.
+    /// Reuse this workspace across all forward/backward calls to achieve
+    /// zero-allocation inference and training.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_batch` - Maximum batch size you'll use with this workspace
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArkanError::Overflow`] if buffer size calculations overflow.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let network = KanNetwork::new(KanConfig::preset());
+    /// let mut workspace = network.try_create_workspace(64)?;
+    /// # Ok::<(), arkan::ArkanError>(())
+    /// ```
+    #[must_use = "this returns a Result that should be handled"]
+    pub fn try_create_workspace(&self, max_batch: usize) -> ArkanResult<Workspace> {
+        self.validate_layout()?;
+        let mut ws = Workspace::new(&self.config);
+        ws.try_reserve(max_batch, &self.config)?;
+        Ok(ws)
+    }
+
+    /// Creates a workspace sized for this network.
+    ///
+    /// The workspace is preallocated for the given maximum batch size.
+    /// Reuse this workspace across all forward/backward calls to achieve
+    /// zero-allocation inference and training.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_batch` - Maximum batch size you'll use with this workspace
+    ///
+    /// # Panics
+    ///
+    /// Panics if buffer size calculations overflow. Use [`try_create_workspace`](Self::try_create_workspace)
+    /// for a fallible version.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arkan::{KanConfig, KanNetwork};
+    ///
+    /// let network = KanNetwork::new(KanConfig::preset());
+    ///
+    /// // Create workspace for batches up to 64
+    /// let mut workspace = network.create_workspace(64);
+    ///
+    /// // Can be used for any batch size <= 64
+    /// // Workspace will grow automatically if needed, but that causes allocation
+    /// ```
+    #[must_use = "this creates a new workspace without modifying anything"]
+    pub fn create_workspace(&self, max_batch: usize) -> Workspace {
+        self.try_create_workspace(max_batch)
+            .expect("KanNetwork::create_workspace: buffer size overflow")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,72 +947,5 @@ mod tests {
         // Overflow in gradient size calculation
         let result = ws.try_prepare_training(usize::MAX / 4, &config, &dims);
         assert!(result.is_err());
-    }
-}
-
-impl KanNetwork {
-    /// Creates a workspace sized for this network (fallible version).
-    ///
-    /// The workspace is preallocated for the given maximum batch size.
-    /// Reuse this workspace across all forward/backward calls to achieve
-    /// zero-allocation inference and training.
-    ///
-    /// # Arguments
-    ///
-    /// * `max_batch` - Maximum batch size you'll use with this workspace
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ArkanError::Overflow`] if buffer size calculations overflow.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use arkan::{KanConfig, KanNetwork};
-    ///
-    /// let network = KanNetwork::new(KanConfig::preset());
-    /// let mut workspace = network.try_create_workspace(64)?;
-    /// # Ok::<(), arkan::ArkanError>(())
-    /// ```
-    #[must_use = "this returns a Result that should be handled"]
-    pub fn try_create_workspace(&self, max_batch: usize) -> ArkanResult<Workspace> {
-        self.validate_layout()?;
-        let mut ws = Workspace::new(&self.config);
-        ws.try_reserve(max_batch, &self.config)?;
-        Ok(ws)
-    }
-
-    /// Creates a workspace sized for this network.
-    ///
-    /// The workspace is preallocated for the given maximum batch size.
-    /// Reuse this workspace across all forward/backward calls to achieve
-    /// zero-allocation inference and training.
-    ///
-    /// # Arguments
-    ///
-    /// * `max_batch` - Maximum batch size you'll use with this workspace
-    ///
-    /// # Panics
-    ///
-    /// Panics if buffer size calculations overflow. Use [`try_create_workspace`](Self::try_create_workspace)
-    /// for a fallible version.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use arkan::{KanConfig, KanNetwork};
-    ///
-    /// let network = KanNetwork::new(KanConfig::preset());
-    ///
-    /// // Create workspace for batches up to 64
-    /// let mut workspace = network.create_workspace(64);
-    ///
-    /// // Can be used for any batch size <= 64
-    /// // Workspace will grow automatically if needed, but that causes allocation
-    /// ```
-    #[must_use = "this creates a new workspace without modifying anything"]
-    pub fn create_workspace(&self, max_batch: usize) -> Workspace {
-        self.try_create_workspace(max_batch)
-            .expect("KanNetwork::create_workspace: buffer size overflow")
     }
 }

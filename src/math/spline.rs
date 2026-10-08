@@ -91,7 +91,7 @@ pub(crate) fn validate_spline(
     order: usize,
     grid_range: (f32, f32),
 ) -> Result<(), crate::config::ConfigError> {
-    use crate::config::{ConfigError, MAX_GRID_SIZE, MAX_SPLINE_ORDER};
+    use crate::config::{ConfigError, MAX_GRID_SIZE};
     if grid_size == 0 || grid_size > MAX_GRID_SIZE {
         return Err(ConfigError::InvalidGridSize(grid_size));
     }
