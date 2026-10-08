@@ -557,9 +557,9 @@ Use Result-style when inputs may be malformed or for graceful error handling.
 ## GPU freshness and later crate extraction
 
 GPU conversion captures the CPU's checked layout and actual per-layer statistics.
-CPU→GPU synchronization refreshes weights, bias and normalization; GPU→CPU reads
-and validates the complete snapshot before changing the destination. Native GPU
-optimizer updates are not automatically reflected in the CPU model. Call the
+CPU→GPU synchronization refreshes weights, bias and normalization; GPU→CPU checks
+layout/storage and completes all snapshot readbacks before changing the destination.
+Native GPU optimizer updates are not automatically reflected in the CPU model. Call the
 explicit sync method before CPU inference, serialization or baking.
 
 GPU execution checks legacy model metadata, tensor ranks and actual storage
