@@ -524,6 +524,7 @@ impl BakedModel {
                     layer.order
                 )));
             }
+            layer.validate_layout()?;
             if layer.in_dim != dims[i]
                 || layer.out_dim != dims[i + 1]
                 || layer.in_dim == 0

@@ -248,3 +248,51 @@ fn requant_saturates_before_narrowing_to_i64() {
         assert_eq!(output, [expected]);
     }
 }
+
+#[test]
+fn fallible_bake_rejects_stale_range_knots_with_and_without_calibration() {
+    let mut net = network(1, (-1.0, 1.0));
+    net.config.grid_range = (-2.0, 2.0);
+    net.layers[0].grid_range = (-2.0, 2.0);
+    let results: Vec<bool> = [None, Some(&[1.0][..])]
+        .into_iter()
+        .map(|calibration| {
+            matches!(
+                std::panic::catch_unwind(|| BakedModel::try_from_network(&net, calibration)),
+                Ok(Err(_))
+            )
+        })
+        .collect();
+    assert_eq!(results, [true, true], "stale range cache must return Err");
+}
+
+#[test]
+fn fallible_bake_rejects_stale_order_knots_with_and_without_calibration() {
+    let config = KanConfig {
+        spline_order: 2,
+        grid_size: 1,
+        ..network(1, (-1.0, 1.0)).config
+    };
+    let mut net = KanNetwork::new(config);
+    net.config.spline_order = 5;
+    let layer = &mut net.layers[0];
+    layer.order = 5;
+    layer.global_basis_size = 6;
+    layer.local_basis_size = 6;
+    layer.basis_aligned = 8;
+    layer.weights.resize(6, 1.0);
+    let results: Vec<bool> = [None, Some(&[0.0][..])]
+        .into_iter()
+        .map(|calibration| {
+            matches!(
+                std::panic::catch_unwind(|| BakedModel::try_from_network(&net, calibration)),
+                Ok(Err(_))
+            )
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [true, true],
+        "stale order cache must return Err without panicking"
+    );
+}
