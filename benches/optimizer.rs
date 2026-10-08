@@ -23,8 +23,11 @@ fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> V
 
 /// Benchmark raw train_step (inline SGD, no momentum)
 fn bench_raw_train_step(c: &mut Criterion) {
-    let config = KanConfig::preset();
-    let mut network = KanNetwork::new(config.clone());
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
+    let network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256];
     let mut group = c.benchmark_group("raw_train_step");
@@ -33,18 +36,25 @@ fn bench_raw_train_step(c: &mut Criterion) {
         let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
         let targets = make_inputs(config.output_dim, config.grid_range, batch, 123);
         let mut workspace = network.create_workspace(batch);
+        network
+            .clone()
+            .train_step(&inputs, &targets, None, 0.001, &mut workspace);
 
         group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
         group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &_batch| {
-            b.iter(|| {
-                network.train_step(
-                    black_box(&inputs),
-                    black_box(&targets),
-                    None,
-                    0.001,
-                    &mut workspace,
-                );
-            });
+            b.iter_batched_ref(
+                || network.clone(),
+                |network| {
+                    network.train_step(
+                        black_box(&inputs),
+                        black_box(&targets),
+                        None,
+                        0.001,
+                        &mut workspace,
+                    );
+                },
+                criterion::BatchSize::SmallInput,
+            );
         });
     }
 
@@ -53,92 +63,71 @@ fn bench_raw_train_step(c: &mut Criterion) {
 
 /// Benchmark train_step with gradient clipping
 fn bench_train_step_clipping(c: &mut Criterion) {
-    let config = KanConfig::preset();
-    let mut network = KanNetwork::new(config.clone());
-
-    let batch = 64_usize;
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
+    let network = KanNetwork::new(config.clone());
+    let batch = 64;
     let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
     let targets = make_inputs(config.output_dim, config.grid_range, batch, 123);
     let mut workspace = network.create_workspace(batch);
-
-    let opts_no_clip = TrainOptions {
-        max_grad_norm: None,
-        weight_decay: 0.0,
-    };
-    let opts_clip = TrainOptions {
-        max_grad_norm: Some(1.0),
-        weight_decay: 0.0,
-    };
-    let opts_decay = TrainOptions {
-        max_grad_norm: None,
-        weight_decay: 0.01,
-    };
-    let opts_both = TrainOptions {
-        max_grad_norm: Some(1.0),
-        weight_decay: 0.01,
-    };
-
+    network
+        .clone()
+        .train_step(&inputs, &targets, None, 0.001, &mut workspace);
+    let norm = workspace
+        .weight_grads
+        .iter()
+        .chain(&workspace.bias_grads)
+        .flat_map(|g| g.as_slice())
+        .map(|g| (*g as f64).powi(2))
+        .sum::<f64>()
+        .sqrt() as f32;
+    assert!(
+        norm.is_finite() && norm > 0.0,
+        "clipping workload needs finite nonzero gradients"
+    );
+    println!("Seeded CPU clipping workload gradient norm: {norm}");
+    let cases = [
+        ("no_options", None, 0.0),
+        ("clip_active_half_norm", Some(norm * 0.5), 0.0),
+        ("clip_inactive_double_norm", Some(norm * 2.0), 0.0),
+        ("weight_decay_0.01", None, 0.01),
+        ("active_clip_and_decay", Some(norm * 0.5), 0.01),
+    ];
     let mut group = c.benchmark_group("train_options_batch64");
     group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
-
-    group.bench_function("no_options", |b| {
-        b.iter(|| {
-            network.train_step_with_options(
-                black_box(&inputs),
-                black_box(&targets),
-                None,
-                0.001,
-                &mut workspace,
-                &opts_no_clip,
+    for (name, max_grad_norm, weight_decay) in cases {
+        let opts = TrainOptions {
+            max_grad_norm,
+            weight_decay,
+        };
+        group.bench_function(name, |b| {
+            b.iter_batched_ref(
+                || network.clone(),
+                |network| {
+                    black_box(network.train_step_with_options(
+                        black_box(&inputs),
+                        black_box(&targets),
+                        None,
+                        0.001,
+                        &mut workspace,
+                        &opts,
+                    ));
+                },
+                criterion::BatchSize::SmallInput,
             );
         });
-    });
-
-    group.bench_function("grad_clip_1.0", |b| {
-        b.iter(|| {
-            network.train_step_with_options(
-                black_box(&inputs),
-                black_box(&targets),
-                None,
-                0.001,
-                &mut workspace,
-                &opts_clip,
-            );
-        });
-    });
-
-    group.bench_function("weight_decay_0.01", |b| {
-        b.iter(|| {
-            network.train_step_with_options(
-                black_box(&inputs),
-                black_box(&targets),
-                None,
-                0.001,
-                &mut workspace,
-                &opts_decay,
-            );
-        });
-    });
-
-    group.bench_function("clip_and_decay", |b| {
-        b.iter(|| {
-            network.train_step_with_options(
-                black_box(&inputs),
-                black_box(&targets),
-                None,
-                0.001,
-                &mut workspace,
-                &opts_both,
-            );
-        });
-    });
-
+    }
     group.finish();
 }
 
 /// Optimizer initialization cost
 fn bench_optimizer_init(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let network = KanNetwork::new(config.clone());
 
     let mut group = c.benchmark_group("optimizer_init");
@@ -179,13 +168,19 @@ fn bench_optimizer_init(c: &mut Criterion) {
 
 /// Compare different learning rates overhead (should be negligible)
 fn bench_learning_rates(c: &mut Criterion) {
-    let config = KanConfig::preset();
-    let mut network = KanNetwork::new(config.clone());
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
+    let network = KanNetwork::new(config.clone());
 
     let batch = 64_usize;
     let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
     let targets = make_inputs(config.output_dim, config.grid_range, batch, 123);
     let mut workspace = network.create_workspace(batch);
+    network
+        .clone()
+        .train_step(&inputs, &targets, None, 0.001, &mut workspace);
 
     let lrs = [0.0001_f32, 0.001, 0.01, 0.1];
     let mut group = c.benchmark_group("learning_rates_batch64");
@@ -196,15 +191,19 @@ fn bench_learning_rates(c: &mut Criterion) {
             BenchmarkId::from_parameter(format!("lr_{}", lr)),
             &lr,
             |b, &lr| {
-                b.iter(|| {
-                    network.train_step(
-                        black_box(&inputs),
-                        black_box(&targets),
-                        None,
-                        lr,
-                        &mut workspace,
-                    );
-                });
+                b.iter_batched_ref(
+                    || network.clone(),
+                    |network| {
+                        network.train_step(
+                            black_box(&inputs),
+                            black_box(&targets),
+                            None,
+                            lr,
+                            &mut workspace,
+                        );
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
             },
         );
     }

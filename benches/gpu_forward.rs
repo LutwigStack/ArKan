@@ -11,7 +11,7 @@
 //! - `gpu_spline_order`: Spline order impact
 //! - `gpu_grid_size`: Grid size impact
 //! - `gpu_latency_distribution`: Latency percentiles
-//! - `gpu_memory_throughput`: Memory bandwidth analysis
+//! - `gpu_memory_throughput`: Modeled selected buffer bytes / elapsed time
 //! - `gpu_softmax`: GPU softmax at different batch sizes
 //! - `gpu_softmax_overhead`: Forward vs forward+softmax comparison
 //!
@@ -80,7 +80,10 @@ fn bench_gpu_forward(c: &mut Criterion) {
         }
     };
 
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let cpu_network = KanNetwork::new(config.clone());
 
     // Create GPU network
@@ -139,7 +142,10 @@ fn bench_cpu_vs_gpu(c: &mut Criterion) {
         Err(_) => return,
     };
 
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let cpu_network = KanNetwork::new(config.clone());
 
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
@@ -504,7 +510,10 @@ fn bench_gpu_latency_distribution(c: &mut Criterion) {
         Err(_) => return,
     };
 
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let cpu_network = KanNetwork::new(config.clone());
 
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
@@ -581,7 +590,8 @@ fn bench_gpu_latency_distribution(_c: &mut Criterion) {}
 // ============================================================================
 
 #[cfg(feature = "gpu")]
-fn estimate_gpu_memory_bytes(config: &KanConfig, batch_size: usize) -> usize {
+/// Counts selected device buffers plus host transfer arrays once; not GPU/DRAM traffic.
+fn estimate_gpu_working_set_bytes(config: &KanConfig, batch_size: usize) -> usize {
     let basis_size = config.basis_size();
     let layer_dims = config.layer_dims();
 
@@ -623,7 +633,10 @@ fn bench_gpu_memory_throughput(c: &mut Criterion) {
         Err(_) => return,
     };
 
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let cpu_network = KanNetwork::new(config.clone());
 
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
@@ -632,7 +645,7 @@ fn bench_gpu_memory_throughput(c: &mut Criterion) {
     };
 
     let batch_sizes = [1_usize, 16, 64, 256, 1024];
-    let mut group = c.benchmark_group("gpu_memory_throughput");
+    let mut group = c.benchmark_group("gpu_modeled_working_set");
 
     let max_batch = *batch_sizes.iter().max().unwrap();
     let mut workspace = match gpu_network.create_workspace(max_batch) {
@@ -642,7 +655,7 @@ fn bench_gpu_memory_throughput(c: &mut Criterion) {
 
     for &batch in &batch_sizes {
         let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
-        let mem_bytes = estimate_gpu_memory_bytes(&config, batch);
+        let mem_bytes = estimate_gpu_working_set_bytes(&config, batch);
 
         // Use bytes as throughput metric
         group.throughput(Throughput::Bytes(mem_bytes as u64));
@@ -667,9 +680,9 @@ fn bench_gpu_memory_throughput(c: &mut Criterion) {
     println!("Config: {:?}", config.layer_dims());
 
     let batch = 256;
-    let mem_bytes = estimate_gpu_memory_bytes(&config, batch);
+    let mem_bytes = estimate_gpu_working_set_bytes(&config, batch);
     println!(
-        "Estimated memory per forward (batch={}): {} bytes ({:.2} KB)",
+        "Modeled selected buffer bytes (batch={}): {} bytes ({:.2} KB)",
         batch,
         mem_bytes,
         mem_bytes as f64 / 1024.0
@@ -694,7 +707,10 @@ fn bench_gpu_memory_throughput(c: &mut Criterion) {
     let time_per_forward_us = elapsed.as_micros() as f64 / iterations as f64;
 
     println!("Time per forward: {:.2} µs", time_per_forward_us);
-    println!("Achieved bandwidth: {:.2} GB/s", bandwidth_gbs);
+    println!(
+        "Modeled selected bytes / elapsed time: {:.2} GB/s",
+        bandwidth_gbs
+    );
 }
 
 #[cfg(not(feature = "gpu"))]
@@ -715,7 +731,10 @@ fn bench_cpu_vs_gpu_scaling(c: &mut Criterion) {
         Err(_) => return,
     };
 
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let cpu_network = KanNetwork::new(config.clone());
 
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
@@ -836,7 +855,10 @@ fn bench_gpu_softmax(c: &mut Criterion) {
         Err(_) => return,
     };
 
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let cpu_network = KanNetwork::new(config.clone());
 
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {
@@ -885,7 +907,10 @@ fn bench_forward_vs_forward_softmax(c: &mut Criterion) {
         Err(_) => return,
     };
 
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let cpu_network = KanNetwork::new(config.clone());
 
     let mut gpu_network = match GpuNetwork::from_cpu(&backend, &cpu_network) {

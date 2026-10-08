@@ -16,22 +16,18 @@ Run:
 """
 
 import time
+import statistics
 import sys
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
+from bench_reference import find_span, compute_basis_vectorized, forward_layer, capture_reset
 
-# Check CUDA availability
-if not torch.cuda.is_available():
-    print("ERROR: CUDA not available. This benchmark requires a CUDA-capable GPU.")
-    print("For CPU benchmarks, use: python scripts/bench_pytorch_train.py")
-    sys.exit(1)
+compute_basis_vectorized_gpu = compute_basis_vectorized
 
 DEVICE = torch.device("cuda")
-print(f"GPU: {torch.cuda.get_device_name(0)}")
-print(f"CUDA Version: {torch.version.cuda}")
-print(f"PyTorch Version: {torch.__version__}")
+
 
 # Try importing KAN implementations
 HAVE_EFFICIENT_KAN = False
@@ -80,53 +76,15 @@ def compute_knots(cfg: KanConfig, device: torch.device) -> torch.Tensor:
     )
 
 
-def find_span(x: torch.Tensor, order: int, grid_size: int) -> torch.Tensor:
-    """Find knot span index."""
-    n = grid_size + order
-    return torch.clamp((x * grid_size).floor().to(torch.long), min=order, max=n - 1)
-
-
-def compute_basis_vectorized_gpu(
-    x: torch.Tensor, span: torch.Tensor, knots: torch.Tensor, order: int
-) -> torch.Tensor:
-    """Compute B-spline basis on GPU."""
-    batch, in_dim = x.shape
-    device = x.device
-    dtype = x.dtype
-    
-    basis = torch.zeros(batch, in_dim, order + 1, dtype=dtype, device=device)
-    basis[:, :, 0] = 1.0
-    
-    left = torch.zeros(order + 1, batch, in_dim, dtype=dtype, device=device)
-    right = torch.zeros(order + 1, batch, in_dim, dtype=dtype, device=device)
-    
-    for j in range(1, order + 1):
-        idx_left = span + 1 - j
-        idx_right = span + j
-        left[j] = x - knots[idx_left]
-        right[j] = knots[idx_right] - x
-        
-        saved = torch.zeros(batch, in_dim, dtype=dtype, device=device)
-        for r in range(j):
-            denom = right[r + 1] + left[j - r]
-            mask = denom.abs() > 1e-6
-            safe_denom = torch.where(mask, denom, torch.ones_like(denom))
-            temp = (basis[:, :, r] / safe_denom) * mask
-            basis[:, :, r] = saved + right[r + 1] * temp
-            saved = left[j - r] * temp
-        basis[:, :, j] = saved
-    
-    return basis
-
-
 def make_network_gpu(cfg: KanConfig, device: torch.device) -> list[dict]:
     """Create ArKan-style network on GPU."""
+    generator = torch.Generator(device=device).manual_seed(42)
     layers = []
     dims = [cfg.input_dim, *cfg.hidden_dims, cfg.output_dim]
     global_basis = cfg.grid_size + cfg.spline_order
     
     for in_dim, out_dim in zip(dims[:-1], dims[1:]):
-        weights = torch.randn(out_dim, in_dim, global_basis, dtype=torch.float32, device=device)
+        weights = torch.randn(out_dim, in_dim, global_basis, generator=generator, dtype=torch.float32, device=device)
         bias = torch.zeros(out_dim, dtype=torch.float32, device=device)
         layers.append({"in": in_dim, "out": out_dim, "weights": weights, "bias": bias})
     
@@ -139,21 +97,7 @@ def forward_arkan_style_gpu(
     """Forward pass (ArKan-style B-spline) on GPU."""
     x = inputs
     for layer in network:
-        span = find_span(x, cfg.spline_order, cfg.grid_size)
-        basis = compute_basis_vectorized_gpu(x, span, knots, cfg.spline_order)
-        
-        start = span - cfg.spline_order
-        basis_idx = start.unsqueeze(-1) + torch.arange(cfg.spline_order + 1, device=x.device)
-        
-        w = layer["weights"].unsqueeze(0).expand(basis_idx.shape[0], -1, -1, -1)
-        idx = basis_idx.unsqueeze(1).clamp(min=0).expand(-1, layer["out"], -1, -1)
-        w_chunks = torch.gather(w, dim=3, index=idx)
-        
-        b_exp = basis.unsqueeze(1)
-        out = (w_chunks * b_exp).sum(dim=3).sum(dim=2)
-        out = out + layer["bias"]
-        x = out
-    
+        x = forward_layer(x, layer['weights'], layer['bias'], knots, cfg.grid_size, cfg.spline_order, layer.get('mean', 0.0), layer.get('std', 1.0))
     return x
 
 
@@ -170,11 +114,13 @@ def bench_forward_gpu(
     repeats: int = 100,
 ) -> float:
     """Benchmark forward pass on GPU."""
+    torch.manual_seed(123)
     inputs = torch.rand(batch, cfg.input_dim, device=DEVICE)
     
     # Warmup
     for _ in range(warmup):
-        _ = forward_fn(inputs)
+        with torch.no_grad():
+            _ = forward_fn(inputs)
         torch_sync()
     
     # Measure
@@ -182,11 +128,12 @@ def bench_forward_gpu(
     for _ in range(repeats):
         torch_sync()
         t0 = time.perf_counter()
-        _ = forward_fn(inputs)
+        with torch.no_grad():
+            _ = forward_fn(inputs)
         torch_sync()
         times.append(time.perf_counter() - t0)
     
-    return min(times) * 1000.0  # ms
+    return statistics.median(times) * 1000.0  # ms
 
 
 def bench_train_step_gpu(
@@ -199,13 +146,16 @@ def bench_train_step_gpu(
     repeats: int = 50,
 ) -> float:
     """Benchmark full train step (forward + backward + optimizer) on GPU."""
+    torch.manual_seed(123)
     inputs = torch.rand(batch, cfg.input_dim, device=DEVICE)
     targets = torch.rand(batch, cfg.output_dim, device=DEVICE)
     loss_fn = torch.nn.MSELoss()
     
+    reset = capture_reset(model, optimizer)
+
     # Warmup
     for _ in range(warmup):
-        optimizer.zero_grad()
+        reset()
         outputs = model(inputs)
         loss = loss_fn(outputs, targets)
         loss.backward()
@@ -215,7 +165,7 @@ def bench_train_step_gpu(
     # Measure
     times = []
     for _ in range(repeats):
-        optimizer.zero_grad()
+        reset()
         torch_sync()
         t0 = time.perf_counter()
         outputs = model(inputs)
@@ -225,11 +175,12 @@ def bench_train_step_gpu(
         torch_sync()
         times.append(time.perf_counter() - t0)
     
-    return min(times) * 1000.0  # ms
+    return statistics.median(times) * 1000.0  # ms
 
 
 def bench_arkan_style_forward(batch: int, cfg: KanConfig, repeats: int = 100) -> float:
     """Benchmark ArKan-style B-spline forward on GPU."""
+    torch.manual_seed(42)
     knots = compute_knots(cfg, DEVICE)
     network = make_network_gpu(cfg, DEVICE)
     inputs = torch.rand(batch, cfg.input_dim, device=DEVICE)
@@ -247,7 +198,7 @@ def bench_arkan_style_forward(batch: int, cfg: KanConfig, repeats: int = 100) ->
         torch_sync()
         times.append(time.perf_counter() - t0)
     
-    return min(times) * 1000.0  # ms
+    return statistics.median(times) * 1000.0  # ms
 
 
 def run_efficient_kan_benchmarks(cfg: KanConfig):
@@ -255,6 +206,7 @@ def run_efficient_kan_benchmarks(cfg: KanConfig):
     print("\n--- Efficient-KAN (GPU) ---")
     
     layers = [cfg.input_dim, *cfg.hidden_dims, cfg.output_dim]
+    torch.manual_seed(42)
     model = EfficientKAN(
         layers,
         grid_size=cfg.grid_size,
@@ -284,6 +236,7 @@ def run_fast_kan_benchmarks(cfg: KanConfig):
     print("\n--- FastKAN (GPU, RBF) ---")
     
     layers = [cfg.input_dim, *cfg.hidden_dims, cfg.output_dim]
+    torch.manual_seed(42)
     model = FastKAN(
         layers,
         num_grids=cfg.grid_size,
@@ -351,6 +304,7 @@ def run_latency_percentiles(cfg: KanConfig):
     
     if HAVE_EFFICIENT_KAN:
         layers = [cfg.input_dim, *cfg.hidden_dims, cfg.output_dim]
+        torch.manual_seed(42)
         model = EfficientKAN(layers, grid_size=cfg.grid_size, spline_order=cfg.spline_order).to(DEVICE)
         model.eval()
         
@@ -372,6 +326,7 @@ def run_latency_percentiles(cfg: KanConfig):
     
     if HAVE_FAST_KAN:
         layers = [cfg.input_dim, *cfg.hidden_dims, cfg.output_dim]
+        torch.manual_seed(42)
         model = FastKAN(layers, num_grids=cfg.grid_size).to(DEVICE)
         model.eval()
         
@@ -455,9 +410,10 @@ def run_architecture_scaling(cfg: KanConfig):
             forward_arkan_style_gpu(network, arch_cfg, inputs, knots)
             torch_sync()
             times.append(time.perf_counter() - t0)
-        results["arkan-style"] = min(times) * 1000
+        results["arkan-style"] = statistics.median(times) * 1000
         
         if HAVE_EFFICIENT_KAN:
+            torch.manual_seed(42)
             model = EfficientKAN(layers, grid_size=cfg.grid_size, spline_order=cfg.spline_order).to(DEVICE)
             model.eval()
             
@@ -473,9 +429,10 @@ def run_architecture_scaling(cfg: KanConfig):
                     model(inputs)
                     torch_sync()
                     times.append(time.perf_counter() - t0)
-            results["efficient-kan"] = min(times) * 1000
+            results["efficient-kan"] = statistics.median(times) * 1000
         
         if HAVE_FAST_KAN:
+            torch.manual_seed(42)
             model = FastKAN(layers, num_grids=cfg.grid_size).to(DEVICE)
             model.eval()
             
@@ -491,7 +448,7 @@ def run_architecture_scaling(cfg: KanConfig):
                     model(inputs)
                     torch_sync()
                     times.append(time.perf_counter() - t0)
-            results["fast-kan"] = min(times) * 1000
+            results["fast-kan"] = statistics.median(times) * 1000
         
         # Print row
         efficient = f"{results.get('efficient-kan', 0):>12.3f} ms" if HAVE_EFFICIENT_KAN else "N/A"
@@ -517,6 +474,7 @@ def run_spline_config_analysis(cfg: KanConfig):
     print("-" * 60)
     
     for order, name in [(1, "linear"), (2, "quadratic"), (3, "cubic"), (4, "quartic"), (5, "quintic")]:
+        torch.manual_seed(42)
         model = EfficientKAN(layers, grid_size=5, spline_order=order).to(DEVICE)
         model.eval()
         
@@ -533,7 +491,7 @@ def run_spline_config_analysis(cfg: KanConfig):
                 torch_sync()
                 times.append(time.perf_counter() - t0)
         
-        t_ms = min(times) * 1000
+        t_ms = statistics.median(times) * 1000
         elems = batch * cfg.input_dim
         thrpt = elems / (t_ms / 1000.0)
         print(f"{order:<10} {name:<12} {t_ms:>12.3f} {thrpt/1e6:>12.2f} M/s")
@@ -544,6 +502,7 @@ def run_spline_config_analysis(cfg: KanConfig):
     print("-" * 60)
     
     for grid in [3, 5, 8, 12, 16]:
+        torch.manual_seed(42)
         model = EfficientKAN(layers, grid_size=grid, spline_order=3).to(DEVICE)
         model.eval()
         
@@ -560,7 +519,7 @@ def run_spline_config_analysis(cfg: KanConfig):
                 torch_sync()
                 times.append(time.perf_counter() - t0)
         
-        t_ms = min(times) * 1000
+        t_ms = statistics.median(times) * 1000
         basis_size = grid + 3  # order + grid
         elems = batch * cfg.input_dim
         thrpt = elems / (t_ms / 1000.0)
@@ -583,6 +542,7 @@ def run_memory_analysis(cfg: KanConfig):
     
     if HAVE_EFFICIENT_KAN:
         torch.cuda.empty_cache()
+        torch.manual_seed(42)
         model = EfficientKAN(layers, grid_size=cfg.grid_size, spline_order=cfg.spline_order).to(DEVICE)
         model_mem = torch.cuda.memory_allocated() - base_mem
         
@@ -600,6 +560,7 @@ def run_memory_analysis(cfg: KanConfig):
     
     if HAVE_FAST_KAN:
         torch.cuda.reset_peak_memory_stats()
+        torch.manual_seed(42)
         model = FastKAN(layers, num_grids=cfg.grid_size).to(DEVICE)
         model_mem = torch.cuda.memory_allocated() - base_mem
         
@@ -614,6 +575,9 @@ def run_memory_analysis(cfg: KanConfig):
 
 
 def main():
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is required; use bench_pytorch_train.py for CPU")
+    print(f"GPU: {torch.cuda.get_device_name(0)}; PyTorch: {torch.__version__}; CUDA: {torch.version.cuda}")
     cfg = KanConfig()
     
     print("=" * 70)

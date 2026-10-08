@@ -11,11 +11,10 @@
 //!
 //! By comparing these, you can estimate:
 //! - **History overhead**: `forward_training - forward_only`
-//! - **Backward overhead**: `full_train_step - forward_training`
+//! - **Loss + backward + SGD update estimate**: `full_train_step - forward_training`
 //!
-//! **Single network instance**: Unlike forward.rs, these benchmarks share one
-//! network across batch sizes. This is acceptable because we're comparing
-//! relative costs, not absolute timings across batch sizes.
+//! **Seeded base model**: The inference cases share immutable seed-42 weights;
+//! training cases restore those weights before every measured routine.
 //!
 //! **Workspace reuse**: Each batch size gets its own workspace, created once
 //! and reused. After first iteration, all calls are zero-allocation.
@@ -34,7 +33,10 @@ fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> V
 /// Benchmark forward pass only (for comparison with backward).
 /// Measures pure inference without saving history for backward pass.
 fn bench_forward_only(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256];
@@ -58,7 +60,10 @@ fn bench_forward_only(c: &mut Criterion) {
 
 /// Benchmark forward_batch_training (stores intermediate values for backward)
 fn bench_forward_training(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256];
@@ -90,7 +95,10 @@ fn bench_forward_training(c: &mut Criterion) {
 /// NOTE: Uses iter_batched_ref to reset network state between iterations
 /// for stable measurements (weights don't drift).
 fn bench_full_train_step(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let base_network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256];
@@ -105,8 +113,10 @@ fn bench_full_train_step(c: &mut Criterion) {
             b.iter_batched_ref(
                 || {
                     // Setup: clone network and create fresh workspace
-                    let network = base_network.clone();
-                    let workspace = network.create_workspace(batch);
+                    let mut network = base_network.clone();
+                    let mut workspace = network.create_workspace(batch);
+                    network.train_step(&inputs, &targets, None, 0.001, &mut workspace);
+                    network = base_network.clone();
                     (network, workspace)
                 },
                 |(network, workspace)| {
@@ -127,11 +137,14 @@ fn bench_full_train_step(c: &mut Criterion) {
 }
 
 /// Compute backward overhead by comparing train_step vs forward_training
-/// backward_time ≈ train_step_time - forward_training_time
+/// loss_backward_update_time ≈ train_step_time - forward_training_time
 ///
 /// NOTE: Uses iter_batched_ref for train_step to reset network state.
 fn bench_backward_overhead(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let base_network = KanNetwork::new(config.clone());
 
     // Fixed batch for detailed analysis
@@ -172,8 +185,10 @@ fn bench_backward_overhead(c: &mut Criterion) {
     group.bench_function("3_full_train_step", |b| {
         b.iter_batched_ref(
             || {
-                let network = base_network.clone();
-                let workspace = network.create_workspace(batch);
+                let mut network = base_network.clone();
+                let mut workspace = network.create_workspace(batch);
+                network.train_step(&inputs, &targets, None, 0.001, &mut workspace);
+                network = base_network.clone();
                 (network, workspace)
             },
             |(network, workspace)| {

@@ -1,4 +1,149 @@
-# ArKan Benchmark Results
+# Benchmark methodology
+
+The historical ArKan/PyTorch comparison ratios are **invalid pending a matched
+rerun**. The Python baselines used spans inconsistent with the grid range, and
+the competitor baseline stored only `order + 1` coefficients instead of
+`grid_size + order`. Training option timings also carried model and optimizer
+state between samples; the CPU/GPU training comparison used different optimizers.
+These defects invalidate the old speedup and option-overhead conclusions. No new
+performance measurements are published here.
+
+Historical Rust constants remain explicitly tagged in `scripts/bench_competitors.py`
+for provenance, separate from the current Python results. Their estimated
+`backward + update` column also includes loss computation. It is not a measured
+forward-plus-backward time and must not be compared with the Python `fwd_bwd`
+column. The original machine/date attribution is unverified; a current Python
+run does not remeasure those constants.
+
+Historical baked latency numbers measured the allocating `BakedModel::forward`
+convenience method. The current benchmark uses `forward_with_workspace`, so those
+latency ratios do not describe the current benchmark. Rerun on the same hardware
+and record the revision before making a new deployment latency claim.
+
+## Cases and state
+
+Rust models use seed 42. Training benchmarks clone the seeded base model for each
+measured step, and prepare reusable scratch buffers outside the timer. Learning
+rate and option cases start from the same weights, rather than from a model
+trained by a preceding case. The CPU optimizer suite measures raw SGD training,
+optimizer construction, and active/inactive clipping thresholds at one half/twice
+the measured initial gradient norm. The norm is asserted finite and nonzero and
+printed before timing.
+
+GPU training uses `BatchSize::PerIteration`: each reset of the shared GPU model
+finishes before its measured step. `SmallInput` would run multiple setup closures
+before multiple routines and therefore reset the shared device model only before
+the first routine. Native GPU Adam resets both weights and moments for every
+sample. Training buffers are initialized before timing. CPU/GPU Adam comparison
+cases use the same seeded network, inputs, targets, and `AdamConfig::with_lr(0.001)`.
+Hybrid GPU timing includes transfers, backward readback, the CPU optimizer step,
+and updated-weight upload. Native timing includes its synchronous loss readback.
+These are different workflows; publish them with their operation boundaries.
+
+The GPU option cases use Adam plus `TrainOptions` clipping and weights-only
+option decay. The raw CPU option cases use SGD; they are not a backend speedup
+comparison. Standalone optimizer decay policies are separate from these options.
+
+`baked` measures batch-one inference for two calibrated seeded networks, using
+reusable workspaces for both f32 and baked inference. Workspace creation and
+calibration are outside timing. `size_bytes()` is an approximate baked
+payload count; it excludes some metadata, capacities, allocator overhead, and the
+workspace. The f32 column counts only weights and biases. Neither reports total
+process memory or serialized size.
+
+Python baseline operations share `scripts/bench_reference.py`: normalize, clamp,
+find the span from the actual knots, evaluate local basis functions, and gather
+active global coefficients from `[output, input, global_basis]`. Hidden layers
+use identity normalization. The benchmark defaults use identity input
+normalization; the dictionary forward helpers also accept per-layer `mean` and
+`std`. Same-weight tests use the five checked-in training fixtures, including
+multilayer and order-four cases, and check clamped gradients and coefficient
+gathering. The GPU script's tensor helper can be tested on CPU without CUDA.
+
+Legacy baselines initialize unit-normal coefficients; the competitor pure-spline
+model scales its initial coefficients by 0.1. These are separate workloads.
+Python reports medians. The legacy CPU scripts default to five samples; the
+competitor runner uses 50 samples after 10 warmups. Repeat counts are part of the
+result and must match for a comparison. Legacy CPU full-step timing uses SGD;
+the competitor runner and third-party CUDA training runner use Adam. Competitor
+Adam buffers are prepared outside timing, and model weights plus zero optimizer
+state are restored before every warmup and measured step. CUDA synchronizes
+before and after timing. Runtime metadata records UTC timestamp, platform,
+Python/PyTorch versions, thread count, revision, compiler, and Rust flags.
+
+`efficient-kan` adds a base/residual term; FastKAN uses RBFs. Their timings are
+workload comparisons, not costs of equivalent mathematical functions. A seed
+alone does not create identical weights across Rust and PyTorch RNGs. Use a
+shared exported model and identical data for an actual same-function speedup
+claim; the parity fixtures establish mathematical agreement, not speedup.
+
+## Metrics and hardware
+
+`Throughput::Elements(batch * input_dim)` counts input elements, not samples or
+FLOPS. Report batch latency and latency per sample alongside it. The CPU and GPU
+memory groups report an approximate selected-buffer working-set size divided by
+elapsed time. Each selected buffer is counted once; this model is neither a
+complete allocation inventory nor measured cache/DRAM traffic. It cannot support
+roofline arithmetic intensity or a comparison with peak DDR bandwidth. Use
+hardware counters or a profiler for memory traffic.
+
+Record OS, CPU/GPU adapter, physical versus software GPU, revision, toolchain,
+features, flags, input/model fixtures, repeat counts, and thread count with every
+result. `wide::f32x8` and `simd_width = 8` do not establish AVX2 code generation.
+Portable builds and `RUSTFLAGS='-C target-cpu=native'` builds are separate cases;
+record `rustc --print cfg` with matching target flags. Software llvmpipe runs can
+validate correctness but do not establish physical GPU performance.
+
+## Run and validate
+
+```bash
+# Compile/link benchmark harnesses without taking performance measurements.
+cargo test --benches --no-run
+cargo test --benches --no-run --features serde,parallel,gpu
+
+# CPU suites (Criterion needs several minutes; run on an otherwise idle machine).
+cargo bench --bench forward --bench backward --bench optimizer
+cargo bench --bench scaling --bench spline_config --bench latency
+cargo bench --bench memory --bench baked
+cargo bench --features parallel --bench forward --bench backward
+
+# Physical GPU only; unset ARKAN_GPU_BENCH skips runtime benchmark cases.
+ARKAN_GPU_BENCH=1 cargo bench --features gpu --bench gpu_forward --bench gpu_backward
+
+# Install CPU PyTorch into a project/workspace-owned venv if needed.
+python3 -m venv .venv
+.venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+.venv/bin/python -m unittest discover -s scripts -p test_bench_reference.py
+.venv/bin/python scripts/bench_pytorch.py
+.venv/bin/python scripts/bench_pytorch_train.py
+.venv/bin/python scripts/bench_competitors.py
+
+# Example runtime smoke: build outside the runtime deadline.
+cargo build --example basic --example baked_inference
+python3 scripts/smoke_examples.py
+cargo build --features serde --example basic --example baked_inference
+python3 scripts/smoke_examples.py --serde
+```
+
+CI runs the CPU smoke with and without serde. Each example has a 30-second
+process timeout, and each CI smoke step has a two-minute timeout. The smoke checks
+finite single/batch inference output, completed baked inference, and bit-identical
+baked serialization output. It requires no datasets, downloads, GPU, or benchmark
+sampling. GPU CI compilation alone does not validate GPU runtime behavior.
+
+## Historical archive
+
+The tables below preserve the earlier published record. **All historical
+comparison ratios and performance conclusions are invalid pending a matched
+rerun under the methodology above.** Platform/date attribution describes the
+old report, not this checkout or a fresh run. Earlier baked accuracy and payload
+counts are retained as historical observations; their latency uses the allocating
+API. The old byte-rate tables do not measure DRAM bandwidth.
+
+<details>
+<summary>Superseded tables and conclusions (invalid for current comparisons)</summary>
+
+## Archived benchmark results
 
 **Platform:** Windows 11, AMD Ryzen (AVX2), NVIDIA GeForce RTX 4070 SUPER
 (Vulkan via wgpu 0.23)
@@ -834,3 +979,5 @@ emits a constant and receives no gradient. Nothing reports this — there is no
 ---
 
 *ArKan benchmark suite, v0.4.0*
+
+</details>

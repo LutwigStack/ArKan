@@ -228,6 +228,17 @@ jobs:
       - name: Build in-crate examples
         run: cargo build --examples
 
+      - name: Run bounded CPU example smoke
+        timeout-minutes: 2
+        run: python3 scripts/smoke_examples.py
+
+      - name: Build serde CPU smoke examples
+        run: cargo build --features serde --example basic --example baked_inference
+
+      - name: Run bounded serde CPU example smoke
+        timeout-minutes: 2
+        run: python3 scripts/smoke_examples.py --serde
+
       - name: Build sinusoid
         working-directory: examples/sinusoid
         run: cargo build

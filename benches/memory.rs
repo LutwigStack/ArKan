@@ -1,12 +1,7 @@
-//! Memory throughput benchmarks - roofline analysis.
+//! Approximate selected buffer working-set size alongside forward latency.
 //!
-//! Measures actual memory bandwidth utilization during forward pass.
-//! Goal: understand how close we are to peak memory bandwidth.
-//!
-//! Key metrics:
-//! - Bytes read/written per forward pass
-//! - Achieved GB/s
-//! - Arithmetic intensity (FLOPS/byte)
+//! The byte model counts each selected buffer once. It is neither memory
+//! traffic nor measured DRAM bandwidth; profiler counters are needed for that.
 
 use arkan::{KanConfig, KanNetwork};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -20,8 +15,8 @@ fn make_inputs(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64) -> V
         .collect()
 }
 
-/// Estimate bytes read/written for a forward pass
-fn estimate_memory_bytes(config: &KanConfig, batch_size: usize) -> usize {
+/// Approximate selected parameter/activation/basis buffer bytes, counted once.
+fn estimate_working_set_bytes(config: &KanConfig, batch_size: usize) -> usize {
     let basis_size = config.basis_size();
     let layer_dims = config.layer_dims();
 
@@ -53,28 +48,28 @@ fn estimate_memory_bytes(config: &KanConfig, batch_size: usize) -> usize {
         total_bytes += batch_size * in_dim * local_basis * 4;
     }
 
-    // Output write
-    total_bytes += batch_size * config.output_dim * 4;
-
     total_bytes
 }
 
-/// Benchmark with explicit memory throughput measurement
+/// Report modeled selected buffer size with forward latency.
 fn bench_memory_throughput(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let network = KanNetwork::new(config.clone());
 
     let batch_sizes = [1_usize, 16, 64, 256, 1024];
-    let mut group = c.benchmark_group("memory_throughput");
+    let mut group = c.benchmark_group("modeled_working_set");
 
     for &batch in &batch_sizes {
         let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
         let mut outputs = vec![0.0f32; batch * config.output_dim];
         let mut workspace = network.create_workspace(batch);
 
-        let mem_bytes = estimate_memory_bytes(&config, batch);
+        let mem_bytes = estimate_working_set_bytes(&config, batch);
 
-        // Use bytes as throughput metric
+        // Criterion reports modeled buffer bytes / time, not measured bandwidth.
         group.throughput(Throughput::Bytes(mem_bytes as u64));
         group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &_batch| {
             b.iter(|| {
@@ -86,9 +81,12 @@ fn bench_memory_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-/// Manual timing to compute GB/s
+/// Manual modeled working-set bytes / elapsed time, not a roofline analysis.
 fn bench_manual_bandwidth(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let network = KanNetwork::new(config.clone());
 
     let batch = 256_usize;
@@ -96,10 +94,10 @@ fn bench_manual_bandwidth(c: &mut Criterion) {
     let mut outputs = vec![0.0f32; batch * config.output_dim];
     let mut workspace = network.create_workspace(batch);
 
-    let mem_bytes = estimate_memory_bytes(&config, batch);
+    let mem_bytes = estimate_working_set_bytes(&config, batch);
     let iterations = 1000;
 
-    let mut group = c.benchmark_group("bandwidth_analysis");
+    let mut group = c.benchmark_group("modeled_working_set_rate");
 
     group.bench_function(format!("batch{}_bytes{}", batch, mem_bytes), |b| {
         b.iter_custom(|iters| {
@@ -114,11 +112,11 @@ fn bench_manual_bandwidth(c: &mut Criterion) {
     group.finish();
 
     // Print bandwidth analysis
-    println!("\n=== Memory Bandwidth Analysis ===");
+    println!("\n=== Modeled Working-Set Rate ===");
     println!("Config: {:?}", config.layer_dims());
     println!("Batch size: {}", batch);
     println!(
-        "Estimated memory per forward: {} bytes ({:.2} KB)",
+        "Modeled selected working-set bytes: {} bytes ({:.2} KB)",
         mem_bytes,
         mem_bytes as f64 / 1024.0
     );
@@ -139,13 +137,19 @@ fn bench_manual_bandwidth(c: &mut Criterion) {
     let time_per_forward_us = elapsed.as_micros() as f64 / iterations as f64;
 
     println!("Time per forward: {:.2} µs", time_per_forward_us);
-    println!("Achieved bandwidth: {:.2} GB/s", bandwidth_gbs);
-    println!("(Typical DDR4 peak: ~25-50 GB/s, DDR5: ~50-100 GB/s)");
+    println!(
+        "Modeled working-set bytes / elapsed time: {:.2} GB/s",
+        bandwidth_gbs
+    );
+    println!("This model does not measure DRAM/cache traffic or bandwidth.");
 }
 
 /// Cache pressure analysis - vary batch size to see cache effects
 fn bench_cache_pressure(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let network = KanNetwork::new(config.clone());
 
     // Batch sizes designed to stress different cache levels
@@ -158,7 +162,7 @@ fn bench_cache_pressure(c: &mut Criterion) {
         let mut outputs = vec![0.0f32; batch * config.output_dim];
         let mut workspace = network.create_workspace(batch);
 
-        let mem_bytes = estimate_memory_bytes(&config, batch);
+        let mem_bytes = estimate_working_set_bytes(&config, batch);
 
         group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
         group.bench_with_input(
@@ -184,7 +188,10 @@ fn bench_cache_pressure(c: &mut Criterion) {
 
 /// Workspace allocation vs reuse comparison
 fn bench_workspace_reuse(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let network = KanNetwork::new(config.clone());
 
     let batch = 64_usize;

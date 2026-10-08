@@ -29,12 +29,17 @@ Formulation notes (mandatory fairness disclaimer):
   - faithful-PyTorch: Pure B-spline matching ArKan's math, isolates language/runtime overhead.
   - ArKan (CPU): Pure B-spline, Rust, zero-allocation workspace reuse, optional SIMD/rayon.
   - ArKan (GPU/wgpu): Pure B-spline on GPU via custom WGSL shaders (not CUDA).
-    Note: ArKan GPU numbers are loaded from Rust cargo bench output (see results/arkan_bench.json).
+    Rust benchmarks are not run here. Embedded CPU constants are historical and invalid
+    for comparisons pending a matched rerun.
 
 Output: prints table to stdout + writes JSON to tasks/02-reference-parity-and-benchmarks/results/competitors.json
 """
 
 import json
+import platform
+import subprocess
+from datetime import datetime, timezone
+from bench_reference import find_span, compute_basis_vectorized as spline_basis, forward_layer, capture_reset
 import os
 import sys
 import statistics
@@ -52,7 +57,6 @@ import torch.nn as nn
 
 REPO_ROOT = Path(__file__).parent.parent
 RESULTS_DIR = REPO_ROOT / "tasks" / "02-reference-parity-and-benchmarks" / "results"
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 WARMUP = 10
 REPEATS = 50
@@ -121,41 +125,9 @@ def compute_knots(grid_size: int, spline_order: int, grid_range=(-3.0, 3.0),
 def compute_basis_vectorized(x: torch.Tensor, grid_size: int, spline_order: int,
                               knots: torch.Tensor) -> torch.Tensor:
     """Cox-de Boor recursion — same algorithm as ArKan. Autograd-safe (no in-place ops)."""
-    batch, in_dim = x.shape
-    device, dtype = x.device, x.dtype
-
-    n = grid_size + spline_order
-    span = torch.clamp((x * grid_size).floor().to(torch.long), min=spline_order, max=n - 1)
-
-    # Build left/right arrays (no in-place, using list then stack)
-    lefts  = [torch.zeros(batch, in_dim, dtype=dtype, device=device)]
-    rights = [torch.zeros(batch, in_dim, dtype=dtype, device=device)]
-    for j in range(1, spline_order + 1):
-        lefts.append(x - knots[span + 1 - j])
-        rights.append(knots[span + j] - x)
-
-    # Cox-de Boor recursion using lists (no in-place assignment)
-    basis_cols = [torch.ones(batch, in_dim, dtype=dtype, device=device)]
-    for _ in range(spline_order):
-        basis_cols.append(torch.zeros(batch, in_dim, dtype=dtype, device=device))
-
-    for j in range(1, spline_order + 1):
-        new_cols = []
-        saved = torch.zeros(batch, in_dim, dtype=dtype, device=device)
-        for r in range(j):
-            denom = rights[r + 1] + lefts[j - r]
-            mask = denom.abs() > 1e-6
-            safe = torch.where(mask, denom, torch.ones_like(denom))
-            temp = (basis_cols[r] / safe) * mask
-            new_col_r = saved + rights[r + 1] * temp
-            saved = lefts[j - r] * temp
-            new_cols.append(new_col_r)
-        new_cols.append(saved)
-        # Merge new columns for this pass
-        for r in range(j + 1):
-            basis_cols[r] = new_cols[r]
-
-    return torch.stack(basis_cols[:spline_order + 1], dim=2)  # [batch, in_dim, order+1]
+    x = x.clamp(knots[spline_order], knots[spline_order + grid_size])
+    span = find_span(x, spline_order, grid_size, knots=knots)
+    return spline_basis(x, span, knots, spline_order)
 
 
 class FaithfulKANLayer(nn.Module):
@@ -169,21 +141,13 @@ class FaithfulKANLayer(nn.Module):
         super().__init__()
         self.grid_size = grid_size
         self.spline_order = spline_order
-        order_p1 = spline_order + 1
-        # Weights for local support only: [out_dim, in_dim, order+1]
-        # This is the minimal representation matching ArKan's local B-spline evaluation
-        self.weights = nn.Parameter(torch.randn(out_dim, in_dim, order_p1) * 0.1)
+        # Global coefficients [out_dim, in_dim, grid_size + order], gathered by span.
+        self.weights = nn.Parameter(torch.randn(out_dim, in_dim, grid_size + spline_order) * 0.1)
         self.bias    = nn.Parameter(torch.zeros(out_dim))
 
     def forward(self, x: torch.Tensor, knots: torch.Tensor) -> torch.Tensor:
-        # basis: [batch, in_dim, order+1]
-        basis = compute_basis_vectorized(x, self.grid_size, self.spline_order, knots)
-        # Contraction: sum over in_dim and order+1
-        # einsum: "bio, oib -> bo" then sum out_dim... actually:
-        # basis [B, I, K], weights [O, I, K]
-        # out[b, o] = sum_i sum_k basis[b,i,k] * weights[o,i,k]
-        out = torch.einsum("bik,oik->bo", basis, self.weights) + self.bias
-        return out
+        return forward_layer(x, self.weights, self.bias, knots, self.grid_size, self.spline_order)
+
 
 
 class FaithfulKAN(nn.Module):
@@ -212,14 +176,18 @@ def cuda_sync():
         torch.cuda.synchronize()
 
 
-def time_fn(fn, warmup=WARMUP, repeats=REPEATS) -> float:
+def time_fn(fn, warmup=WARMUP, repeats=REPEATS, setup=None) -> float:
     """Return MEDIAN time in ms over `repeats` calls, after `warmup` iterations."""
     for _ in range(warmup):
+        if setup is not None:
+            setup()
         fn()
         cuda_sync()
 
     times_ms = []
     for _ in range(repeats):
+        if setup is not None:
+            setup()
         cuda_sync()
         t0 = time.perf_counter()
         fn()
@@ -238,6 +206,7 @@ def bench_efficient_kan(cfg: BenchConfig, batch: int, device: torch.device) -> d
     if not HAVE_EFFICIENT_KAN:
         return {"forward": None, "fwd_bwd": None, "full_step": None, "note": "not_installed"}
 
+    torch.manual_seed(42)
     model = EfficientKAN(
         cfg.layers,
         grid_size=cfg.grid_size,
@@ -271,7 +240,8 @@ def bench_efficient_kan(cfg: BenchConfig, batch: int, device: torch.device) -> d
         loss.backward()
         optimizer.step()
 
-    full_ms = time_fn(full_step)
+    reset = capture_reset(model, optimizer)
+    full_ms = time_fn(full_step, setup=reset)
 
     return {"forward": fwd_ms, "fwd_bwd": fwdbwd_ms, "full_step": full_ms}
 
@@ -281,6 +251,7 @@ def bench_fastkan(cfg: BenchConfig, batch: int, device: torch.device) -> dict:
     if not HAVE_FAST_KAN:
         return {"forward": None, "fwd_bwd": None, "full_step": None, "note": "not_installed"}
 
+    torch.manual_seed(42)
     model = FastKAN(
         cfg.layers,
         num_grids=cfg.grid_size,
@@ -310,13 +281,15 @@ def bench_fastkan(cfg: BenchConfig, batch: int, device: torch.device) -> dict:
         loss.backward()
         optimizer.step()
 
-    full_ms = time_fn(full_step)
+    reset = capture_reset(model, optimizer)
+    full_ms = time_fn(full_step, setup=reset)
 
     return {"forward": fwd_ms, "fwd_bwd": fwdbwd_ms, "full_step": full_ms}
 
 
 def bench_faithful_pytorch(cfg: BenchConfig, batch: int, device: torch.device) -> dict:
     """Benchmark faithful PyTorch KAN (pure B-spline, same math as ArKan)."""
+    torch.manual_seed(42)
     model = FaithfulKAN(cfg.layers, cfg.grid_size, cfg.spline_order).to(device)
     knots = compute_knots(cfg.grid_size, cfg.spline_order, device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -344,7 +317,8 @@ def bench_faithful_pytorch(cfg: BenchConfig, batch: int, device: torch.device) -
         loss.backward()
         optimizer.step()
 
-    full_ms = time_fn(full_step)
+    reset = capture_reset(model, optimizer)
+    full_ms = time_fn(full_step, setup=reset)
 
     return {"forward": fwd_ms, "fwd_bwd": fwdbwd_ms, "full_step": full_ms}
 
@@ -468,11 +442,11 @@ ARKAN_CPU_PRESET = {
             "256": 18.015,    # ms
             "1024": None,
         },
-        # backward bench: full_train_step group
-        "fwd_bwd_est": {
+        # Historical estimate includes backward, loss, and SGD update.
+        "backward_update_est": {
             # forward_training - forward_only ≈ ~0 (prep only)
-            # full_train_step ≈ forward + backward
-            # backward = full_step - forward_only
+            # full_train_step = forward + loss + backward + SGD update
+            # backward_update_est = full_step - forward_only
             "1":   0.09660,   # 123.63 - 27.03 µs = 96.60 µs
             "64":  2.7990,    # 4.4971 - 1.6981 ms
             "256": 11.434,    # 18.273 - 6.839 ms
@@ -506,7 +480,7 @@ def main():
 
     # ---- Print ArKan numbers from Rust benches ----
     print("\n\n" + "#"*70)
-    print("# ArKan CPU numbers (from cargo bench, Rust, preset [21,64,64,24])")
+    print("# HISTORICAL ArKan CPU numbers — invalid for comparison pending matched rerun")
     print("# NOTE: Config does NOT match the Python configs above.")
     print("# ArKan benches are fixed to the poker preset; Python configs above")
     print("# use [2,8,1] and [16,64,64,8] for cross-library comparison.")
@@ -516,12 +490,12 @@ def main():
     print("-"*42)
     for batch_k, fwd in sorted(p["forward"].items(), key=lambda x: int(x[0])):
         full = p["full_step"].get(batch_k)
-        fwdbwd = p["fwd_bwd_est"].get(batch_k)
+        fwdbwd = p["backward_update_est"].get(batch_k)
         fwd_s = f"{fwd:.4f} ms" if fwd is not None else "N/A"
         full_s = f"{full:.4f} ms" if full is not None else "N/A"
         fwdbwd_s = f"{fwdbwd:.4f} ms" if fwdbwd is not None else "N/A"
         print(f"{'forward':<14} {batch_k:>6}  {fwd_s:>18}")
-        print(f"{'fwd+bwd(est)':<14} {batch_k:>6}  {fwdbwd_s:>18}")
+        print(f"{'bwd+update(est)':<14} {batch_k:>6}  {fwdbwd_s:>18}")
         print(f"{'full_step':<14} {batch_k:>6}  {full_s:>18}")
         print()
 
@@ -543,9 +517,16 @@ def main():
     # ---- Save JSON ----
     output = {
         "metadata": {
-            "date": "2026-06-27",
-            "platform": "Windows 11",
-            "python": torch.__version__,
+            "date": datetime.now(timezone.utc).isoformat(),
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "torch_threads": torch.get_num_threads(),
+            "seed": 42,
+            "optimizer": "Adam(lr=0.001)",
+            "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True).strip(),
+            "rustflags": os.environ.get("RUSTFLAGS", ""),
+            "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
             "cuda_available": CUDA_AVAILABLE,
             "gpu": GPU_NAME if CUDA_AVAILABLE else None,
             "warmup_iters": WARMUP,
@@ -568,9 +549,15 @@ def main():
             },
         },
         "results": results_all,
-        "arkan_cpu_preset_rust_bench": ARKAN_CPU_PRESET,
+        "historical_arkan_cpu": {
+            "status": "invalid_for_comparison_pending_rerun",
+            "reported_date": "2025-06-27",
+            "platform": "unverified historical source",
+            "values": ARKAN_CPU_PRESET,
+        },
     }
 
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = RESULTS_DIR / "competitors.json"
     with open(out_path, "w") as f:
         json.dump(output, f, indent=2, default=lambda x: None)

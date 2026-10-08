@@ -1,7 +1,7 @@
 //! Deployment benchmark: BakedModel (int8) vs f32 KanNetwork at batch=1.
 //!
 //! Measures:
-//!   - Latency: `BakedModel::forward` vs `KanNetwork::forward_single` (Criterion, warmup + median)
+//!   - Latency: `BakedModel::forward_with_workspace` vs `KanNetwork::forward_single` (Criterion, warmup + median)
 //!   - Size:    `BakedModel::size_bytes()` vs f32 weight bytes (params × 4) — printed once
 //!
 //! Note: baked int8 is NOT expected to beat f32 at batch=1 on modern CPUs without
@@ -67,7 +67,7 @@ fn print_size_comparison(label: &str, baked: &BakedModel, network: &KanNetwork) 
     let baked_bytes = baked.size_bytes();
     let f32_bytes = f32_weight_bytes(network);
     let ratio = f32_bytes as f32 / baked_bytes as f32;
-    println!("[size] {label}: baked={baked_bytes} B  f32={f32_bytes} B  compression={ratio:.2}x");
+    println!("[size] {label}: baked_payload_estimate={baked_bytes} B  f32_parameters={f32_bytes} B  payload_ratio={ratio:.2}x");
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +90,7 @@ fn bench_small(c: &mut Criterion) {
     let mut f32_out = vec![0.0f32; output_dim];
     let mut baked_out = vec![0.0f32; output_dim];
     let mut workspace = network.create_workspace(1);
+    let mut baked_workspace = baked.create_workspace();
 
     let mut group = c.benchmark_group("baked_batch1_small");
 
@@ -99,9 +100,13 @@ fn bench_small(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("baked_int8_forward", |b| {
+    group.bench_function("baked_int8_forward_with_workspace", |b| {
         b.iter(|| {
-            baked.forward(black_box(&input), black_box(&mut baked_out));
+            baked.forward_with_workspace(
+                black_box(&input),
+                black_box(&mut baked_out),
+                &mut baked_workspace,
+            );
         });
     });
 
@@ -123,6 +128,7 @@ fn bench_medium(c: &mut Criterion) {
     let mut f32_out = vec![0.0f32; output_dim];
     let mut baked_out = vec![0.0f32; output_dim];
     let mut workspace = network.create_workspace(1);
+    let mut baked_workspace = baked.create_workspace();
 
     let mut group = c.benchmark_group("baked_batch1_medium");
 
@@ -132,9 +138,13 @@ fn bench_medium(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("baked_int8_forward", |b| {
+    group.bench_function("baked_int8_forward_with_workspace", |b| {
         b.iter(|| {
-            baked.forward(black_box(&input), black_box(&mut baked_out));
+            baked.forward_with_workspace(
+                black_box(&input),
+                black_box(&mut baked_out),
+                &mut baked_workspace,
+            );
         });
     });
 

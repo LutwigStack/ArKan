@@ -138,22 +138,29 @@ fn bench_architecture_training(c: &mut Criterion) {
 
     for arch in &archs {
         let config = make_config(arch.input, arch.output, arch.hidden.clone());
-        let mut network = KanNetwork::new(config.clone());
+        let network = KanNetwork::new(config.clone());
         let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
         let targets = make_inputs(config.output_dim, config.grid_range, batch, 123);
         let mut workspace = network.create_workspace(batch);
+        network
+            .clone()
+            .train_step(&inputs, &targets, None, 0.001, &mut workspace);
 
         group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
         group.bench_with_input(BenchmarkId::new("train_step", arch.name), arch, |b, _| {
-            b.iter(|| {
-                network.train_step(
-                    black_box(&inputs),
-                    black_box(&targets),
-                    None,
-                    0.001,
-                    &mut workspace,
-                );
-            });
+            b.iter_batched_ref(
+                || network.clone(),
+                |network| {
+                    network.train_step(
+                        black_box(&inputs),
+                        black_box(&targets),
+                        None,
+                        0.001,
+                        &mut workspace,
+                    );
+                },
+                criterion::BatchSize::SmallInput,
+            );
         });
     }
 

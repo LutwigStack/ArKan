@@ -26,7 +26,10 @@ fn make_inputs_batch(dim: usize, grid_range: (f32, f32), batch: usize, seed: u64
 
 /// Compare forward_single vs forward_batch(batch=1)
 fn bench_single_vs_batch1(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let network = KanNetwork::new(config.clone());
 
     let input_single = make_input_single(config.input_dim, config.grid_range, 42);
@@ -65,7 +68,10 @@ fn bench_single_vs_batch1(c: &mut Criterion) {
 
 /// Latency distribution analysis (manual measurement for percentiles)
 fn bench_latency_distribution(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let network = KanNetwork::new(config.clone());
 
     let input = make_input_single(config.input_dim, config.grid_range, 42);
@@ -126,7 +132,10 @@ fn bench_latency_distribution(c: &mut Criterion) {
 
 /// Cold cache vs warm cache comparison
 fn bench_cache_effects(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
 
     let mut group = c.benchmark_group("cache_effects");
 
@@ -173,7 +182,10 @@ fn bench_cache_effects(c: &mut Criterion) {
 
 /// Simulate poker solver workload: alternating inference and other work
 fn bench_poker_workload(c: &mut Criterion) {
-    let config = KanConfig::preset();
+    let config = KanConfig {
+        init_seed: Some(42),
+        ..KanConfig::preset()
+    };
     let network = KanNetwork::new(config.clone());
 
     let input = make_input_single(config.input_dim, config.grid_range, 42);

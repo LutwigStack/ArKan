@@ -164,25 +164,32 @@ fn bench_spline_training(c: &mut Criterion) {
 
     for &(grid_size, order, name) in &configs {
         let config = make_config_with_spline(grid_size, order);
-        let mut network = KanNetwork::new(config.clone());
+        let network = KanNetwork::new(config.clone());
         let inputs = make_inputs(config.input_dim, config.grid_range, batch, 42);
         let targets = make_inputs(config.output_dim, config.grid_range, batch, 123);
         let mut workspace = network.create_workspace(batch);
+        network
+            .clone()
+            .train_step(&inputs, &targets, None, 0.001, &mut workspace);
 
         group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
         group.bench_with_input(
             BenchmarkId::new("train_step", name),
             &(grid_size, order),
             |b, _| {
-                b.iter(|| {
-                    network.train_step(
-                        black_box(&inputs),
-                        black_box(&targets),
-                        None,
-                        0.001,
-                        &mut workspace,
-                    );
-                });
+                b.iter_batched_ref(
+                    || network.clone(),
+                    |network| {
+                        network.train_step(
+                            black_box(&inputs),
+                            black_box(&targets),
+                            None,
+                            0.001,
+                            &mut workspace,
+                        );
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
             },
         );
     }
