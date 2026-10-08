@@ -316,6 +316,8 @@ impl GpuNetwork {
                 || layer.std_inv.shape != [expected.in_dim]
                 || layer.weights.buffer.size() < weights as u64 * 4
                 || layer.bias.buffer.size() < expected.out_dim as u64 * 4
+                || layer.normalization.buffer.size() < expected.in_dim as u64 * 8
+                || layer.std_inv.buffer.size() < expected.in_dim as u64 * 4
             {
                 return Err(ArkanError::validation(
                     "GPU layer metadata no longer matches its layout",
@@ -327,16 +329,8 @@ impl GpuNetwork {
 
     fn validate_workspace(&self, workspace: &GpuWorkspace) -> ArkanResult<()> {
         self.validate_layout()?;
-        if workspace.in_dim != self.input_dim
-            || workspace.out_dim != self.output_dim
-            || workspace
-                .input
-                .as_ref()
-                .map_or(true, |t| t.shape.len() != 2 || t.shape[1] != self.input_dim)
-            || workspace.output.as_ref().map_or(true, |t| {
-                t.shape.len() != 2 || t.shape[1] != self.output_dim
-            })
-        {
+        workspace.validate_metadata()?;
+        if workspace.in_dim != self.input_dim || workspace.out_dim != self.output_dim {
             return Err(ArkanError::validation(
                 "GPU workspace dimensions do not match the model",
             ));
@@ -618,6 +612,8 @@ impl GpuNetwork {
 
         // Ensure workspace capacity
         workspace.ensure_capacity(&self.device, batch_size)?;
+        workspace.validate_io_capacity(batch_size)?;
+        workspace.ensure_intermediates(&self.device, self.layout.layer_dims(), batch_size)?;
 
         // Upload input
         workspace.upload_input(&self.queue, input)?;
@@ -689,6 +685,8 @@ impl GpuNetwork {
 
         // Ensure workspace capacity
         workspace.ensure_capacity(&self.device, batch_size)?;
+        workspace.validate_io_capacity(batch_size)?;
+        workspace.ensure_intermediates(&self.device, self.layout.layer_dims(), batch_size)?;
 
         // Upload input
         workspace.upload_input(&self.queue, input)?;
@@ -751,9 +749,6 @@ impl GpuNetwork {
         if self.layers.len() == 1 {
             return self.execute_single_layer_forward(0, batch_size, workspace);
         }
-
-        // Multi-layer: need intermediate buffers
-        workspace.ensure_intermediates(&self.device, self.layout.layer_dims(), batch_size)?;
 
         // Execute layers sequentially
         let num_layers = self.layers.len();
@@ -1004,6 +999,7 @@ impl GpuNetwork {
         batch_size: usize,
         workspace: &mut GpuWorkspace,
     ) -> ArkanResult<Vec<f32>> {
+        self.validate_workspace(workspace)?;
         let expected_len = batch_size
             .checked_mul(self.input_dim)
             .ok_or_else(|| ArkanError::buffer("GPU batch extent overflow"))?;
@@ -1014,6 +1010,8 @@ impl GpuNetwork {
             ));
         }
         workspace.ensure_capacity(&self.device, batch_size)?;
+        workspace.validate_io_capacity(batch_size)?;
+        workspace.ensure_intermediates(&self.device, self.layout.layer_dims(), batch_size)?;
         workspace.upload_input(&self.queue, input)?;
         self.execute_forward(batch_size, workspace)?;
 
@@ -1085,9 +1083,12 @@ impl GpuNetwork {
 
         // Ensure workspace capacity
         workspace.ensure_capacity(&self.device, batch_size)?;
+        workspace.validate_io_capacity(batch_size)?;
+        workspace.ensure_intermediates(&self.device, self.layout.layer_dims(), batch_size)?;
 
         // Prepare training buffers (z_values, span_indices per layer)
         workspace.prepare_training(&self.device, self.layout.layer_dims(), batch_size)?;
+        workspace.validate_training_capacity(batch_size, self.layout.layer_dims())?;
 
         // Upload input
         workspace.upload_input(&self.queue, input)?;
@@ -1125,9 +1126,6 @@ impl GpuNetwork {
                 &training_layout,
             );
         }
-
-        // Multi-layer: need intermediate buffers
-        workspace.ensure_intermediates(&self.device, self.layout.layer_dims(), batch_size)?;
 
         // Execute layers sequentially
         let num_layers = self.layers.len();
@@ -2251,6 +2249,7 @@ impl GpuNetwork {
         workspace: &GpuWorkspace,
     ) -> ArkanResult<()> {
         self.validate_workspace(workspace)?;
+        workspace.validate_training_capacity(batch_size, self.layout.layer_dims())?;
         if workspace.training_batch != Some(batch_size)
             || workspace.z_values.len() != self.layers.len()
             || workspace.span_indices.len() != self.layers.len()

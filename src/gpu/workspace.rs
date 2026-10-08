@@ -95,6 +95,101 @@ pub struct GpuWorkspace {
 }
 
 impl GpuWorkspace {
+    /// Check legacy public tensor metadata before preparation indexes shapes.
+    /// Hidden widths may differ from the next model: preparation reallocates them.
+    pub(crate) fn validate_metadata(&self) -> ArkanResult<()> {
+        for tensor in self
+            .input
+            .iter()
+            .chain(&self.output)
+            .chain(&self.intermediates)
+            .chain(&self.z_values)
+            .chain(&self.grad_output)
+            .chain(&self.grad_input)
+        {
+            Self::validate_tensor(tensor, 2)?;
+        }
+        for tensor in self
+            .std_inv
+            .iter()
+            .chain(&self.grad_weights)
+            .chain(&self.grad_bias)
+        {
+            Self::validate_tensor(tensor, 1)?;
+        }
+        match (&self.input, &self.output) {
+            (None, None) if self.max_batch == 0 => {}
+            (Some(input), Some(output))
+                if input.shape[1] == self.in_dim
+                    && output.shape[1] == self.out_dim
+                    && input.shape[0] >= self.max_batch
+                    && output.shape[0] >= self.max_batch => {}
+            _ => return Err(ArkanError::validation("Invalid GPU workspace I/O capacity")),
+        }
+        for (values, spans) in self.z_values.iter().zip(&self.span_indices) {
+            if spans.size() < values.size_bytes() {
+                return Err(ArkanError::validation("Invalid GPU saved-span capacity"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_tensor(tensor: &GpuTensor, rank: usize) -> ArkanResult<()> {
+        let bytes = tensor
+            .shape
+            .iter()
+            .try_fold(4u64, |bytes, &dim| bytes.checked_mul(dim as u64));
+        if tensor.shape.len() != rank
+            || bytes.is_none()
+            || bytes.unwrap_or(u64::MAX) > tensor.capacity_bytes
+            || tensor.capacity_bytes > tensor.buffer.size()
+        {
+            return Err(ArkanError::validation(
+                "Invalid GPU tensor shape or byte capacity",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_io_capacity(&self, batch_size: usize) -> ArkanResult<()> {
+        self.validate_metadata()?;
+        if self.input.as_ref().is_none_or(|t| t.shape[0] < batch_size)
+            || self.output.as_ref().is_none_or(|t| t.shape[0] < batch_size)
+        {
+            return Err(ArkanError::validation(
+                "GPU workspace is not prepared for this batch",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_training_capacity(
+        &self,
+        batch_size: usize,
+        layer_dims: &[usize],
+    ) -> ArkanResult<()> {
+        self.validate_io_capacity(batch_size)?;
+        let max_dim = layer_dims.iter().copied().max().unwrap_or(self.in_dim);
+        if self.z_values.len() != layer_dims.len().saturating_sub(1)
+            || self.span_indices.len() != self.z_values.len()
+            || self
+                .z_values
+                .iter()
+                .zip(layer_dims)
+                .any(|(t, &width)| t.shape[0] < batch_size || t.shape[1] != width)
+            || [&self.grad_input, &self.grad_output].iter().any(|tensor| {
+                tensor
+                    .as_ref()
+                    .is_none_or(|t| t.shape[0] < batch_size || t.shape[1] < max_dim)
+            })
+        {
+            return Err(ArkanError::validation(
+                "GPU training buffers are not prepared for this batch",
+            ));
+        }
+        Ok(())
+    }
+
     /// Creates a new workspace with the specified dimensions.
     ///
     /// # Arguments
@@ -234,6 +329,7 @@ impl GpuWorkspace {
         device: &wgpu::Device,
         batch_size: usize,
     ) -> ArkanResult<bool> {
+        self.validate_metadata()?;
         if batch_size <= self.max_batch && self.input.is_some() {
             return Ok(false); // No resize needed
         }
@@ -288,6 +384,7 @@ impl GpuWorkspace {
         layer_dims: &[usize],
         batch_size: usize,
     ) -> ArkanResult<()> {
+        self.validate_metadata()?;
         // Need n-1 intermediate buffers for n layers
         let needed = layer_dims.len().saturating_sub(2);
 
@@ -341,6 +438,7 @@ impl GpuWorkspace {
         layer_dims: &[usize],
         batch_size: usize,
     ) -> ArkanResult<()> {
+        self.validate_metadata()?;
         self.training_batch = None;
         let num_layers = layer_dims.len().saturating_sub(1);
         for &dim in layer_dims {
@@ -436,6 +534,7 @@ impl GpuWorkspace {
         device: &wgpu::Device,
         layer_specs: &[(usize, usize, usize)],
     ) -> ArkanResult<()> {
+        self.validate_metadata()?;
         let num_layers = layer_specs.len();
         for &(input, output, basis) in layer_specs {
             GpuTensor::allocation_bytes(
