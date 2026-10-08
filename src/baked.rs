@@ -40,6 +40,7 @@
 //! quantity, and `baked_parity` gates it at 15%.
 
 use crate::config::{KanConfig, EPSILON};
+use crate::error::{ArkanError, ArkanResult};
 use crate::network::KanNetwork;
 
 #[cfg(feature = "serde")]
@@ -328,7 +329,7 @@ fn eval_basis_fixed(order: usize, t_q16: u32, out: &mut [u16]) {
 fn extract_span_t(q_z: i32, q_rmin: i32, h_q16: i32, grid_size: usize) -> (usize, u32) {
     // q_z_off = (z - r_min) * 65536 = position above grid start in Q16 z-units.
     // Always >= 0 because the caller clamped q_z to [q_rmin, q_rmax].
-    let q_z_off = (q_z - q_rmin) as i64;
+    let q_z_off = i64::from(q_z) - i64::from(q_rmin);
     let h = h_q16 as i64; // one grid interval in Q16 z-units, >= 1 by construction
     let span = (q_z_off / h).clamp(0, grid_size as i64 - 1) as usize;
     let t_rem = q_z_off - span as i64 * h;
@@ -395,7 +396,7 @@ pub struct BakedLayer {
 ///
 /// The hot path (between entry normalization and final dequant) uses no f32.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct BakedModel {
     /// Original configuration for reference/validation.
     pub config: KanConfig,
@@ -403,6 +404,67 @@ pub struct BakedModel {
     pub layers: Vec<BakedLayer>,
     /// Set to true if baked without calibration data (accuracy may be reduced).
     pub uncalibrated: bool,
+}
+
+/// Reusable scratch storage for single-sample baked inference.
+/// Create with [`BakedModel::create_workspace`], then reuse across calls.
+#[derive(Debug, Clone)]
+pub struct BakedWorkspace {
+    act_a: Vec<i32>,
+    act_b: Vec<i32>,
+    spans: Vec<usize>,
+    bases: Vec<[u16; 6]>,
+}
+
+fn checked_weights(input: usize, output: usize, basis: usize) -> ArkanResult<usize> {
+    input
+        .checked_mul(output)
+        .and_then(|n| n.checked_mul(basis))
+        .ok_or_else(|| ArkanError::overflow("baked weight shape"))
+}
+
+fn quantized_grid(range: (f32, f32), grid: usize) -> ArkanResult<(i32, i32, i32)> {
+    let lo = (range.0 as f64 * 65536.0).round();
+    let hi = (range.1 as f64 * 65536.0).round();
+    let h = (65536.0 * (range.1 - range.0).max(EPSILON) as f64 / grid as f64)
+        .round()
+        .max(1.0);
+    if grid == 0
+        || !lo.is_finite()
+        || !hi.is_finite()
+        || !h.is_finite()
+        || lo < i32::MIN as f64
+        || lo > i32::MAX as f64
+        || hi < i32::MIN as f64
+        || hi > i32::MAX as f64 + 1.0
+        || h > i32::MAX as f64
+    {
+        return Err(ArkanError::cpu(
+            "baked grid range or interval is outside Q15.16 representation",
+        ));
+    }
+    Ok((lo as i32, ((hi as i64 - 1).max(lo as i64)) as i32, h as i32))
+}
+
+// Keep the version-2 field order and validate every serde model import.
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for BakedModel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            config: KanConfig,
+            layers: Vec<BakedLayer>,
+            uncalibrated: bool,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let model = Self {
+            config: wire.config,
+            layers: wire.layers,
+            uncalibrated: wire.uncalibrated,
+        };
+        model.validate().map_err(serde::de::Error::custom)?;
+        Ok(model)
+    }
 }
 
 impl BakedModel {
@@ -418,44 +480,92 @@ impl BakedModel {
     ///
     /// * `network` - Trained KAN network to bake.
     /// * `calibration` - Optional calibration inputs (flat: [n_samples * input_dim]).
-    ///   If provided, activation scales are set using 99.9th-percentile clipping
-    ///   (stops outliers from wasting the i32 dynamic range). If None, a heuristic
-    ///   scale is used and `uncalibrated` is set.
+    ///   If provided, activation scales use the 99.9th percentile (without clipping
+    ///   outputs), so outliers do not waste the i32 dynamic range. If None, a heuristic
+    ///   scale is used and `uncalibrated` is set. Empty calibration uses that same
+    ///   heuristic; nonempty incomplete or nonfinite calibration is rejected.
     ///
     /// # Panics
     ///
-    /// Panics if any layer's `spline_order` is outside `2..=5`. Baked inference
+    /// Panics on invalid model/calibration data or an unrepresentable Q15.16 grid
+    /// (use [`Self::try_from_network`] for errors), including any layer whose
+    /// `spline_order` is outside `2..=5`. Baked inference
     /// only has fixed-point basis polynomials for those orders, even though
     /// [`KanConfig::validate`](crate::KanConfig::validate) accepts
     /// `1..=MAX_SPLINE_ORDER` (7) for the f32 CPU path. Use
     /// [`KanNetwork::forward_single`](crate::KanNetwork::forward_single) for other orders.
     pub fn from_network(network: &KanNetwork, calibration: Option<&[f32]>) -> Self {
-        let config = network.config.clone();
-        let uncalibrated = calibration.is_none();
+        Self::try_from_network(network, calibration).expect("BakedModel::from_network failed")
+    }
 
-        // Baked inference has closed-form fixed-point basis polynomials for orders
-        // 2..=5 only (see `eval_basis_fixed`). Orders 6/7 pass `KanConfig::validate`
-        // (MAX_SPLINE_ORDER = 7, sized for the f32 CPU path) but used to blow up as an
-        // out-of-bounds index deep inside spline.rs on the first `forward` call.
-        // ponytail: bake-time panic rather than making `from_network` return a Result
-        // — it returns `Self` and is called from tests, benches and the example, so a
-        // Result is a breaking API change for orders nobody ships (untested and
-        // unmeasured for baked). Ceiling: unrecoverable at bake time, but the message
-        // names the cause instead of pointing at spline.rs.
-        if let Some(bad) = network
-            .layers
-            .iter()
-            .map(|l| l.order)
-            .find(|o| !(2..=5).contains(o))
-        {
-            panic!(
-                "BakedModel::from_network: spline_order {bad} is not supported by baked \
-                 (fixed-point) inference; supported range is 2..=5. KanConfig::validate \
-                 accepts 1..={} (MAX_SPLINE_ORDER) for the f32 CPU path only. Re-configure \
-                 with spline_order in 2..=5, or use KanNetwork::forward for f32 inference.",
-                crate::config::MAX_SPLINE_ORDER
-            );
+    /// Fallible bake with shape, finite-value and Q15.16 domain validation.
+    ///
+    /// Empty calibration uses the same uncalibrated heuristic as `None`.
+    /// Nonempty calibration must contain complete samples and finite values.
+    /// Grid endpoints and interval spacing must fit Q15.16; sub-tick ranges
+    /// retain the single-tick fallback, with reduced precision.
+    pub fn try_from_network(
+        network: &KanNetwork,
+        calibration: Option<&[f32]>,
+    ) -> ArkanResult<Self> {
+        network.config.validate()?;
+        let config = network.config.clone();
+        let dims = config.layer_dims();
+        if network.layers.len() != config.num_layers() {
+            return Err(ArkanError::cpu(
+                "baked network layer count disagrees with config",
+            ));
         }
+        for (i, layer) in network.layers.iter().enumerate() {
+            let weights = checked_weights(layer.in_dim, layer.out_dim, layer.global_basis_size)?;
+            if !(2..=5).contains(&layer.order) {
+                return Err(ArkanError::cpu(format!(
+                    "spline_order {} is not supported by baked inference; supported range is 2..=5",
+                    layer.order
+                )));
+            }
+            if layer.in_dim != dims[i]
+                || layer.out_dim != dims[i + 1]
+                || layer.in_dim == 0
+                || layer.out_dim == 0
+                || layer.order != config.spline_order
+                || layer.grid_size != config.grid_size
+                || layer.global_basis_size != layer.grid_size + layer.order
+                || layer.local_basis_size != layer.order + 1
+                || layer.basis_aligned < layer.local_basis_size
+                || layer.grid_range != config.grid_range
+                || layer.weights.len() != weights
+                || layer.bias.len() != layer.out_dim
+                || layer.mean.len() != layer.in_dim
+                || layer.std.len() != layer.in_dim
+            {
+                return Err(ArkanError::cpu(format!(
+                    "baked layer {i}: invalid shape or spline_order; supported orders are 2..=5"
+                )));
+            }
+            if !layer
+                .weights
+                .iter()
+                .chain(&layer.bias)
+                .chain(&layer.mean)
+                .all(|v| v.is_finite())
+                || !layer.std.iter().all(|v| v.is_finite() && *v > 0.0)
+            {
+                return Err(ArkanError::cpu(format!(
+                    "baked layer {i}: parameters must be finite and std positive"
+                )));
+            }
+            quantized_grid(layer.grid_range, layer.grid_size)?;
+        }
+        let calibration = calibration.filter(|values| !values.is_empty());
+        if let Some(values) = calibration {
+            if values.len() % config.input_dim != 0 || !values.iter().all(|v| v.is_finite()) {
+                return Err(ArkanError::cpu(
+                    "baked calibration requires complete finite samples",
+                ));
+            }
+        }
+        let uncalibrated = calibration.is_none();
 
         // Compute activation scales s_act[L] for each layer output.
         // s_act[L] = ACT_TARGET / p99.9(|layer L output|) over calibration inputs.
@@ -495,6 +605,11 @@ impl BakedModel {
                         layer.forward_single(in_slice, out_slice, &mut basis_buf);
 
                         for &v in out_slice.iter() {
+                            if !v.is_finite() {
+                                return Err(ArkanError::cpu(
+                                    "baked calibration produced a nonfinite activation",
+                                ));
+                            }
                             layer_mags[l].push(v.abs());
                         }
 
@@ -510,11 +625,9 @@ impl BakedModel {
                         s_act[l] = Self::ACT_TARGET as f32;
                         continue;
                     }
-                    // Sort to find percentile (NaN-safe: treat NaN as large)
-                    mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
-                    // 99.9th percentile index
                     let idx = ((mags.len() - 1) as f64 * 0.999) as usize;
-                    let p999 = mags[idx];
+                    let (_, p999, _) = mags.select_nth_unstable_by(idx, f32::total_cmp);
+                    let p999 = *p999;
                     if p999 > EPSILON {
                         s_act[l] = (Self::ACT_TARGET / p999 as f64) as f32;
                     } else {
@@ -675,27 +788,7 @@ impl BakedModel {
                 })
                 .collect();
 
-            // Grid range in fixed point
-            // q_rmin = round(r_min * 2^16) in z-space (z = normalized input)
-            // q_rmax = round(r_max * 2^16) - 1 (to mirror +EPSILON floor)
-            // The z values in Q15.16 format: q_z represents z = q_z / 65536
-            let q_rmin = (r_min * 65536.0).round() as i32;
-            // `.max(q_rmin)`: for a range narrower than ~1.5e-5 (e.g. the
-            // validate-approved grid_range = (0.0, 0.000005)) both endpoints round to
-            // the same Q16 tick and the `- 1` puts q_rmax *below* q_rmin, which made
-            // `q_z.clamp(q_rmin, q_rmax)` in `forward` panic with "min > max".
-            // Collapsing to a single-tick interval keeps the clamp well-formed; such a
-            // range is degenerate anyway (every input maps to span 0, t 0).
-            let q_rmax = ((r_max * 65536.0).round() as i32 - 1).max(q_rmin);
-
-            // inv_h_scaled: used to extract span and t from q_z (fixed-point z)
-            // span = (q_z - q_rmin) * inv_h_scaled >> 16, clamped to [0, G-1]
-            // t_q16 = (q_z - q_rmin) * inv_h_scaled - span * 65536
-            // inv_h_scaled = round(G * 2^16 / (r_max - r_min))
-            let h_range = (r_max - r_min).max(EPSILON);
-            // h_q16 = round(65536 * range / G) = one span interval in Q16 z-units
-            let h_q16 = ((65536.0 * h_range as f64 / grid_size as f64).round() as i64)
-                .clamp(1, i32::MAX as i64) as i32;
+            let (q_rmin, q_rmax, h_q16) = quantized_grid((r_min, r_max), grid_size)?;
 
             baked_layers.push(BakedLayer {
                 weights_i8,
@@ -721,11 +814,72 @@ impl BakedModel {
             s_act_prev = s_act_l;
         }
 
-        Self {
+        let model = Self {
             config,
             layers: baked_layers,
             uncalibrated,
+        };
+        model.validate()?;
+        Ok(model)
+    }
+
+    /// Checks executable shapes, fixed-point bounds and metadata.
+    /// Call again after mutating the public model fields.
+    pub fn validate(&self) -> ArkanResult<()> {
+        self.config.validate()?;
+        let dims = self.config.layer_dims();
+        let grid = quantized_grid(self.config.grid_range, self.config.grid_size)?;
+        if self.layers.len() != self.config.num_layers() {
+            return Err(ArkanError::cpu("baked layer count disagrees with config"));
         }
+        for (i, l) in self.layers.iter().enumerate() {
+            let weights = checked_weights(l.in_dim, l.out_dim, l.global_basis_size)?;
+            if l.in_dim != dims[i]
+                || l.out_dim != dims[i + 1]
+                || l.in_dim == 0
+                || l.out_dim == 0
+                || l.order != self.config.spline_order
+                || !(2..=5).contains(&l.order)
+                || l.grid_size != self.config.grid_size
+                || l.global_basis_size != l.grid_size + l.order
+                || l.weights_i8.len() != weights
+                || l.q_bias.len() != l.out_dim
+                || l.requant_m0.len() != l.out_dim
+                || l.requant_shift.len() != l.out_dim
+                || l.norm_a_fixed.len() != l.in_dim
+                || l.norm_b_fixed.len() != l.in_dim
+                || l.mean.len() != l.in_dim
+                || l.std.len() != l.in_dim
+                || (l.q_rmin, l.q_rmax, l.h_q16) != grid
+            {
+                return Err(ArkanError::cpu(format!(
+                    "baked layer {i}: invalid executable shape or grid metadata"
+                )));
+            }
+            // Each input's basis sums to 32768, bounding every accumulation prefix.
+            let acc_bound = (l.in_dim as i128) * 128 * 32768;
+            if l.q_bias
+                .iter()
+                .any(|b| (*b as i128).abs() + acc_bound > i64::MAX as i128)
+                || l.norm_shift > 62
+                || l.requant_shift.iter().any(|s| *s > 62)
+                || l.norm_a_fixed
+                    .iter()
+                    .any(|a| !(1..=(1 << 30) - 1).contains(a))
+                || l.requant_m0
+                    .iter()
+                    .any(|m| !(1..=(1 << 30) - 1).contains(m))
+                || !l.mean.iter().all(|v| v.is_finite())
+                || !l.std.iter().all(|v| v.is_finite() && *v > 0.0)
+                || !l.s_act_out.is_finite()
+                || l.s_act_out <= 0.0
+            {
+                return Err(ArkanError::cpu(format!(
+                    "baked layer {i}: invalid fixed-point scale, shift or accumulator bounds"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Computes weight index for coefficient [out_idx, in_idx, basis_idx].
@@ -751,6 +905,38 @@ impl BakedModel {
     ///
     /// Panics if `input.len() != config.input_dim` or `output.len() != config.output_dim`.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) {
+        let mut workspace = self.create_workspace();
+        self.forward_with_workspace(input, output, &mut workspace);
+    }
+
+    /// Allocates scratch buffers once for this model's largest layer.
+    pub fn create_workspace(&self) -> BakedWorkspace {
+        let max_dim = self
+            .layers
+            .iter()
+            .map(|l| l.in_dim.max(l.out_dim))
+            .max()
+            .unwrap_or(0);
+        let max_input = self.layers.iter().map(|l| l.in_dim).max().unwrap_or(0);
+        BakedWorkspace {
+            act_a: vec![0; max_dim],
+            act_b: vec![0; max_dim],
+            spans: vec![0; max_input],
+            bases: vec![[0; 6]; max_input],
+        }
+    }
+
+    /// Runs single-sample inference without allocating.
+    ///
+    /// Panics on input/output length mismatch or insufficient workspace capacity.
+    /// The workspace may be reused with models whose layers fit its buffers.
+    /// Public model fields must retain their validated bake/import invariants.
+    pub fn forward_with_workspace(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        workspace: &mut BakedWorkspace,
+    ) {
         assert_eq!(
             input.len(),
             self.config.input_dim,
@@ -770,17 +956,21 @@ impl BakedModel {
             return;
         }
 
-        // Allocate activation buffers. Max size across layers.
-        let max_dim = self
-            .layers
-            .iter()
-            .map(|l| l.in_dim.max(l.out_dim))
-            .max()
-            .unwrap_or(1);
-
-        let mut act_a = vec![0i32; max_dim]; // current layer inputs as Q15.16 z-values
-        let mut act_b = vec![0i32; max_dim]; // current layer outputs as i32 (scaled by s_act)
-        let mut basis_buf = vec![0u16; 8]; // max order+1 = 6 (order 5), 8 is safe
+        let BakedWorkspace {
+            act_a,
+            act_b,
+            spans,
+            bases,
+        } = workspace;
+        assert!(
+            self.layers.iter().all(|l| {
+                l.in_dim <= act_a.len()
+                    && l.out_dim <= act_b.len()
+                    && l.in_dim <= spans.len()
+                    && l.in_dim <= bases.len()
+            }),
+            "BakedModel::forward_with_workspace: insufficient workspace capacity"
+        );
 
         // ENTRY: normalize layer-0 inputs to Q15.16 fixed-point z
         // z_i = clamp((x_i - mean_i) / std_i, r_min, r_max)
@@ -804,9 +994,12 @@ impl BakedModel {
             let global_basis_size = layer.global_basis_size;
             let local_basis_size = order + 1;
 
-            // Ensure basis_buf is large enough
-            if basis_buf.len() < local_basis_size {
-                basis_buf.resize(local_basis_size, 0);
+            // Span and basis depend on the input, and are shared by all outputs.
+            for i in 0..in_dim {
+                let q_z = act_a[i].clamp(layer.q_rmin, layer.q_rmax);
+                let (span, t) = extract_span_t(q_z, layer.q_rmin, layer.h_q16, grid_size);
+                spans[i] = span;
+                eval_basis_fixed(order, t, &mut bases[i][..local_basis_size]);
             }
 
             // Requantized activations saturate at the i32 they are stored in, and
@@ -839,28 +1032,10 @@ impl BakedModel {
             for (j, act_out) in act_b[..out_dim].iter_mut().enumerate() {
                 let mut acc: i64 = layer.q_bias[j];
 
-                // For each input i
-                for (i, &q_z_raw) in act_a[..in_dim].iter().enumerate() {
-                    // Extract span and t (Q0.16) from q_z = act_a[i] (Q15.16 = z * 65536).
-                    // The clamps inside `extract_span_t` are what keep the weight read
-                    // below in bounds — see its doc comment.
-                    let q_z = q_z_raw.clamp(layer.q_rmin, layer.q_rmax);
-                    let (span, t_q16) = extract_span_t(q_z, layer.q_rmin, layer.h_q16, grid_size);
-
-                    // Evaluate basis functions → Q0.15 u16 values
-                    eval_basis_fixed(order, t_q16, &mut basis_buf[..local_basis_size]);
-
-                    // start_idx: the first global weight index for this span
-                    // span from find_span returns interval + order
-                    // start_idx = span (as interval index, 0-based) for our integer span
-                    // BUT: in the f32 code, find_span returns interval + order,
-                    // and start_idx = span - order. Here our `span` is the interval index [0,G-1].
-                    // So the global weight start = span (= interval) maps to global basis index `span`.
-                    // This matches: start_idx = (span_from_find_span - order) = interval.
-                    let start_idx = span; // = interval = global weight start index
-
-                    // Accumulate: acc += sum_k( weight[j,i,start_idx+k] * basis[k] )
-                    for (k, &q_b) in basis_buf[..local_basis_size].iter().enumerate() {
+                // Preserve input and coefficient accumulation order.
+                for i in 0..in_dim {
+                    let start_idx = spans[i];
+                    for (k, &q_b) in bases[i][..local_basis_size].iter().enumerate() {
                         let w_idx =
                             Self::weight_index(global_basis_size, in_dim, j, i, start_idx + k);
                         let q_c = layer.weights_i8[w_idx] as i64;
@@ -878,8 +1053,8 @@ impl BakedModel {
                 } else {
                     0
                 };
-                let q_out_i64 = ((product + round_offset) >> shift_j) as i64;
-                *act_out = q_out_i64.clamp(ACT_LO, ACT_HI) as i32;
+                let q_out = (product + round_offset) >> shift_j;
+                *act_out = q_out.clamp(ACT_LO as i128, ACT_HI as i128) as i32;
             }
 
             // INTER-LAYER: compute next layer's z values in Q15.16
@@ -925,7 +1100,8 @@ impl BakedModel {
         }
     }
 
-    /// Returns size estimate in bytes.
+    /// Estimates counted inference payload bytes (not total resident/serialized size).
+    /// Excludes mean/std, config buffers, vector capacity and allocation overhead.
     pub fn size_bytes(&self) -> usize {
         self.layers
             .iter()
@@ -974,7 +1150,7 @@ impl BakedModel {
     /// - Input shorter than the 16-byte header.
     /// - Wrong magic bytes (not an ArKan baked-model file).
     /// - Wrong format version (produced by a different library version).
-    /// - Corrupt bincode body.
+    /// - Corrupt bincode body or invalid executable shapes, scales or metadata.
     ///
     /// Requires the `serde` feature.
     #[cfg(feature = "serde")]

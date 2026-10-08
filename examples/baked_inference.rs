@@ -31,7 +31,7 @@ fn pseudo_random(idx: u64, range: f32) -> f32 {
     let h = idx
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
-    let frac = (h >> 33) as f32 / (u32::MAX as f32); // [0, 1)
+    let frac = (h >> 32) as f32 / (u32::MAX as f32); // [0, 1]
     frac * 2.0 * range - range
 }
 
@@ -119,8 +119,8 @@ fn main() {
 
     println!("\n--- Model size ---");
     println!("  f32 weights+biases : {:>7} bytes", f32_weight_bytes);
-    println!("  BakedModel (int8)  : {:>7} bytes", baked_bytes);
-    println!("  Compression ratio  : {:.2}x smaller", ratio);
+    println!("  Baked payload estimate: {:>7} bytes", baked_bytes);
+    println!("  Counted payload ratio: {:.2}x smaller", ratio);
 
     // ----------------------------------------------------------------
     // 5. Inference comparison on a few sample inputs
@@ -134,6 +134,7 @@ fn main() {
     let n_test = 5;
     let test_inputs = generate_inputs(n_test, config.input_dim, 5678);
     let mut ws1 = network.create_workspace(1);
+    let mut baked_ws = baked.create_workspace();
 
     let mut total_err: f64 = 0.0;
 
@@ -141,7 +142,7 @@ fn main() {
         let inp = &test_inputs[s * config.input_dim..(s + 1) * config.input_dim];
 
         let mut baked_out = vec![0.0f32; config.output_dim];
-        baked.forward(inp, &mut baked_out);
+        baked.forward_with_workspace(inp, &mut baked_out, &mut baked_ws);
 
         let mut f32_out = vec![0.0f32; config.output_dim];
         network.forward_single(inp, &mut f32_out, &mut ws1);
@@ -197,4 +198,17 @@ fn main() {
     }
 
     println!("\nDone.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_inputs_cover_both_halves_of_the_range() {
+        let inputs = generate_inputs(512, 4, 9999);
+        assert!(inputs.iter().all(|v| (-0.9..=0.9).contains(v)));
+        assert!(inputs.iter().any(|v| *v < -0.8));
+        assert!(inputs.iter().any(|v| *v > 0.8));
+    }
 }

@@ -32,9 +32,8 @@ fn readme_baked_usage() {
 
     // 2. Collect a calibration set (flat: n_samples * input_dim f32 values).
     //    Use REAL representative inputs: the 99.9th percentile of the activations
-    //    they produce becomes a hard ceiling on the baked model's output.
-    //    256-1024 samples is typical. An empty slice does NOT error - it bakes a
-    //    degenerate model (measured 100% NRMSE vs f32).
+    //    they produce sets the baked activation scale.
+    //    256-1024 samples is typical. Empty calibration uses the uncalibrated heuristic.
     let n_samples = 256;
     let calibration: Vec<f32> = (0..n_samples * config.input_dim)
         .map(|i| (i % 17) as f32 / 17.0 - 0.5) // stand-in for your real data
@@ -54,50 +53,29 @@ fn readme_baked_usage() {
     assert!(baked.size_bytes() > 0);
 }
 
-/// The README warns that an empty calibration slice produces a degenerate model
-/// instead of an error. Pin that, so the warning stays true — or gets deleted
-/// when `from_network` learns to reject it.
+/// Empty calibration must report the fallback rather than silently collapse output.
 #[test]
-fn readme_empty_calibration_is_degenerate_not_an_error() {
+fn readme_empty_calibration_uses_uncalibrated_fallback() {
     use arkan::{BakedModel, KanConfig, KanNetwork};
 
     let mut config = KanConfig::preset();
     config.init_seed = Some(20260726);
-    let network = KanNetwork::new(config.clone());
-
-    // Does not panic and does not return an error: there is no error to return.
+    let mut network = KanNetwork::new(config.clone());
+    // A constant output isolates activation-scale handling from quantized weights.
+    let last = network.layers.last_mut().unwrap();
+    last.weights.fill(0.0);
+    last.bias.fill(0.25);
     let baked = BakedModel::from_network(&network, Some(&[]));
+    assert!(baked.uncalibrated);
 
     let input = vec![0.5f32; config.input_dim];
     let mut baked_out = vec![0.0f32; config.output_dim];
     baked.forward(&input, &mut baked_out);
-
     let mut f32_out = vec![0.0f32; config.output_dim];
     let mut ws = network.create_workspace(1);
     network.forward_single(&input, &mut f32_out, &mut ws);
-
-    // The activation scale collapses, so the output quantizes to a handful of
-    // whole numbers with no relation to the f32 result.
-    assert!(
-        baked_out.iter().all(|v| *v == v.trunc()),
-        "expected a degenerate integer-valued output, got {baked_out:?}"
-    );
-
-    let num: f32 = baked_out
-        .iter()
-        .zip(&f32_out)
-        .map(|(b, f)| (b - f) * (b - f))
-        .sum();
-    let den: f32 = f32_out.iter().map(|f| f * f).sum();
-    let nrmse = (num / den).sqrt();
-    println!("empty-calibration NRMSE vs f32: {:.1}%", nrmse * 100.0);
-    assert!(
-        nrmse > 0.5,
-        "empty calibration is supposed to be catastrophic; NRMSE was only {:.1}%. \
-         If `from_network` now rejects or handles an empty calibration set, update \
-         the README warning and delete this test.",
-        nrmse * 100.0
-    );
+    assert_eq!(f32_out, vec![0.25; config.output_dim]);
+    assert_eq!(baked_out, f32_out);
 }
 
 // ---------------------------------------------------------------------------
