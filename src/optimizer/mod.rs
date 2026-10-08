@@ -39,6 +39,7 @@
 //! Weight decay is implemented as decoupled weight decay (AdamW style),
 //! not L2 regularization. This provides better generalization.
 
+use crate::training::gradients::{global_clip_scale, global_grad_norm};
 use std::borrow::Cow;
 
 use crate::buffer::AlignedBuffer;
@@ -318,25 +319,6 @@ impl SafetyConfig {
 /// Returns the index of the first non-finite value found, or None if all values are finite.
 fn find_nan_in_grads(grads: &[f32]) -> Option<usize> {
     grads.iter().position(|&g| !g.is_finite())
-}
-
-/// Euclidean norm across all gradient tensors, with squares accumulated in f64.
-pub(crate) fn global_grad_norm(weight_grads: &[Vec<f32>], bias_grads: &[Vec<f32>]) -> f64 {
-    weight_grads
-        .iter()
-        .chain(bias_grads)
-        .flatten()
-        .map(|&g| (g as f64).powi(2))
-        .sum::<f64>()
-        .sqrt()
-}
-
-/// Multiply gradients in f64 before casting back, so tiny scales do not underflow.
-pub(crate) fn global_clip_scale(norm: f64, max_norm: Option<f32>) -> f64 {
-    match max_norm {
-        Some(max) if norm > max as f64 && norm > 0.0 => max as f64 / norm,
-        _ => 1.0,
-    }
 }
 
 fn validate_nonnegative(value: f64, name: &str) -> ArkanResult<()> {

@@ -30,33 +30,53 @@ use super::*;
 /// assert!(loss > 0.0);
 /// ```
 pub fn masked_mse(predictions: &[f32], targets: &[f32], mask: Option<&[f32]>) -> (f32, Vec<f32>) {
-    debug_assert_eq!(predictions.len(), targets.len());
+    let mut gradient = vec![0.0; predictions.len()];
+    let loss = masked_mse_into(predictions, targets, mask, &mut gradient)
+        .expect("masked_mse: incompatible prediction, target or mask lengths");
+    (loss, gradient)
+}
 
+/// Masked MSE and its output derivative in a caller-owned buffer.
+///
+/// All lengths must match. Invalid shapes return an error before modifying
+/// `gradient`; inactive positions are always cleared. Normalization uses the
+/// same reciprocal multiplication as the network training path.
+pub fn masked_mse_into(
+    predictions: &[f32],
+    targets: &[f32],
+    mask: Option<&[f32]>,
+    gradient: &mut [f32],
+) -> crate::ArkanResult<f32> {
     let n = predictions.len();
-    let mut loss = 0.0f32;
-    let mut grad = vec![0.0f32; n];
-    let mut count = 0.0f32;
-
-    for i in 0..n {
-        let m = mask.map(|m| m[i]).unwrap_or(1.0);
-
-        if m > 0.0 {
-            let diff = predictions[i] - targets[i];
-            loss += m * diff * diff;
-            grad[i] = 2.0 * m * diff;
-            count += m;
+    for actual in [
+        targets.len(),
+        gradient.len(),
+        mask.map_or(n, |mask| mask.len()),
+    ] {
+        if actual != n {
+            return Err(crate::ArkanError::shape_mismatch(&[n], &[actual]));
         }
     }
-
+    let mut loss = 0.0;
+    let mut count = 0.0;
+    gradient.fill(0.0);
+    for index in 0..n {
+        let weight = mask.map_or(1.0, |mask| mask[index]);
+        if weight > 0.0 {
+            let difference = predictions[index] - targets[index];
+            loss += weight * difference * difference;
+            gradient[index] = 2.0 * weight * difference;
+            count += weight;
+        }
+    }
     if count > 0.0 {
-        loss /= count;
-        // Gradient is already weighted by mask, but we normalize by count
-        for g in &mut grad {
-            *g /= count;
+        let inverse = 1.0 / count;
+        loss *= inverse;
+        for value in gradient {
+            *value *= inverse;
         }
     }
-
-    (loss, grad)
+    Ok(loss)
 }
 
 /// Huber loss (smooth L1) for robust training.

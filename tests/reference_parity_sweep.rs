@@ -19,7 +19,7 @@
 
 use arkan::loss::masked_bce_with_logits;
 use arkan::optimizer::Optimizer;
-use arkan::{Adam, AdamConfig, KanConfig, KanNetwork, Workspace};
+use arkan::{Adam, AdamConfig, KanConfig, KanNetwork};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -192,97 +192,13 @@ fn compute_loss_and_grad(predictions: &[f32], targets: &[f32], loss_type: &str) 
     }
 }
 
-/// Run the full backward pass using workspace, returning (weight_grads, bias_grads).
-///
-/// This replicates the logic in train_step_with_options but without the SGD update,
-/// and accepts an externally-computed output gradient so we can use any loss function.
+/// Copy gradients only so the fixture comparison owns them independently of scratch.
 fn run_backward(
-    network: &KanNetwork,
-    workspace: &mut Workspace,
+    pass: arkan::training::ForwardPass<'_, '_>,
     grad_output: &[f32],
-    n: usize,
 ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
-    let num_layers = network.layers.len();
-    let out_dim = network.config.output_dim;
-
-    // Derive layer_param_sizes from public API
-    let layer_param_sizes: Vec<(usize, usize)> = network
-        .layers
-        .iter()
-        .map(|l| (l.weights.len(), l.bias.len()))
-        .collect();
-
-    workspace
-        .try_prepare_grad_buffers(&layer_param_sizes)
-        .unwrap_or_else(|e| panic!("prepare_grad_buffers failed: {}", e));
-
-    // Zero gradient buffers
-    for i in 0..num_layers {
-        for g in workspace.weight_grads[i].iter_mut() {
-            *g = 0.0;
-        }
-        for g in workspace.bias_grads[i].iter_mut() {
-            *g = 0.0;
-        }
-    }
-
-    // Staging buffer: start with output gradient
-    // Derive max_dim from config.layer_dims() (public method on KanConfig)
-    let all_dims = network.config.layer_dims();
-    let max_dim = all_dims.iter().copied().max().unwrap_or(out_dim);
-    let staging_size = n * max_dim;
-    workspace.staging_buffer.resize(staging_size);
-    workspace.staging_buffer.as_mut_slice()[..n * out_dim].copy_from_slice(grad_output);
-
-    for layer_idx in (0..num_layers).rev() {
-        let layer = &network.layers[layer_idx];
-        let in_dim = layer.in_dim;
-        let layer_out_dim = layer.out_dim;
-
-        // Take staging with current grad_out
-        let staging = std::mem::take(&mut workspace.staging_buffer);
-        let grad_out_slice = staging.as_slice()[..n * layer_out_dim].to_vec();
-
-        let mut weight_grad = std::mem::take(&mut workspace.weight_grads[layer_idx]);
-        let mut bias_grad = std::mem::take(&mut workspace.bias_grads[layer_idx]);
-
-        let mut grad_input_buf: Option<Vec<f32>> = if layer_idx > 0 {
-            Some(vec![0.0f32; n * in_dim])
-        } else {
-            None
-        };
-
-        let saved_inputs = workspace.layers_inputs[layer_idx].as_slice().to_vec();
-        let saved_indices = workspace.layers_grid_indices[layer_idx].to_vec();
-
-        layer.backward(
-            &saved_inputs,
-            &saved_indices,
-            &grad_out_slice,
-            grad_input_buf.as_deref_mut(),
-            &mut weight_grad,
-            &mut bias_grad,
-            workspace,
-        );
-
-        workspace.weight_grads[layer_idx] = weight_grad;
-        workspace.bias_grads[layer_idx] = bias_grad;
-        workspace.staging_buffer = staging;
-
-        if let Some(gi) = grad_input_buf {
-            let needed = n * in_dim;
-            workspace.staging_buffer.resize(needed);
-            workspace.staging_buffer.as_mut_slice()[..needed].copy_from_slice(&gi[..needed]);
-        }
-    }
-
-    let weight_grads: Vec<Vec<f32>> = workspace
-        .weight_grads
-        .iter()
-        .map(|wg| wg.to_vec())
-        .collect();
-    let bias_grads: Vec<Vec<f32>> = workspace.bias_grads.iter().map(|bg| bg.to_vec()).collect();
-    (weight_grads, bias_grads)
+    let gradients = pass.backward(grad_output).unwrap();
+    (gradients.weights.to_vec(), gradients.biases.to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -332,12 +248,14 @@ fn assert_parity(config_name: &str, ref_data: &Reference) -> (f32, f32, f32) {
     let mut workspace = network.create_workspace(n);
 
     let mut predictions = vec![0.0f32; n * out_dim];
-    network.forward_batch_training(&ref_data.dataset.inputs, &mut predictions, &mut workspace);
+    let pass = network
+        .try_forward_for_backward(&ref_data.dataset.inputs, &mut predictions, &mut workspace)
+        .unwrap();
 
     let (_, grad_output) =
         compute_loss_and_grad(&predictions, &ref_data.dataset.targets, loss_type);
 
-    let (weight_grads, bias_grads) = run_backward(&network, &mut workspace, &grad_output, n);
+    let (weight_grads, bias_grads) = run_backward(pass, &grad_output);
 
     let grad_tol = 1e-4f32;
     let mut max_w_err = 0.0f32;
@@ -417,14 +335,16 @@ fn assert_parity(config_name: &str, ref_data: &Reference) -> (f32, f32, f32) {
                 } else {
                     // SGD+BCE: manual forward + BCE loss + backward + SGD update
                     let mut predictions = vec![0.0f32; n * out_dim];
-                    network.forward_batch_training(
-                        &ref_data.dataset.inputs,
-                        &mut predictions,
-                        &mut workspace,
-                    );
+                    let pass = network
+                        .try_forward_for_backward(
+                            &ref_data.dataset.inputs,
+                            &mut predictions,
+                            &mut workspace,
+                        )
+                        .unwrap();
                     let (loss, grad_out) =
                         compute_loss_and_grad(&predictions, &ref_data.dataset.targets, loss_type);
-                    let (wg, bg) = run_backward(&network, &mut workspace, &grad_out, n);
+                    let (wg, bg) = run_backward(pass, &grad_out);
                     // SGD update: w -= lr * grad
                     for (layer_idx, layer) in network.layers.iter_mut().enumerate() {
                         for (w, g) in layer.weights.iter_mut().zip(wg[layer_idx].iter()) {
@@ -440,14 +360,16 @@ fn assert_parity(config_name: &str, ref_data: &Reference) -> (f32, f32, f32) {
             "adam" => {
                 // Adam: manual forward + loss + backward + Adam update
                 let mut predictions = vec![0.0f32; n * out_dim];
-                network.forward_batch_training(
-                    &ref_data.dataset.inputs,
-                    &mut predictions,
-                    &mut workspace,
-                );
+                let pass = network
+                    .try_forward_for_backward(
+                        &ref_data.dataset.inputs,
+                        &mut predictions,
+                        &mut workspace,
+                    )
+                    .unwrap();
                 let (loss, grad_out) =
                     compute_loss_and_grad(&predictions, &ref_data.dataset.targets, loss_type);
-                let (wg, bg) = run_backward(&network, &mut workspace, &grad_out, n);
+                let (wg, bg) = run_backward(pass, &grad_out);
                 // Adam update
                 adam_opt
                     .as_mut()

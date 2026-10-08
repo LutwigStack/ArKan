@@ -1741,6 +1741,7 @@ impl GpuNetwork {
         cpu_network: &mut KanNetwork,
         opts: &TrainOptions,
     ) -> ArkanResult<f32> {
+        opts.validate()?;
         // Validate target shape
         let expected_target_len = batch_size
             .checked_mul(self.output_dim)
@@ -1772,8 +1773,8 @@ impl GpuNetwork {
         // 4. Apply weight decay if specified (AdamW-style decoupled decay)
         if opts.weight_decay > 0.0 {
             let lr = optimizer.config.lr;
-            for layer in &mut cpu_network.layers {
-                for w in layer.weights.as_mut_slice() {
+            for layer in cpu_network.try_parameters_mut()?.iter_mut() {
+                for w in layer.weights {
                     *w *= 1.0 - lr * opts.weight_decay;
                 }
             }
@@ -1878,6 +1879,7 @@ impl GpuNetwork {
         cpu_network: &mut KanNetwork,
         opts: &TrainOptions,
     ) -> ArkanResult<f32> {
+        opts.validate()?;
         // Validate target shape
         let expected_target_len = batch_size
             .checked_mul(self.output_dim)
@@ -1909,8 +1911,8 @@ impl GpuNetwork {
         // 4. Apply weight decay override if specified in opts
         if opts.weight_decay > 0.0 {
             let lr = optimizer.lr();
-            for layer in &mut cpu_network.layers {
-                for w in layer.weights.as_mut_slice() {
+            for layer in cpu_network.try_parameters_mut()?.iter_mut() {
+                for w in layer.weights {
                     *w *= 1.0 - lr * opts.weight_decay;
                 }
             }
@@ -2113,6 +2115,7 @@ impl GpuNetwork {
         optimizer: &mut GpuAdam,
         options: &TrainOptions,
     ) -> ArkanResult<f32> {
+        options.validate()?;
         // Validate target shape
         let expected_target_len = batch_size
             .checked_mul(self.output_dim)
@@ -2152,39 +2155,29 @@ impl GpuNetwork {
         workspace: &mut GpuWorkspace,
         max_norm: f32,
     ) -> ArkanResult<()> {
-        // Compute total L2 norm of all gradients
-        let mut total_sq_norm = 0.0f32;
-
         let layer_grads = workspace.get_layer_grad_buffers();
         let mut all_grads: Vec<Vec<f32>> = Vec::with_capacity(layer_grads.len() * 2);
 
         for (weight_grad_buf, bias_grad_buf) in layer_grads.iter() {
             // Download weight gradients
             let weight_grads = self.download_buffer_f32(weight_grad_buf)?;
-            for &g in &weight_grads {
-                total_sq_norm += g * g;
-            }
             all_grads.push(weight_grads);
 
             // Download bias gradients
             let bias_grads = self.download_buffer_f32(bias_grad_buf)?;
-            for &g in &bias_grads {
-                total_sq_norm += g * g;
-            }
             all_grads.push(bias_grads);
         }
 
-        let norm = total_sq_norm.sqrt();
-        if norm > max_norm && norm > 0.0 {
-            let scale = max_norm / norm;
-
+        let norm = crate::training::gradients::global_grad_norm(&all_grads, &[]);
+        let scale = crate::training::gradients::global_clip_scale(norm, Some(max_norm));
+        if scale != 1.0 {
             // Scale and re-upload gradients
             let mut grad_idx = 0;
             for (weight_grad_buf, bias_grad_buf) in layer_grads.iter() {
                 // Scale weight gradients
                 let mut weight_grads = std::mem::take(&mut all_grads[grad_idx]);
                 for g in weight_grads.iter_mut() {
-                    *g *= scale;
+                    *g = (*g as f64 * scale) as f32;
                 }
                 self.upload_buffer_f32(weight_grad_buf, &weight_grads);
                 grad_idx += 1;
@@ -2192,7 +2185,7 @@ impl GpuNetwork {
                 // Scale bias gradients
                 let mut bias_grads = std::mem::take(&mut all_grads[grad_idx]);
                 for g in bias_grads.iter_mut() {
-                    *g *= scale;
+                    *g = (*g as f64 * scale) as f32;
                 }
                 self.upload_buffer_f32(bias_grad_buf, &bias_grads);
                 grad_idx += 1;

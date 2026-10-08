@@ -249,14 +249,14 @@ fn layer2_gradient_parity() {
         );
     }
 
-    // Run one training step to get gradients (we'll read them from workspace)
-    // We need to extract gradients without updating weights, so we use a lower-level approach:
-    // run forward_batch_training, compute MSE gradient, then backward.
+    // Exercise production backward with an independently computed MSE derivative.
     let mut workspace = network.create_workspace(n);
 
     // Forward with history
     let mut predictions = vec![0.0f32; n * out_dim];
-    network.forward_batch_training(&ref_data.dataset.inputs, &mut predictions, &mut workspace);
+    let pass = network
+        .try_forward_for_backward(&ref_data.dataset.inputs, &mut predictions, &mut workspace)
+        .unwrap();
 
     // Compute MSE gradient (same as ArKan's compute_masked_mse_loss_into)
     let mut grad_output = vec![0.0f32; n * out_dim];
@@ -270,69 +270,9 @@ fn layer2_gradient_parity() {
         grad_output[idx] = 2.0 * diff / count;
     }
 
-    // Allocate gradient buffers per layer
-    let num_layers = network.layers.len();
-    let mut weight_grads: Vec<Vec<f32>> = network
-        .layers
-        .iter()
-        .map(|l| vec![0.0f32; l.weights.len()])
-        .collect();
-    let mut bias_grads: Vec<Vec<f32>> = network
-        .layers
-        .iter()
-        .map(|l| vec![0.0f32; l.bias.len()])
-        .collect();
-
-    // Backward pass (sequential, matching train_step for small batches)
-    // We replicate the backward pass logic from network.rs train_step.
-    //
-    // staging_buffer holds the current layer's dL/dy
-    let max_dim = network
-        .config
-        .layer_dims()
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(out_dim);
-    let mut staging: Vec<f32> = vec![0.0f32; n * max_dim];
-    // Seed with output gradient
-    staging[..n * out_dim].copy_from_slice(&grad_output);
-
-    // We need the saved history from forward_batch_training
-    // history is in workspace.layers_inputs and workspace.layers_grid_indices
-    // Replicate backward from last layer to first
-    for layer_idx in (0..num_layers).rev() {
-        let layer = &network.layers[layer_idx];
-        let layer_in_dim = layer.in_dim;
-        let layer_out_dim = layer.out_dim;
-
-        let grad_out_slice = &staging[..n * layer_out_dim].to_vec();
-        let mut grad_input_buf: Option<Vec<f32>> = if layer_idx > 0 {
-            Some(vec![0.0f32; n * layer_in_dim])
-        } else {
-            None
-        };
-
-        // Get saved inputs and grid indices from workspace
-        let saved_inputs = workspace.layers_inputs[layer_idx].as_slice().to_vec();
-        let saved_indices = workspace.layers_grid_indices[layer_idx].to_vec();
-
-        layer.backward(
-            &saved_inputs,
-            &saved_indices,
-            grad_out_slice,
-            grad_input_buf.as_deref_mut(),
-            &mut weight_grads[layer_idx],
-            &mut bias_grads[layer_idx],
-            &mut workspace,
-        );
-
-        // Propagate grad_input to staging for next (earlier) layer
-        if let Some(ref gi) = grad_input_buf {
-            let needed = n * layer_in_dim;
-            staging[..needed].copy_from_slice(&gi[..needed]);
-        }
-    }
+    let gradients = pass.backward(&grad_output).unwrap();
+    let weight_grads = gradients.weights;
+    let bias_grads = gradients.biases;
 
     // Compare with PyTorch reference gradients
     let tol = 1e-4;

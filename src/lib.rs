@@ -158,6 +158,7 @@ pub mod model;
 pub mod network;
 pub mod optimizer;
 pub mod spline;
+pub mod training;
 
 #[cfg(feature = "serde")]
 mod format;

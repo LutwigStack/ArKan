@@ -49,6 +49,85 @@ fn model_snapshot_rejects_mutated_gpu_geometry_before_execution() {
     gpu.layers[0].in_dim += 1;
     assert!(gpu.forward_batch(&[0.5, -0.2], 1, &mut workspace).is_err());
 }
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn native_clipping_preserves_large_finite_gradient_direction() {
+    let b = backend();
+    let mut cpu = network(3);
+    for layer in &mut cpu.layers {
+        layer.weights.fill(0.0);
+        layer.bias.fill(0.0);
+    }
+    let mut gpu = GpuNetwork::from_cpu(&b, &cpu).unwrap();
+    let mut workspace = gpu.create_workspace(1).unwrap();
+    let mut optimizer = GpuAdam::new(
+        b.device.clone(),
+        b.queue.clone(),
+        &gpu.layer_param_sizes(),
+        GpuAdamConfig::with_lr(0.01),
+    );
+    gpu.train_step_gpu_native_with_options(
+        &[0.5, -0.2],
+        &[-1e20],
+        1,
+        None,
+        &mut workspace,
+        &mut optimizer,
+        &arkan::TrainOptions {
+            max_grad_norm: Some(1.0),
+            weight_decay: 0.0,
+        },
+    )
+    .unwrap();
+    let mut sum = 0.0f64;
+    for tensor in workspace.grad_weights.iter().chain(&workspace.grad_bias) {
+        for value in tensor.download(&b.device, &b.queue).unwrap() {
+            sum += (value as f64).powi(2);
+        }
+    }
+    assert!(
+        (sum.sqrt() - 1.0).abs() < 1e-5,
+        "clipped norm {}",
+        sum.sqrt()
+    );
+    gpu.sync_weights_to_cpu(&mut cpu).unwrap();
+    assert!(cpu.layers.last().unwrap().bias[0] < 0.0);
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn native_training_rejects_invalid_clip_threshold_before_updates() {
+    let b = backend();
+    let mut cpu = network(3);
+    let before = cpu.layers[0].weights.clone();
+    let mut gpu = GpuNetwork::from_cpu(&b, &cpu).unwrap();
+    let mut workspace = gpu.create_workspace(1).unwrap();
+    let mut optimizer = GpuAdam::new(
+        b.device.clone(),
+        b.queue.clone(),
+        &gpu.layer_param_sizes(),
+        GpuAdamConfig::with_lr(0.01),
+    );
+    for threshold in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+        assert!(gpu
+            .train_step_gpu_native_with_options(
+                &[0.5, -0.2],
+                &[1.0],
+                1,
+                None,
+                &mut workspace,
+                &mut optimizer,
+                &arkan::TrainOptions {
+                    max_grad_norm: Some(threshold),
+                    weight_decay: 0.0
+                },
+            )
+            .is_err());
+    }
+    gpu.sync_weights_to_cpu(&mut cpu).unwrap();
+    assert_eq!(cpu.layers[0].weights, before);
+}
 fn close(actual: &[f32], expected: &[f32]) {
     assert_eq!(actual.len(), expected.len());
     for (i, (a, b)) in actual.iter().zip(expected).enumerate() {
