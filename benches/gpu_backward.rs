@@ -31,6 +31,13 @@ use arkan::optimizer::{Adam, AdamConfig, SGDConfig, SGD};
 #[cfg(feature = "gpu")]
 use arkan::{KanConfig, KanNetwork, TrainOptions};
 
+/// Start deferred queue writes and wait for all submitted work at the timing boundary.
+#[cfg(feature = "gpu")]
+fn finish_gpu_work(backend: &WgpuBackend) {
+    backend.queue().submit([]);
+    backend.poll();
+}
+
 /// Check if GPU benchmarks are enabled via environment variable.
 ///
 /// Set `ARKAN_GPU_BENCH=1` to enable GPU benchmarks.
@@ -98,7 +105,7 @@ fn bench_gpu_train_step_adam(c: &mut Criterion) {
         .borrow_mut()
         .init_training()
         .expect("training buffer setup");
-    backend.poll();
+    finish_gpu_work(&backend);
 
     let batch_sizes = [1_usize, 8, 16, 64, 256];
     let mut group = c.benchmark_group("gpu_train_step_adam");
@@ -133,7 +140,7 @@ fn bench_gpu_train_step_adam(c: &mut Criterion) {
                             .borrow_mut()
                             .sync_weights_cpu_to_gpu(&cpu_network)
                             .unwrap();
-                        backend.poll();
+                        finish_gpu_work(&backend);
                         (cpu_network, optimizer)
                     },
                     |(cpu_network, optimizer)| {
@@ -148,6 +155,7 @@ fn bench_gpu_train_step_adam(c: &mut Criterion) {
                                 cpu_network,
                             )
                             .expect("GPU train step failed");
+                        finish_gpu_work(&backend);
                         black_box(loss)
                     },
                     criterion::BatchSize::PerIteration,
@@ -185,7 +193,7 @@ fn bench_gpu_train_step_sgd(c: &mut Criterion) {
         .borrow_mut()
         .init_training()
         .expect("training buffer setup");
-    backend.poll();
+    finish_gpu_work(&backend);
 
     let batch_sizes = [1_usize, 8, 16, 64, 256];
     let mut group = c.benchmark_group("gpu_train_step_sgd");
@@ -213,7 +221,7 @@ fn bench_gpu_train_step_sgd(c: &mut Criterion) {
                             .borrow_mut()
                             .sync_weights_cpu_to_gpu(&cpu_network)
                             .unwrap();
-                        backend.poll();
+                        finish_gpu_work(&backend);
                         (cpu_network, optimizer)
                     },
                     |(cpu_network, optimizer)| {
@@ -228,6 +236,7 @@ fn bench_gpu_train_step_sgd(c: &mut Criterion) {
                                 cpu_network,
                             )
                             .expect("GPU train step failed");
+                        finish_gpu_work(&backend);
                         black_box(loss)
                     },
                     criterion::BatchSize::PerIteration,
@@ -286,7 +295,7 @@ fn bench_gpu_train_step_with_options(c: &mut Criterion) {
         "clipping workload needs finite nonzero gradients"
     );
     println!("Seeded GPU clipping workload CPU-reference gradient norm: {norm}");
-    backend.poll();
+    finish_gpu_work(&backend);
     let mut group = c.benchmark_group("gpu_train_options");
     group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
     let cases = [
@@ -310,25 +319,25 @@ fn bench_gpu_train_step_with_options(c: &mut Criterion) {
                         .borrow_mut()
                         .sync_weights_cpu_to_gpu(&cpu)
                         .unwrap();
-                    backend.poll();
+                    finish_gpu_work(&backend);
                     (cpu, optimizer)
                 },
                 |(cpu, optimizer)| {
-                    black_box(
-                        gpu_network
-                            .borrow_mut()
-                            .train_step_with_options(
-                                black_box(&inputs),
-                                black_box(&targets),
-                                None,
-                                batch,
-                                &mut workspace,
-                                optimizer,
-                                cpu,
-                                &opts,
-                            )
-                            .expect("GPU train step failed"),
-                    );
+                    let loss = gpu_network
+                        .borrow_mut()
+                        .train_step_with_options(
+                            black_box(&inputs),
+                            black_box(&targets),
+                            None,
+                            batch,
+                            &mut workspace,
+                            optimizer,
+                            cpu,
+                            &opts,
+                        )
+                        .expect("GPU train step failed");
+                    finish_gpu_work(&backend);
+                    black_box(loss)
                 },
                 criterion::BatchSize::PerIteration,
             );
@@ -367,11 +376,35 @@ fn bench_cpu_vs_gpu_train(c: &mut Criterion) {
         .borrow_mut()
         .init_training()
         .expect("training buffer setup");
-    backend.poll();
+    finish_gpu_work(&backend);
     let gpu_workspace = match gpu_network.borrow_mut().create_workspace(batch) {
         Ok(w) => RefCell::new(w),
         Err(_) => return,
     };
+
+    let mut cpu_workspace = base_cpu_network.create_workspace(batch);
+    {
+        let mut warm_network = base_cpu_network.clone();
+        let mut warm_optimizer = Adam::new(&warm_network, AdamConfig::with_lr(0.001));
+        warm_network
+            .train_step_with_optimizer(
+                &inputs,
+                &targets,
+                None,
+                &mut cpu_workspace,
+                &mut warm_optimizer,
+                &TrainOptions::default(),
+            )
+            .expect("CPU workspace warmup failed");
+    }
+    assert_eq!(
+        cpu_workspace.weight_grads.len(),
+        base_cpu_network.layers.len()
+    );
+    assert_eq!(
+        cpu_workspace.bias_grads.len(),
+        base_cpu_network.layers.len()
+    );
 
     let mut group = c.benchmark_group("cpu_vs_gpu_train_batch64");
     group.throughput(Throughput::Elements((batch * config.input_dim) as u64));
@@ -381,17 +414,16 @@ fn bench_cpu_vs_gpu_train(c: &mut Criterion) {
         b.iter_batched_ref(
             || {
                 let cpu_network = base_cpu_network.clone();
-                let workspace = cpu_network.create_workspace(batch);
                 let optimizer = Adam::new(&cpu_network, AdamConfig::with_lr(0.001));
-                (cpu_network, workspace, optimizer)
+                (cpu_network, optimizer)
             },
-            |(cpu_network, workspace, optimizer)| {
+            |(cpu_network, optimizer)| {
                 let loss = cpu_network
                     .train_step_with_optimizer(
                         black_box(&inputs),
                         black_box(&targets),
                         None,
-                        workspace,
+                        &mut cpu_workspace,
                         optimizer,
                         &TrainOptions::default(),
                     )
@@ -412,7 +444,7 @@ fn bench_cpu_vs_gpu_train(c: &mut Criterion) {
                     .borrow_mut()
                     .sync_weights_cpu_to_gpu(&gpu_cpu_network)
                     .unwrap();
-                backend.poll();
+                finish_gpu_work(&backend);
                 (gpu_cpu_network, optimizer)
             },
             |(gpu_cpu_network, optimizer)| {
@@ -427,6 +459,7 @@ fn bench_cpu_vs_gpu_train(c: &mut Criterion) {
                         gpu_cpu_network,
                     )
                     .expect("GPU train step failed");
+                finish_gpu_work(&backend);
                 black_box(loss)
             },
             criterion::BatchSize::PerIteration,
@@ -481,7 +514,7 @@ fn bench_gpu_native_training(c: &mut Criterion) {
         .borrow_mut()
         .init_training()
         .expect("training buffer setup");
-    backend.poll();
+    finish_gpu_work(&backend);
 
     let batch_sizes = [1_usize, 8, 16, 64, 256];
     let mut group = c.benchmark_group("gpu_native_training");
@@ -520,7 +553,7 @@ fn bench_gpu_native_training(c: &mut Criterion) {
                             .sync_weights_cpu_to_gpu(&cpu_network)
                             .unwrap();
                         optimizer.borrow_mut().reset();
-                        backend.poll();
+                        finish_gpu_work(&backend);
                     },
                     |_| {
                         let loss = gpu_network
@@ -533,6 +566,7 @@ fn bench_gpu_native_training(c: &mut Criterion) {
                                 &mut optimizer.borrow_mut(),
                             )
                             .expect("Native GPU train step failed");
+                        finish_gpu_work(&backend);
                         black_box(loss)
                     },
                     criterion::BatchSize::PerIteration,
