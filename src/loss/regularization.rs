@@ -172,13 +172,12 @@ pub fn entropy_regularization(coefficients: &[f32], group_size: usize) -> f32 {
     for g in 0..num_groups {
         let group = &coefficients[g * group_size..(g + 1) * group_size];
 
-        // Compute squared magnitudes
-        let squared: Vec<f32> = group.iter().map(|c| c * c).collect();
-        let sum: f32 = squared.iter().sum::<f32>() + EPSILON;
+        let sum: f32 = group.iter().map(|c| c * c).sum::<f32>() + EPSILON;
 
         // Compute entropy
         let mut entropy = 0.0f32;
-        for &sq in &squared {
+        for &c in group {
+            let sq = c * c;
             let p = sq / sum;
             if p > EPSILON {
                 entropy -= p * p.ln();

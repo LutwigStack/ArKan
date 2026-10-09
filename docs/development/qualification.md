@@ -1,0 +1,75 @@
+# Guarded validation command receipts
+
+Proposed repository paths: `scripts/check_command.py`, `scripts/test_check_command.py`,
+`scripts/test_cancellation.py`, and `docs/development/qualification.md`.
+This utility requires POSIX and Python 3.11+
+and adds no dependencies. Existing Criterion benches and example smoke checks remain
+the application workflows; this records an already selected foreground command.
+
+Public command:
+
+```text
+python3 scripts/check_command.py --manifest /path/to/check.json --output /path/to/new-evidence
+python3 -B -m unittest discover -s scripts -p test_check_command.py -v
+python3 -B scripts/test_cancellation.py -v
+```
+
+Manifest schema 1 has `cwd`, `argv` (a string vector with an absolute executable
+path), positive finite `timeout_seconds`, and nonempty `inputs` (objects with
+`path` and SHA256 `sha256`). Relative `cwd` and input paths resolve against the
+manifest's parent directory. Record the actual toolchain, library/caller build,
+lock, features, linked dependencies, source snapshot, executable, test source and
+prior review report identities in the input list when the command depends on them.
+It is the manifest author's responsibility to enumerate the complete inputs.
+The utility never discovers a Cargo dependency closure or supplies independent
+qualification, compilation, correctness, ownership or acceptance review.
+
+The output directory must be absent. It contains an exact `manifest.json` copy,
+binary `stdout.log`/`stderr.log` when launch was attempted, and `receipt.json` with
+argv/cwd, manifest SHA, wall timestamps, elapsed seconds, PID, child exit status,
+outcome and SHA/byte identities of retained payloads. Launched commands also record
+`group_cleanup`: TERM/KILL delivery, direct-child reaping, process-group presence
+after cleanup, and cleanup elapsed seconds. Outcomes distinguish PASS,
+FAIL, REFUSED, TIMEOUT, INTERRUPTED, INPUT_CHANGED and ERROR. A zero child exit
+is PASS only when pre/post immutable input and manifest checks also pass.
+Duplicate JSON keys and nonfinite deadlines refuse launch. Output is written
+directly to disk, preserving partial output without unbounded capture in memory.
+The utility returns zero only for PASS. It never retries or overwrites its output.
+An existing evidence directory is a consumed attempt; choosing another directory
+does not authorize a repeat of an application experiment.
+
+Children must join their descendants and must not detach process groups. Handled
+INT/TERM signals only record a pending interruption, so they cannot abandon an
+unregistered child inside Popen. After handle registration the wait checks the
+pending signal at most every 100 ms. Every postlaunch exit runs cleanup before
+restoring the caller's handlers. Cleanup sends TERM to the whole owned process
+group, allows a one-second grace when TERM was delivered, and sends KILL even
+when the leader already exited. It reaps the direct child and checks group
+disappearance within a shared six-second cleanup budget. A successful direct
+child that leaves its group present produces ERROR. Failure to confirm reaping
+or group disappearance also produces ERROR, preserving the observed cleanup
+fields rather than implying that cleanup completed.
+
+The utility cannot waitpid orphan descendants. A terminated orphan zombie may
+keep its process group present until its adoptive parent reaps it; this prevents
+a confirmed cleanup receipt within the budget and is reported as ERROR. Group
+absence is a bounded observation after termination, not a claim about escaped
+sessions or universal OS process ownership. Cleanup time and pre/post hashing
+count in receipt elapsed time, but extend beyond the command deadline. OS launch
+and uninterruptible kernel I/O are not bounded by the polling interval. This is
+a validation utility, not the full scientific campaign supervisor:
+that driver creates independent caller sessions and needs separate supervision.
+File hashing before and after does not prevent a hostile or transient change
+between guards. A SIGKILL of the utility or machine failure can leave partial files
+without a final receipt; that is incomplete evidence, never a passing check.
+
+The focused suite uses tiny Python fixture children only. It covers nonzero child
+status/partial stdout and stderr, ordinary and TERM-resistant timeout/reaping,
+immutable mismatch before side effects, postlaunch mutation, failed launch,
+duplicate manifest keys and refusal to overwrite or repeat an existing attempt.
+Four additional real Linux fixtures exercise a TERM-resistant same-group descendant
+on timeout and waiting interruption, and actual SIGTERM immediately before Popen
+returns and after handle registration. Those fixtures temporarily become their
+own orphan subreaper, reap their own children on RED and GREEN, then restore that
+per-process setting. The production utility does not adopt orphan descendants.
+The focused suite does not execute ArKan or prove Rust/application correctness.

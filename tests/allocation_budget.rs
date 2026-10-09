@@ -6,6 +6,7 @@
 //! allocation" claim must be exactly zero.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arkan::{Adam, AdamConfig, KanConfig, KanNetwork, SGDConfig, TrainOptions, SGD};
@@ -13,16 +14,35 @@ use arkan::{Adam, AdamConfig, KanConfig, KanNetwork, SGDConfig, TrainOptions, SG
 static ARMED: AtomicBool = AtomicBool::new(false);
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static BYTES: AtomicUsize = AtomicUsize::new(0);
+static CLASSES: [AtomicUsize; 3] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 
 struct Counting;
 
+fn record(class: usize, bytes: usize) {
+    if ARMED.load(Ordering::Relaxed) {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(bytes, Ordering::Relaxed);
+        CLASSES[class].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// SAFETY: Every operation forwards the original pointer/layout to System.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
+        record(0, layout.size());
         System.alloc(layout)
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        record(1, layout.size());
+        System.alloc_zeroed(layout)
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        record(2, new_size);
+        System.realloc(ptr, layout, new_size)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         System.dealloc(ptr, layout)
@@ -36,6 +56,9 @@ static A: Counting = Counting;
 fn measure(f: impl FnOnce()) -> (usize, usize) {
     ALLOCS.store(0, Ordering::Relaxed);
     BYTES.store(0, Ordering::Relaxed);
+    for class in &CLASSES {
+        class.store(0, Ordering::Relaxed);
+    }
     ARMED.store(true, Ordering::Relaxed);
     f();
     ARMED.store(false, Ordering::Relaxed);
@@ -43,6 +66,53 @@ fn measure(f: impl FnOnce()) -> (usize, usize) {
         ALLOCS.load(Ordering::Relaxed),
         BYTES.load(Ordering::Relaxed),
     )
+}
+
+fn entropy_is_allocation_free() {
+    let coefficients: [f32; 18] = std::array::from_fn(|i| (i as f32 - 7.0) * 0.13);
+    let cases = [
+        (8, 4),
+        (16, 4),
+        (18, 4),
+        (8, 8),
+        (8, 1),
+        (0, 4),
+        (8, 0),
+        (8, 9),
+    ];
+    // Collect every row before assertions, so a baseline failure retains tail controls.
+    let observations = cases.map(|(length, group_size)| {
+        let control = measure(|| {});
+        let result = measure(|| {
+            black_box(arkan::loss::entropy_regularization(
+                black_box(&coefficients[..length]),
+                black_box(group_size),
+            ));
+        });
+        let classes: [usize; 3] = std::array::from_fn(|i| CLASSES[i].load(Ordering::Relaxed));
+        (control, result, classes)
+    });
+    for ((length, group_size), (control, (requests, bytes), classes)) in
+        cases.into_iter().zip(observations)
+    {
+        println!(
+            "entropy len={length} group={group_size} calls=1 control={control:?} \
+             requests={requests} bytes={bytes} alloc={} alloc_zeroed={} realloc={}",
+            classes[0], classes[1], classes[2]
+        );
+    }
+    assert_eq!(
+        observations[1].1, observations[2].1,
+        "incomplete tail allocation cost"
+    );
+    for (control, result, _) in observations {
+        assert_eq!(control, (0, 0), "empty entropy measurement window");
+        assert_eq!(
+            result,
+            (0, 0),
+            "entropy must not allocate temporary storage"
+        );
+    }
 }
 
 fn net(batch: usize) -> (KanNetwork, KanConfig) {
@@ -254,6 +324,7 @@ fn try_create_workspace_does_not_panic_on_a_valid_config() {
 
 #[test]
 fn allocation_budget() {
+    entropy_is_allocation_free();
     inference_is_allocation_free();
     train_step_is_allocation_free();
     optimizer_step_is_allocation_free();
