@@ -284,6 +284,9 @@ fn lbfgs_failure_after_an_accepted_iteration_restores_parameters_and_history() {
             ..Default::default()
         },
     );
+    #[cfg(feature = "serde")]
+    let mut original_state: L3State =
+        bincode::deserialize(&bincode::serialize(&opt).unwrap()).unwrap();
     let mut evaluations = 0;
     assert!(opt
         .step_lbfgs(&mut net, |net| {
@@ -301,6 +304,14 @@ fn lbfgs_failure_after_an_accepted_iteration_restores_parameters_and_history() {
         .collect();
     assert_eq!(opt.two_loop_recursion(&gradient)[0], -2.0);
     assert_eq!(opt.num_evals(), 3);
+    #[cfg(feature = "serde")]
+    {
+        original_state.7 = 3;
+        assert_eq!(
+            bincode::serialize(&opt).unwrap(),
+            bincode::serialize(&original_state).unwrap()
+        );
+    }
 }
 #[test]
 fn default_skip_policy_preserves_parameters_for_unscale_overflow() {
@@ -691,6 +702,9 @@ fn lbfgs_cancellation_preserves_warmed_history_and_original_error() {
         let probe = vec![2.0; before.len()];
         let direction = optimizer.two_loop_recursion(&probe);
         assert_eq!(direction, vec![-1.0; before.len()]);
+        #[cfg(feature = "serde")]
+        let mut original_state: L3State =
+            bincode::deserialize(&bincode::serialize(&optimizer).unwrap()).unwrap();
         let mut calls = 0;
         let error = optimizer
             .step_lbfgs(&mut net, |net| {
@@ -709,5 +723,381 @@ fn lbfgs_cancellation_preserves_warmed_history_and_original_error() {
         assert_eq!(optimizer.num_evals(), 4);
         assert_eq!(LBFGS::flatten_params(&net), before);
         assert_eq!(optimizer.two_loop_recursion(&probe), direction);
+        #[cfg(feature = "serde")]
+        {
+            original_state.7 = 4;
+            assert_eq!(
+                bincode::serialize(&optimizer).unwrap(),
+                bincode::serialize(&original_state).unwrap()
+            );
+        }
+    }
+}
+
+// Literal public warm-up fixtures for L3; no second two-loop implementation.
+fn l3_warmed_fixture(width: usize, history: &str) -> (KanNetwork, LBFGS) {
+    let mut net = KanNetwork::new(KanConfig {
+        input_dim: width,
+        output_dim: width,
+        hidden_dims: vec![width],
+        grid_size: 3,
+        spline_order: 3,
+        input_mean: vec![0.0; width],
+        input_std: vec![1.0; width],
+        init_seed: Some(42),
+        ..Default::default()
+    });
+    for layer in &mut net.layers {
+        layer.weights.fill(0.0);
+        layer.bias.fill(0.0);
+    }
+    net.layers[0].weights[0] = 1.0;
+    let mut opt = LBFGS::new(
+        &net,
+        LBFGSConfig {
+            lr: 0.25,
+            max_iter: 1,
+            max_eval: Some(2),
+            tolerance_grad: 0.0,
+            tolerance_change: 0.0,
+            history_size: if history == "E1" { 1 } else { 3 },
+            line_search_fn: LineSearchMethod::NoLineSearch,
+            safety: SafetyConfig::strict(),
+        },
+    );
+    let steps = match history {
+        "H0" => 0,
+        "H1" => 1,
+        "H3" | "E1" => 3,
+        _ => unreachable!(),
+    };
+    let n = 12 * width * width + 2 * width;
+    for step in 0..steps {
+        if step > 0 {
+            opt.config.lr = 0.5;
+        }
+        let loss = opt
+            .step_lbfgs(&mut net, |model| {
+                let x = model.layers[0].weights[0];
+                let mut g = vec![0.0; n];
+                g[0] = 2.0 * x;
+                Ok((f64::from(x).powi(2), g))
+            })
+            .unwrap();
+        let x = [0.5f32, 0.25, 0.125][step];
+        assert_eq!(net.layers[0].weights[0].to_bits(), x.to_bits());
+        assert_eq!(loss.to_bits(), f64::from(x).powi(2).to_bits());
+    }
+    let p = LBFGS::flatten_params(&net);
+    assert_eq!(p.len(), n);
+    assert!(p[1..].iter().all(|v| v.to_bits() == 0));
+    assert_eq!(opt.num_evals(), 2 * steps);
+    (net, opt)
+}
+fn l3_bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|v| v.to_bits()).collect()
+}
+fn l3_mixed(n: usize) -> Vec<f32> {
+    let pattern = [
+        2.0,
+        -3.0,
+        0.25,
+        -0.5,
+        0.0,
+        -0.0,
+        f32::from_bits(1),
+        f32::MAX,
+    ];
+    (0..n).map(|i| pattern[i % pattern.len()]).collect()
+}
+
+#[test]
+fn lbfgs_warmed_public_recursion_preserves_literal_direction_and_legacy_lengths() {
+    for (width, history, lengths) in [
+        (1, "H1", vec![0, 1, 13, 14, 17]),
+        (1, "H3", vec![0, 1, 13, 14, 17]),
+        (8, "H1", vec![784]),
+        (8, "H3", vec![784]),
+        (1, "E1", vec![14]),
+    ] {
+        let (net, opt) = l3_warmed_fixture(width, history);
+        let parameters = l3_bits(&LBFGS::flatten_params(&net));
+        let evaluations = opt.num_evals();
+        let version = opt.get_state_version();
+        let config = format!("{:?}", opt.config);
+        for n in lengths {
+            let g = vec![2.0; n];
+            let direction = opt.two_loop_recursion(&g);
+            assert_eq!(direction.len(), n);
+            assert!(direction.iter().all(|v| v.to_bits() == (-1.0f32).to_bits()));
+            let mixed = l3_mixed(n);
+            let direction = opt.two_loop_recursion(&mixed);
+            assert_eq!(direction.len(), n);
+            for (g, d) in mixed.iter().zip(&direction) {
+                if *g != 0.0 {
+                    assert_eq!(d.to_bits(), ((-0.5f64 * f64::from(*g)) as f32).to_bits());
+                }
+            }
+            assert_eq!(opt.num_evals(), evaluations);
+            assert_eq!(opt.get_state_version(), version);
+            assert_eq!(format!("{:?}", opt.config), config);
+            assert_eq!(l3_bits(&LBFGS::flatten_params(&net)), parameters);
+        }
+    }
+    for (width, n) in [(1, 0), (1, 14), (8, 784)] {
+        let (_, opt) = l3_warmed_fixture(width, "H0");
+        let g = l3_mixed(n);
+        let direction = opt.two_loop_recursion(&g);
+        assert_eq!(
+            l3_bits(&direction),
+            g.iter().map(|v| (-v).to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(opt.num_evals(), 0);
+    }
+}
+
+#[cfg(feature = "serde")]
+type L3State = (
+    LBFGSConfig,
+    Vec<Vec<f32>>,
+    Vec<Vec<f32>>,
+    Vec<f64>,
+    Option<Vec<f32>>,
+    Option<Vec<f32>>,
+    u64,
+    usize,
+);
+#[cfg(feature = "serde")]
+fn l3_literal_state(net: &KanNetwork, opt: &LBFGS, history: &str) -> L3State {
+    let parameters = LBFGS::flatten_params(net);
+    let count = if history == "H1" { 1 } else { 3 };
+    let entries = if history == "E1" { 2..3 } else { 0..count };
+    let mut s = Vec::new();
+    let mut y = Vec::new();
+    let mut rho = Vec::new();
+    for i in entries {
+        let mut a = vec![0.0; parameters.len()];
+        let mut b = a.clone();
+        a[0] = [-0.5, -0.25, -0.125][i];
+        b[0] = [-1.0, -0.5, -0.25][i];
+        s.push(a);
+        y.push(b);
+        rho.push([2.0, 8.0, 32.0][i]);
+    }
+    let mut g = vec![0.0; parameters.len()];
+    g[0] = 2.0 * parameters[0];
+    let tuple = (
+        opt.config,
+        s,
+        y,
+        rho,
+        Some(parameters),
+        Some(g),
+        0,
+        2 * count,
+    );
+    assert_eq!(
+        bincode::serialize(&tuple).unwrap(),
+        bincode::serialize(opt).unwrap(),
+        "literal normal tuple field order and state"
+    );
+    tuple
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn lbfgs_serde_warmed_recursion_preserves_all_state_bits_and_exceptional_lengths() {
+    for (width, history, lengths) in [
+        (1, "H1", vec![0, 1, 13, 14, 17]),
+        (1, "H3", vec![0, 1, 13, 14, 17]),
+        (8, "H1", vec![784]),
+        (8, "H3", vec![784]),
+        (1, "E1", vec![14]),
+    ] {
+        let (net, opt) = l3_warmed_fixture(width, history);
+        l3_literal_state(&net, &opt, history);
+        let before = bincode::serialize(&opt).unwrap();
+        let restored: LBFGS = bincode::deserialize(&before).unwrap();
+        assert_eq!(bincode::serialize(&restored).unwrap(), before);
+        for n in lengths {
+            let g = l3_mixed(n);
+            let direction = opt.two_loop_recursion(&g);
+            assert_eq!(
+                l3_bits(&restored.two_loop_recursion(&g)),
+                l3_bits(&direction)
+            );
+            assert_eq!(bincode::serialize(&opt).unwrap(), before);
+        }
+        if width == 1 && history != "E1" {
+            for index in [0, 7] {
+                for raw in [0x7f800000, 0xff800000, 0x7fc00011, 0xffc00022] {
+                    let mut g = l3_mixed(14);
+                    g[index] = f32::from_bits(raw);
+                    let actual = opt.two_loop_recursion(&g);
+                    let copy = restored.two_loop_recursion(&g);
+                    assert_eq!(actual.len(), 14);
+                    assert_eq!(l3_bits(&actual), l3_bits(&copy));
+                    assert_eq!(bincode::serialize(&opt).unwrap(), before);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+fn l3_forged_optimizer(kind: &str) -> LBFGS {
+    let (net, opt) = l3_warmed_fixture(1, "H1");
+    l3_literal_state(&net, &opt, "H1"); // Prove the ordered tuple before forging.
+    let mut s = vec![0.0; 14];
+    let mut y = s.clone();
+    let rho = match kind {
+        "fallback" => {
+            s[0] = 1.0;
+            y[0] = 2.0f32.powi(-20);
+            2.0f64.powi(20)
+        }
+        "nan" => {
+            s[0] = f32::from_bits(0x7fc00011);
+            y[0] = 1.0;
+            1.0
+        }
+        "length" => {
+            s.resize(13, 0.0);
+            s[0] = 1.0;
+            y[0] = 1.0;
+            1.0
+        }
+        "cardinality" => {
+            s[0] = 1.0;
+            y[0] = 1.0;
+            1.0
+        }
+        "rho" => {
+            s[0] = 1.0;
+            y[0] = 1.0;
+            -1.0
+        }
+        _ => unreachable!(),
+    };
+    let tuple: L3State = (
+        opt.config,
+        vec![s],
+        if kind == "cardinality" {
+            vec![]
+        } else {
+            vec![y]
+        },
+        vec![rho],
+        None,
+        None,
+        0,
+        0,
+    );
+    bincode::deserialize(&bincode::serialize(&tuple).unwrap()).unwrap()
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn lbfgs_serde_gamma_fallback_and_unchecked_nan_direction_keep_original_entry_errors() {
+    let (mut net, _) = l3_warmed_fixture(1, "H0");
+    let model = l3_bits(&LBFGS::flatten_params(&net));
+    let opt = l3_forged_optimizer("fallback");
+    let before = bincode::serialize(&opt).unwrap();
+    let probe = vec![2.0; 14];
+    let direction = opt.two_loop_recursion(&probe);
+    assert_eq!(direction[0].to_bits(), (-2.0f32.powi(21)).to_bits());
+    assert!(direction[1..]
+        .iter()
+        .all(|v| v.to_bits() == (-2.0f32).to_bits()));
+    assert_eq!(bincode::serialize(&opt).unwrap(), before);
+    for kind in ["nan", "length", "cardinality", "rho"] {
+        let mut opt = l3_forged_optimizer(kind);
+        let before = bincode::serialize(&opt).unwrap();
+        if kind == "nan" {
+            let mut g = l3_mixed(14);
+            g[0] = f32::from_bits(0x7fc00022);
+            let direction = opt.two_loop_recursion(&g);
+            assert_eq!(direction.len(), 14);
+            assert!(direction.iter().all(|v| v.is_nan()));
+            assert_eq!(bincode::serialize(&opt).unwrap(), before);
+        }
+        let mut calls = 0;
+        let error = opt
+            .step_lbfgs(&mut net, |_| {
+                calls += 1;
+                unreachable!("entry rejected before callback")
+            })
+            .unwrap_err();
+        match (kind, error) {
+            ("nan", ArkanError::Optimizer(message)) => {
+                assert_eq!(message, "LBFGS history must be finite")
+            }
+            ("rho", ArkanError::Optimizer(message)) => {
+                assert_eq!(message, "LBFGS curvature state must be finite and positive")
+            }
+            (
+                "length",
+                ArkanError::TensorShapeMismatch {
+                    param_shape,
+                    grad_shape,
+                },
+            ) => {
+                assert_eq!(param_shape, vec![14]);
+                assert_eq!(grad_shape, vec![13]);
+            }
+            (
+                "cardinality",
+                ArkanError::TensorShapeMismatch {
+                    param_shape,
+                    grad_shape,
+                },
+            ) => {
+                assert_eq!(param_shape, vec![1]);
+                assert_eq!(grad_shape, vec![0]);
+            }
+            (_, error) => panic!("wrong entry error: {error:?}"),
+        }
+        assert_eq!(calls, 0);
+        assert_eq!(opt.num_evals(), 0);
+        assert_eq!(bincode::serialize(&opt).unwrap(), before);
+        assert_eq!(l3_bits(&LBFGS::flatten_params(&net)), model);
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn lbfgs_entry_config_and_topology_errors_precede_forged_history_without_state_changes() {
+    for clear_topology in [false, true] {
+        let (mut net, opt) = l3_warmed_fixture(1, "H1");
+        let mut tuple = l3_literal_state(&net, &opt, "H1");
+        tuple.0.history_size = 0;
+        tuple.1[0].resize(13, 0.0);
+        let mut opt: LBFGS = bincode::deserialize(&bincode::serialize(&tuple).unwrap()).unwrap();
+        if clear_topology {
+            net.layers.clear();
+        }
+        let before = bincode::serialize(&opt).unwrap();
+        let model = l3_bits(&LBFGS::flatten_params(&net));
+        let mut calls = 0;
+        let error = opt
+            .step_lbfgs(&mut net, |_| {
+                calls += 1;
+                unreachable!("entry rejected before callback")
+            })
+            .unwrap_err();
+        match error {
+            ArkanError::Cpu(message) if clear_topology => {
+                assert_eq!(message, "Network topology no longer matches its layout")
+            }
+            ArkanError::Optimizer(message) if !clear_topology => assert_eq!(
+                message,
+                "LBFGS requires positive lr, max_iter and history_size, and max_eval >= 2"
+            ),
+            error => panic!("wrong precedence: {error:?}"),
+        }
+        assert_eq!(calls, 0);
+        assert_eq!(opt.num_evals(), 2);
+        assert_eq!(bincode::serialize(&opt).unwrap(), before);
+        assert_eq!(l3_bits(&LBFGS::flatten_params(&net)), model);
     }
 }

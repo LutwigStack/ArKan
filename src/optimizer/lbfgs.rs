@@ -270,7 +270,12 @@ impl LBFGS {
         let gamma = if yy > 1e-10 { sy / yy } else { 1.0 };
 
         // r = γ * q
-        let mut r: Vec<f64> = q.iter().map(|&q| gamma * q).collect();
+        let mut r = q;
+        // Preserve gamma as the left operand, including NaN propagation order.
+        #[allow(clippy::assign_op_pattern)]
+        for entry in &mut r {
+            *entry = gamma * *entry;
+        }
 
         // Second loop (forward)
         // Note: We need to access alpha[i] and history[i] in tandem, clippy allow is correct here
