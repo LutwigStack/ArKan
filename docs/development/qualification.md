@@ -35,6 +35,8 @@ is PASS only when pre/post immutable input and manifest checks also pass.
 Duplicate JSON keys and nonfinite deadlines refuse launch. Output is written
 directly to disk, preserving partial output without unbounded capture in memory.
 The utility returns zero only for PASS. It never retries or overwrites its output.
+Passing evidence requires both a complete PASS receipt and normal wrapper exit
+zero; a receipt by itself never certifies success.
 An existing evidence directory is a consumed attempt; choosing another directory
 does not authorize a repeat of an application experiment.
 
@@ -49,6 +51,15 @@ disappearance within a shared six-second cleanup budget. A successful direct
 child that leaves its group present produces ERROR. Failure to confirm reaping
 or group disappearance also produces ERROR, preserving the observed cleanup
 fields rather than implying that cleanup completed.
+
+Deferred INT/TERM handling remains active through retained-output hashing.
+Finalization restores both original handlers in a finally, including on hashing
+failure, then accounts for pending interruption before publishing the receipt.
+This restoration is the signal handoff: subsequent signals use the caller's
+original behavior. With the normal CLI dispositions, SIGTERM during receipt
+publication terminates nonzero and can leave an incomplete receipt; it does not
+become handled success. Hashing/write failures also remain nonpassing. Require
+the receipt and wrapper exit together even if a receipt was already written.
 
 The utility cannot waitpid orphan descendants. A terminated orphan zombie may
 keep its process group present until its adoptive parent reaps it; this prevents
@@ -73,3 +84,6 @@ returns and after handle registration. Those fixtures temporarily become their
 own orphan subreaper, reap their own children on RED and GREEN, then restore that
 per-process setting. The production utility does not adopt orphan descendants.
 The focused suite does not execute ArKan or prove Rust/application correctness.
+Three finalization fixtures additionally cover real SIGTERM during successful
+stdout hashing and receipt publication, and restoration of both original handlers
+when stdout hashing raises an error.

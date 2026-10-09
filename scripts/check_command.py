@@ -148,16 +148,19 @@ def run(manifest, output):
     except (ValueError, OSError, KeyError, TypeError) as error:
         receipt.update(status="REFUSED" if process is None else "ERROR", error=str(error))
     finally:
+        try:
+            receipt.update(elapsed_seconds=time.monotonic()-started, ended_wall_ns=time.time_ns())
+            receipt["evidence"] = [dict(path=p.name, bytes=p.stat().st_size, sha256=digest(p))
+                                   for p in sorted(output.iterdir()) if p.is_file()]
+        finally:
+            # End deferred handling before deciding or publishing the terminal status.
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
         if pending_signal is not None and receipt["status"] == "PASS":
             receipt.update(status="INTERRUPTED", interruption_signal=pending_signal)
-        receipt.update(elapsed_seconds=time.monotonic()-started, ended_wall_ns=time.time_ns())
-        receipt["evidence"] = [dict(path=p.name, bytes=p.stat().st_size, sha256=digest(p))
-                               for p in sorted(output.iterdir()) if p.is_file()]
         with (output / "receipt.json").open("x") as stream:
             json.dump(receipt, stream, sort_keys=True, indent=2, allow_nan=False)
             stream.write("\n")
-        for signum, handler in previous.items():
-            signal.signal(signum, handler)
     return 0 if receipt["status"] == "PASS" else 1
 
 

@@ -153,6 +153,108 @@ class CancellationTests(unittest.TestCase):
     def test_handled_signal_after_handle_registration_reaches_cleanup(self):
         self.run_fixture("registered")
 
+    def run_finalization_fixture(self, mode):
+        manifest = self.write_manifest(
+            "import os; from pathlib import Path; "
+            "Path('leader.pid').write_text(str(os.getpid())); print('completed child', flush=True)", 2)
+        # Real child/hash/publication boundaries; only inject the external signal/error.
+        injection = f"""
+import importlib.util, json, os, signal
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('utility', {str(SCRIPT)!r})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+original_handlers = {{s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}}
+def restored():
+    return {{str(s): signal.getsignal(s) == h for s, h in original_handlers.items()}}
+real_cleanup = m.cleanup_group
+def cleanup(process):
+    result = real_cleanup(process)
+    Path('cleanup-observation.json').write_text(json.dumps(result))
+    return result
+m.cleanup_group = cleanup
+def boundary(phase):
+    Path('boundary.json').write_text(json.dumps(dict(phase=phase, restored_handlers=restored())))
+if {mode!r} == 'publication':
+    real_dump = m.json.dump
+    def publish(*args, **kwargs):
+        boundary('receipt-publication')
+        os.kill(os.getpid(), signal.SIGTERM)
+        return real_dump(*args, **kwargs)
+    m.json.dump = publish
+else:
+    real_digest = m.digest
+    def digest(path):
+        if Path(path).name == 'stdout.log':
+            boundary('post-cleanup-stdout-hash')
+            if {mode!r} == 'hash-error':
+                raise OSError('final stdout hash failure')
+            os.kill(os.getpid(), signal.SIGTERM)
+        return real_digest(path)
+    m.digest = digest
+try:
+    result = m.run({str(manifest)!r}, {str(self.root / 'evidence')!r})
+except OSError as error:
+    Path('error.json').write_text(json.dumps(dict(error=str(error), restored_handlers=restored())))
+    raise SystemExit(1)
+raise SystemExit(result)
+"""
+        command = [sys.executable, "-c", injection]
+        with (self.root / "wrapper.stdout").open("wb") as stdout, (self.root / "wrapper.stderr").open("wb") as stderr:
+            self.wrapper = subprocess.Popen(command, cwd=self.root, stdout=stdout, stderr=stderr)
+            deadline = time.monotonic()+9
+            while self.wrapper.poll() is None and time.monotonic() < deadline:
+                path = self.root / "leader.pid"
+                if path.exists():
+                    self.children.add(int(path.read_text()))
+                self.adopt_and_reap()
+                time.sleep(.01)
+        receipt_path = self.root / "evidence" / "receipt.json"
+        try:
+            receipt = json.loads(receipt_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            receipt = None
+        if EVIDENCE_ROOT is not None:
+            saved = EVIDENCE_ROOT / self._testMethodName
+            saved.mkdir(parents=True, exist_ok=False)
+            if (self.root / "evidence").exists():
+                shutil.copytree(self.root / "evidence", saved / "utility-evidence")
+            for name in ("boundary.json", "error.json", "cleanup-observation.json", "wrapper.stdout", "wrapper.stderr"):
+                if (self.root / name).exists():
+                    shutil.copyfile(self.root / name, saved / name)
+            (saved / "observation.json").write_text(json.dumps(dict(
+                argv=command, mode=mode, wrapper_exit=self.wrapper.returncode,
+                complete_receipt=receipt is not None, receipt_status=receipt.get("status") if receipt else None)))
+        self.assertIsNotNone(self.wrapper.poll(), "finalization fixture exceeded deadline")
+        self.assertNotEqual(self.wrapper.returncode, 0, "interrupted/error finalization reported process success")
+        cleanup = json.loads((self.root / "cleanup-observation.json").read_text())
+        self.assertTrue(cleanup["direct_child_reaped"])
+        self.assertFalse(cleanup["group_present_after_cleanup"])
+        self.assertIn("completed child", (self.root / "evidence" / "stdout.log").read_text())
+        if mode == "hash-signal":
+            self.assertIsNotNone(receipt)
+            self.assertEqual(receipt["status"], "INTERRUPTED")
+            self.assertEqual(receipt["interruption_signal"], signal.SIGTERM)
+        elif mode == "publication":
+            self.assertEqual(self.wrapper.returncode, -signal.SIGTERM)
+            self.assertIsNone(receipt, "post-handoff termination must leave incomplete evidence")
+            boundary = json.loads((self.root / "boundary.json").read_text())
+            self.assertTrue(all(boundary["restored_handlers"].values()))
+        else:
+            error = json.loads((self.root / "error.json").read_text())
+            self.assertEqual(error["error"], "final stdout hash failure")
+            self.assertTrue(all(error["restored_handlers"].values()), "hash failure leaked deferred handlers")
+            self.assertIsNone(receipt)
+
+    def test_sigterm_during_final_stdout_hash_is_interrupted(self):
+        self.run_finalization_fixture("hash-signal")
+
+    def test_sigterm_at_receipt_publication_uses_original_handlers(self):
+        self.run_finalization_fixture("publication")
+
+    def test_final_stdout_hash_error_restores_both_handlers(self):
+        self.run_finalization_fixture("hash-error")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
