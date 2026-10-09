@@ -62,6 +62,47 @@ fn stationary_step_uses_at_most_two_parameter_buffers() {
     let ((), requests, bytes) = measure(|| {});
     assert_eq!((requests, bytes), (0, 0), "empty measurement window");
 
+    // LOSS-R1: one whole public gradient call, including an incomplete group tail.
+    let coefficients = [
+        1050253722u32,
+        3211159142,
+        1053609165,
+        2147483648,
+        0,
+        3207803699,
+        1045220557,
+    ]
+    .map(f32::from_bits);
+    let before_coefficients = coefficients.map(f32::to_bits);
+    let config = arkan::loss::KanLossConfig::default();
+    let before_weights = [
+        config.lambda_l1.to_bits(),
+        config.lambda_smooth.to_bits(),
+        config.lambda_entropy.to_bits(),
+    ];
+    let (gradient, requests, bytes) = measure(|| {
+        std::hint::black_box(arkan::loss::kan_regularization_gradient(
+            std::hint::black_box(&coefficients),
+            std::hint::black_box(3),
+            std::hint::black_box(&config),
+        ))
+    });
+    println!("LOSS-R1 n=7 basis=3 requests={requests} bytes={bytes}");
+    assert_eq!(requests, 3, "LOSS-R1 removes the final result allocation");
+    assert_eq!(bytes, 84, "LOSS-R1 whole-call requested bytes");
+    assert_eq!((gradient.len(), gradient.capacity()), (7, 7));
+    assert!(gradient.iter().all(|value| value.is_finite()));
+    assert_eq!(coefficients.map(f32::to_bits), before_coefficients);
+    assert_eq!(
+        [
+            config.lambda_l1.to_bits(),
+            config.lambda_smooth.to_bits(),
+            config.lambda_entropy.to_bits(),
+        ],
+        before_weights
+    );
+    drop(gradient);
+
     for width in [1, 8] {
         let mut network = KanNetwork::new(KanConfig {
             input_dim: width,

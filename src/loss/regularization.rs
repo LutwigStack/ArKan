@@ -436,18 +436,31 @@ pub fn kan_regularization_gradient(
     basis_size: usize,
     config: &KanLossConfig,
 ) -> Vec<f32> {
-    let l1_grad = l1_sparsity_gradient(coefficients);
+    let mut l1_grad = l1_sparsity_gradient(coefficients);
     let smooth_grad = smoothness_gradient(coefficients, basis_size);
     let entropy_grad = entropy_regularization_gradient(coefficients, basis_size);
 
-    l1_grad
-        .iter()
-        .zip(smooth_grad.iter())
-        .zip(entropy_grad.iter())
-        .map(|((&l1, &sm), &entropy)| {
-            config.lambda_l1 * l1 + config.lambda_smooth * sm + config.lambda_entropy * entropy
-        })
-        .collect()
+    let combine = |l1: f32, sm: f32, entropy: f32| {
+        config.lambda_l1 * l1 + config.lambda_smooth * sm + config.lambda_entropy * entropy
+    };
+    if l1_grad.capacity() == l1_grad.len() {
+        for ((l1, &sm), &entropy) in l1_grad
+            .iter_mut()
+            .zip(smooth_grad.iter())
+            .zip(entropy_grad.iter())
+        {
+            let previous_l1 = *l1;
+            *l1 = combine(previous_l1, sm, entropy);
+        }
+        l1_grad
+    } else {
+        l1_grad
+            .iter()
+            .zip(smooth_grad.iter())
+            .zip(entropy_grad.iter())
+            .map(|((&l1, &sm), &entropy)| combine(l1, sm, entropy))
+            .collect()
+    }
 }
 
 // =============================================================================

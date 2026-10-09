@@ -255,3 +255,158 @@ fn rmse_avoids_squaring_underflow_and_overflow_for_finite_residuals() {
         assert!((gradient[0] - 1.0).abs() < 1e-6);
     }
 }
+
+// Fixed public-gradient controls; no duplicate gradient implementation.
+struct LossR1Case {
+    id: &'static str,
+    coefficients: &'static [u32],
+    basis: usize,
+    // Public field order here is L1, smoothness, entropy.
+    weights: [u32; 3],
+}
+
+fn loss_r1_cases() -> [LossR1Case; 9] {
+    const MIXED: &[u32] = &[
+        0x3e99999a, 0xbf666666, 0x3ecccccd, 0x80000000, 0x00000000, 0xbf333333, 0x3e4ccccd,
+    ];
+    const ORDINARY: [u32; 3] = [0x3e99999a, 0x3e4ccccd, 0x3f333333];
+    [
+        LossR1Case {
+            id: "normal-tail-group3",
+            coefficients: MIXED,
+            basis: 3,
+            // KanLossConfig::default(): .001, .001, .0001.
+            weights: [0x3a83126f, 0x3a83126f, 0x38d1b717],
+        },
+        LossR1Case {
+            id: "analytical-group0",
+            coefficients: &[0xbf000000, 0, 0x3f000000],
+            basis: 0,
+            weights: [0x3f400000, 0x3e800000, 0x3e000000],
+        },
+        LossR1Case {
+            id: "mixed-group1",
+            coefficients: MIXED,
+            basis: 1,
+            weights: ORDINARY,
+        },
+        LossR1Case {
+            id: "mixed-group2",
+            coefficients: MIXED,
+            basis: 2,
+            weights: ORDINARY,
+        },
+        LossR1Case {
+            id: "mixed-oversized-group9",
+            coefficients: MIXED,
+            basis: 9,
+            weights: ORDINARY,
+        },
+        LossR1Case {
+            id: "empty-group0",
+            coefficients: &[],
+            basis: 0,
+            weights: ORDINARY,
+        },
+        LossR1Case {
+            id: "signed-zero-nonfinite-weight",
+            coefficients: &[0x80000000, 0, 0x80000000],
+            basis: 3,
+            weights: [0x7f800000, 0x80000000, 0xc0000000],
+        },
+        LossR1Case {
+            id: "nonfinite-coeff-zero-lambda",
+            coefficients: &[0x7fc01234, 0x7f800000, 0xff800000, 0x80000000, 0x3e800000],
+            basis: 3,
+            weights: [0xbe800000, 0, 0],
+        },
+        LossR1Case {
+            id: "nonfinite-config",
+            coefficients: MIXED,
+            basis: 3,
+            weights: [0x7fc05678, 0x7f800000, 0xff800000],
+        },
+    ]
+}
+
+fn loss_r1_config(case: &LossR1Case) -> KanLossConfig {
+    KanLossConfig {
+        lambda_l1: f32::from_bits(case.weights[0]),
+        lambda_smooth: f32::from_bits(case.weights[1]),
+        lambda_entropy: f32::from_bits(case.weights[2]),
+    }
+}
+
+fn loss_r1_check_public_contract(
+    case: &LossR1Case,
+    coefficients: &[f32],
+    config: &KanLossConfig,
+    gradient: &[f32],
+) {
+    assert_eq!(
+        gradient.len(),
+        case.coefficients.len(),
+        "{}: full length",
+        case.id
+    );
+    for (&value, &bits) in coefficients.iter().zip(case.coefficients) {
+        assert_eq!(value.to_bits(), bits, "{}: immutable coefficient", case.id);
+    }
+    assert_eq!(
+        [
+            config.lambda_l1.to_bits(),
+            config.lambda_smooth.to_bits(),
+            config.lambda_entropy.to_bits()
+        ],
+        case.weights,
+        "{}: immutable weights",
+        case.id,
+    );
+    if case.id == "analytical-group0" {
+        // n=3, signs -1/0/+1, L1 weight 3/4; both group-zero objectives vanish.
+        // These literals are independently -1/4, +0, +1/4, not a copied combiner.
+        for (&value, bits) in gradient.iter().zip([0xbe800000, 0, 0x3e800000]) {
+            assert_eq!(value.to_bits(), bits);
+        }
+    } else if case.id == "signed-zero-nonfinite-weight" || case.id == "nonfinite-config" {
+        assert!(
+            gradient.iter().all(|x| x.is_nan()),
+            "{}: nonfinite products",
+            case.id
+        );
+    } else if case.id == "nonfinite-coeff-zero-lambda" {
+        // A zero coefficient weight must still multiply the nonfinite helper term.
+        assert!(
+            gradient[..3].iter().all(|x| x.is_nan()),
+            "zero * NaN must propagate"
+        );
+    } else {
+        assert!(
+            gradient.iter().all(|x| x.is_finite()),
+            "{}: finite control",
+            case.id
+        );
+    }
+}
+
+#[test]
+fn combined_regularization_gradient_preserves_public_boundary_contract() {
+    for case in loss_r1_cases() {
+        let coefficients: Vec<f32> = case
+            .coefficients
+            .iter()
+            .copied()
+            .map(f32::from_bits)
+            .collect();
+        let config = loss_r1_config(&case);
+        let gradient = kan_regularization_gradient(&coefficients, case.basis, &config);
+        loss_r1_check_public_contract(&case, &coefficients, &config, &gradient);
+        // Exact capacity is additionally bound by the qualified compiler/stdlib source proof.
+        assert_eq!(
+            gradient.capacity(),
+            gradient.len(),
+            "{}: returned capacity",
+            case.id
+        );
+    }
+}
