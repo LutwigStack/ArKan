@@ -1,4 +1,4 @@
-//! Optimizer benchmarks - Adam vs SGD overhead.
+//! Optimizer benchmarks - Adam, SGD and warmed L-BFGS steps.
 //!
 //! Tests:
 //! - Raw SGD (inline in train_step) vs raw train_step with options
@@ -6,11 +6,12 @@
 //! - Memory overhead of optimizer state
 //!
 //! Note: Full Adam/SGD optimizer step benchmarks require manual gradient
-//! extraction which adds overhead. These benchmarks focus on the train_step
-//! variants available in the API.
+//! extraction which adds overhead. The Adam/SGD cases focus on the train_step
+//! variants available in the API. L-BFGS cases include their objective callback.
 
 use arkan::network::TrainOptions;
-use arkan::{Adam, AdamConfig, KanConfig, KanNetwork, SGDConfig, SGD};
+use arkan::optimizer::{LineSearchMethod, SafetyConfig};
+use arkan::{Adam, AdamConfig, KanConfig, KanNetwork, LBFGSConfig, SGDConfig, LBFGS, SGD};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -211,11 +212,129 @@ fn bench_learning_rates(c: &mut Criterion) {
     group.finish();
 }
 
+/// Quadratic callback including the gradient allocation required by step_lbfgs.
+fn lbfgs_objective(network: &KanNetwork, stationary: bool) -> arkan::ArkanResult<(f64, Vec<f32>)> {
+    let mut gradient = vec![0.0; network.param_count()];
+    if stationary {
+        return Ok((7.0, gradient));
+    }
+    let x = network.layers[0].weights[0];
+    gradient[0] = 2.0 * x;
+    Ok((f64::from(x).powi(2), gradient))
+}
+
+/// Reconstruct and warm once: cloning an H1 optimizer would change history capacity.
+fn warmed_lbfgs(width: usize, iterations: usize) -> (KanNetwork, LBFGS) {
+    let mut network = KanNetwork::new(KanConfig {
+        input_dim: width,
+        output_dim: width,
+        hidden_dims: vec![width],
+        grid_size: 3,
+        spline_order: 3,
+        input_mean: vec![0.0; width],
+        input_std: vec![1.0; width],
+        init_seed: Some(42),
+        ..KanConfig::default()
+    });
+    for layer in &mut network.layers {
+        layer.weights.fill(0.0);
+        layer.bias.fill(0.0);
+    }
+    network.layers[0].weights[0] = 1.0;
+    assert_eq!(network.param_count(), 12 * width * width + 2 * width);
+    let mut optimizer = LBFGS::new(
+        &network,
+        LBFGSConfig {
+            lr: 0.25,
+            max_iter: 1,
+            max_eval: Some(2),
+            tolerance_grad: 0.0,
+            tolerance_change: 0.0,
+            history_size: 3,
+            line_search_fn: LineSearchMethod::NoLineSearch,
+            safety: SafetyConfig::strict(),
+        },
+    );
+    let loss = optimizer
+        .step_lbfgs(&mut network, |net| lbfgs_objective(net, false))
+        .expect("L-BFGS warm step failed");
+    assert_eq!(loss.to_bits(), 0.25_f64.to_bits());
+    assert_eq!(network.layers[0].weights[0].to_bits(), 0.5_f32.to_bits());
+    assert_eq!(optimizer.num_evals(), 2);
+    optimizer.config.max_iter = iterations;
+    optimizer.config.max_eval = Some(iterations + 1);
+    (network, optimizer)
+}
+
+/// Analytical checks run before Criterion's measured routine, not inside it.
+fn verify_lbfgs_case(width: usize, iterations: usize, stationary: bool) {
+    let (mut network, mut optimizer) = warmed_lbfgs(width, iterations);
+    let mut calls = 0;
+    let loss = optimizer
+        .step_lbfgs(&mut network, |net| {
+            calls += 1;
+            lbfgs_objective(net, stationary)
+        })
+        .expect("L-BFGS verification failed");
+    let expected_x: f32 = if stationary {
+        0.5
+    } else if iterations == 1 {
+        0.375
+    } else {
+        81.0_f32 / 512.0
+    };
+    let expected_loss = if stationary {
+        7.0
+    } else {
+        f64::from(expected_x).powi(2)
+    };
+    assert_eq!(loss.to_bits(), expected_loss.to_bits());
+    assert_eq!(network.layers[0].weights[0].to_bits(), expected_x.to_bits());
+    assert_eq!(calls, if stationary { 1 } else { iterations + 1 });
+    assert_eq!(optimizer.num_evals(), 2 + calls);
+    assert!(network
+        .layers
+        .iter()
+        .flat_map(|layer| layer.weights.iter().chain(&layer.bias))
+        .skip(1)
+        .all(|value| value.to_bits() == 0.0_f32.to_bits()));
+}
+
+/// One warmed H1 step, including the ordinary allocating objective callback.
+fn bench_lbfgs_step(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lbfgs_step_with_callback");
+    let cases = [
+        ("p14_h1_fixed_k1", 1, 1, false),
+        ("p784_h1_fixed_k4", 8, 4, false),
+        ("p784_h1_stationary", 8, 1, true),
+    ];
+    for (name, width, iterations, stationary) in cases {
+        verify_lbfgs_case(width, iterations, stationary);
+        group.bench_function(name, |b| {
+            b.iter_batched_ref(
+                || warmed_lbfgs(width, iterations),
+                |(network, optimizer)| {
+                    let loss = optimizer
+                        .step_lbfgs(network, |net| lbfgs_objective(net, stationary))
+                        .expect("L-BFGS measured step failed");
+                    black_box(loss);
+                    black_box(&*network);
+                    black_box(&*optimizer);
+                },
+                // Bound warmed tuples independently of Criterion's calibrated iteration count.
+                criterion::BatchSize::NumIterations(16),
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_raw_train_step,
     bench_train_step_clipping,
     bench_optimizer_init,
     bench_learning_rates,
+    bench_lbfgs_step,
 );
 criterion_main!(benches);
