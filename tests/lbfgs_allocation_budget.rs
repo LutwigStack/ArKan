@@ -150,6 +150,35 @@ fn stationary_step_uses_at_most_two_parameter_buffers() {
             drop(output); // Unarmed; do not retain outputs across repetitions.
         }
     }
+
+    // L2: count one accepted full step in this same sole allocator test.
+    let (mut network, mut optimizer) = l3_allocation_fixture(1, "H1");
+    let mut gradients = [Some(vec![0.0; 14]), Some(vec![0.0; 14])];
+    for gradient in &gradients {
+        let gradient = gradient.as_ref().unwrap();
+        assert_eq!(gradient.capacity(), gradient.len());
+    }
+    let mut points = [0u32; 2];
+    let mut calls = 0;
+    let (result, requests, bytes) = measure(|| {
+        optimizer.step_lbfgs(&mut network, |net| {
+            let x = net.layers[0].weights[0];
+            points[calls] = x.to_bits();
+            let mut gradient = gradients[calls].take().unwrap();
+            calls += 1;
+            gradient[0] = 2.0 * x;
+            Ok((f64::from(x).powi(2), gradient))
+        })
+    });
+    assert_eq!(points, [0.5f32, 0.375].map(f32::to_bits));
+    assert_eq!(calls, 2);
+    assert_eq!(result.unwrap().to_bits(), 0.140625f64.to_bits());
+    assert_eq!(optimizer.num_evals(), 4);
+    let parameters = LBFGS::flatten_params(&network);
+    assert_eq!(parameters[0].to_bits(), 0.375f32.to_bits());
+    assert!(parameters[1..].iter().all(|v| v.to_bits() == 0));
+    assert_eq!(requests, 15, "L2 accepted full-step request budget");
+    assert_eq!(bytes, 736, "L2 accepted full-step byte budget");
 }
 
 fn l3_allocation_fixture(width: usize, history: &str) -> (KanNetwork, LBFGS) {

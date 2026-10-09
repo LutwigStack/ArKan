@@ -715,6 +715,7 @@ impl LBFGS {
                 }
             };
             let mut params = original_params.clone();
+            let mut accepted_any = false;
             for _ in 0..self.config.max_iter {
                 if Self::grad_norm(&gradient) <= self.config.tolerance_grad {
                     break;
@@ -785,8 +786,11 @@ impl LBFGS {
                 let parameter_change = s.iter().map(|&v| (v as f64).abs()).fold(0.0, f64::max);
                 let loss_change = (new_loss - loss).abs();
                 self.update_history(s, y);
-                self.prev_params = Some(accepted.clone());
-                self.prev_grads = Some(new_gradient.clone());
+                if !accepted_any {
+                    drop(self.prev_params.take());
+                    drop(self.prev_grads.take());
+                }
+                accepted_any = true;
                 params = accepted;
                 gradient = new_gradient;
                 loss = new_loss;
@@ -795,6 +799,18 @@ impl LBFGS {
                 {
                     break;
                 }
+            }
+            if accepted_any {
+                self.prev_params = Some(if params.capacity() == params.len() {
+                    params
+                } else {
+                    params.clone()
+                });
+                self.prev_grads = Some(if gradient.capacity() == gradient.len() {
+                    gradient
+                } else {
+                    gradient.clone()
+                });
             }
             Ok(loss)
         })();

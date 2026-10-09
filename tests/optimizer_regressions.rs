@@ -1141,3 +1141,94 @@ fn lbfgs_wolfe_zoom_returns_the_current_callback_point() {
         assert_eq!(opt.num_evals(), 6);
     }
 }
+
+#[test]
+fn lbfgs_accepted_point_commits_previous_state_when_curvature_is_rejected() {
+    let (mut net, mut opt) = l3_warmed_fixture(1, "H0");
+    let mut points = Vec::new();
+    let loss = opt
+        .step_lbfgs(&mut net, |model| {
+            let x = model.layers[0].weights[0];
+            points.push(x.to_bits());
+            let mut gradient = vec![0.0; 14];
+            gradient[0] = 2.0;
+            Ok((2.0 * f64::from(x), gradient))
+        })
+        .unwrap();
+    assert_eq!(points, [1.0f32, 0.5].map(f32::to_bits));
+    assert_eq!(loss.to_bits(), 1.0f64.to_bits());
+    assert_eq!(opt.num_evals(), 2);
+    let parameters = LBFGS::flatten_params(&net);
+    assert_eq!(parameters[0].to_bits(), 0.5f32.to_bits());
+    assert!(parameters[1..].iter().all(|v| v.to_bits() == 0));
+    assert_eq!(
+        l3_bits(&opt.two_loop_recursion(&[1.0; 14])),
+        vec![(-1.0f32).to_bits(); 14]
+    );
+    #[cfg(feature = "serde")]
+    {
+        let mut gradient = vec![0.0; 14];
+        gradient[0] = 2.0;
+        let expected: L3State = (
+            opt.config,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(parameters),
+            Some(gradient),
+            0,
+            2,
+        );
+        assert_eq!(
+            bincode::serialize(&opt).unwrap(),
+            bincode::serialize(&expected).unwrap()
+        );
+    }
+}
+
+#[test]
+fn lbfgs_shape_error_and_numerical_skip_after_acceptance_restore_warmed_state() {
+    for malformed in [true, false] {
+        let (mut net, mut opt) = l3_warmed_fixture(1, "H1");
+        opt.config.max_iter = 2;
+        opt.config.max_eval = Some(3);
+        opt.config.safety.skip_step_on_nan = !malformed;
+        let model = l3_bits(&LBFGS::flatten_params(&net));
+        let direction = l3_bits(&opt.two_loop_recursion(&[2.0; 14]));
+        let evaluations = opt.num_evals();
+        #[cfg(feature = "serde")]
+        let before = bincode::serialize(&opt).unwrap();
+        let mut points = Vec::new();
+        let result = opt.step_lbfgs(&mut net, |network| {
+            let x = network.layers[0].weights[0];
+            points.push(x.to_bits());
+            if malformed && points.len() == 3 {
+                return Ok((f64::from(x).powi(2), Vec::new()));
+            }
+            let mut gradient = vec![0.0; 14];
+            gradient[0] = if points.len() == 3 { f32::NAN } else { 2.0 * x };
+            Ok((f64::from(x).powi(2), gradient))
+        });
+        assert_eq!(points, [0.5f32, 0.375, 0.28125].map(f32::to_bits));
+        if malformed {
+            assert!(
+                matches!(result, Err(ArkanError::TensorShapeMismatch { param_shape, grad_shape })
+                if param_shape == [14] && grad_shape == [0])
+            );
+        } else {
+            assert_eq!(result.unwrap().to_bits(), 0.25f64.to_bits());
+        }
+        assert_eq!(opt.num_evals(), evaluations + 3);
+        assert_eq!(l3_bits(&LBFGS::flatten_params(&net)), model);
+        assert_eq!(l3_bits(&opt.two_loop_recursion(&[2.0; 14])), direction);
+        #[cfg(feature = "serde")]
+        {
+            let mut expected: L3State = bincode::deserialize(&before).unwrap();
+            expected.7 += 3;
+            assert_eq!(
+                bincode::serialize(&opt).unwrap(),
+                bincode::serialize(&expected).unwrap()
+            );
+        }
+    }
+}
