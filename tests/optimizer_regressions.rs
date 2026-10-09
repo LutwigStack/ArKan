@@ -1232,3 +1232,28 @@ fn lbfgs_shape_error_and_numerical_skip_after_acceptance_restore_warmed_state() 
         }
     }
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn lbfgs_stationary_step_saturates_evaluation_counter() {
+    let (mut net, mut opt) = l3_warmed_fixture(1, "H1");
+    let model = l3_bits(&LBFGS::flatten_params(&net));
+    let mut state: L3State = bincode::deserialize(&bincode::serialize(&opt).unwrap()).unwrap();
+    state.7 = usize::MAX;
+    opt = bincode::deserialize(&bincode::serialize(&state).unwrap()).unwrap();
+    let before = bincode::serialize(&opt).unwrap();
+    assert_eq!(opt.num_evals(), usize::MAX);
+    assert_eq!(before, bincode::serialize(&state).unwrap());
+    let mut calls = 0;
+    let loss = opt
+        .step_lbfgs(&mut net, |_| {
+            calls += 1;
+            Ok((7.0, vec![0.0; model.len()]))
+        })
+        .unwrap();
+    assert_eq!(loss.to_bits(), 7.0f64.to_bits());
+    assert_eq!(calls, 1);
+    assert_eq!(opt.num_evals(), usize::MAX);
+    assert_eq!(l3_bits(&LBFGS::flatten_params(&net)), model);
+    assert_eq!(bincode::serialize(&opt).unwrap(), before);
+}

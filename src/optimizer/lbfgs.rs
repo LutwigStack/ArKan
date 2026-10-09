@@ -672,7 +672,8 @@ impl LBFGS {
         }
 
         // Keep parameter and history commits in one transaction, including fixed steps.
-        let original_state = self.clone();
+        let original_n_eval = self.n_eval;
+        let mut original_state: Option<Self> = None;
         let budget = self.config.max_eval.unwrap_or(usize::MAX);
         let evaluations = std::cell::Cell::new(0usize);
         let mut numerical_failure = false;
@@ -785,6 +786,9 @@ impl LBFGS {
                     .collect();
                 let parameter_change = s.iter().map(|&v| (v as f64).abs()).fold(0.0, f64::max);
                 let loss_change = (new_loss - loss).abs();
+                if original_state.is_none() {
+                    original_state = Some(self.clone());
+                }
                 self.update_history(s, y);
                 if !accepted_any {
                     drop(self.prev_params.take());
@@ -814,13 +818,14 @@ impl LBFGS {
             }
             Ok(loss)
         })();
-        self.n_eval = original_state.n_eval.saturating_add(evaluations.get());
+        self.n_eval = original_n_eval.saturating_add(evaluations.get());
         match result {
             Ok(loss) => Ok(loss),
             Err(error) => {
                 Self::restore_params(network, &original_params);
                 let n_eval = self.n_eval;
-                *self = original_state;
+                // Even before acceptance, clone/replace releases spare history capacity on rollback.
+                *self = original_state.unwrap_or_else(|| self.clone());
                 self.n_eval = n_eval;
                 if numerical_failure && self.config.safety.skip_step_on_nan {
                     Ok(initial_loss.unwrap_or(f64::NAN))

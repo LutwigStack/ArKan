@@ -179,6 +179,35 @@ fn stationary_step_uses_at_most_two_parameter_buffers() {
     assert!(parameters[1..].iter().all(|v| v.to_bits() == 0));
     assert_eq!(requests, 15, "L2 accepted full-step request budget");
     assert_eq!(bytes, 736, "L2 accepted full-step byte budget");
+    // L4: a warmed stationary success must not clone rollback history.
+    for width in [1, 8] {
+        for _ in 0..3 {
+            let (mut network, mut optimizer) = l3_allocation_fixture(width, "H1");
+            let before = LBFGS::flatten_params(&network);
+            let n = before.len();
+            let evaluations = optimizer.num_evals();
+            let mut gradient = Some(vec![0.0; n]);
+            let mut calls = 0;
+            let (result, requests, bytes) = measure(|| {
+                optimizer.step_lbfgs(&mut network, |_| {
+                    calls += 1;
+                    Ok((7.0, gradient.take().unwrap()))
+                })
+            });
+            assert_eq!(result.unwrap().to_bits(), 7.0f64.to_bits());
+            assert_eq!(calls, 1);
+            assert_eq!(optimizer.num_evals(), evaluations + 1);
+            assert_eq!(
+                LBFGS::flatten_params(&network)
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                before.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            assert_eq!(requests, 2, "L4 warmed stationary request budget");
+            assert_eq!(bytes, 8 * n, "L4 warmed stationary byte budget");
+        }
+    }
 }
 
 fn l3_allocation_fixture(width: usize, history: &str) -> (KanNetwork, LBFGS) {
