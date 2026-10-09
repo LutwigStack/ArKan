@@ -1101,3 +1101,43 @@ fn lbfgs_entry_config_and_topology_errors_precede_forged_history_without_state_c
         assert_eq!(l3_bits(&LBFGS::flatten_params(&net)), model);
     }
 }
+
+#[test]
+fn lbfgs_wolfe_zoom_returns_the_current_callback_point() {
+    for policy in [
+        LineSearchMethod::StrongWolfe,
+        LineSearchMethod::Backtracking,
+    ] {
+        let (mut net, mut opt) = l3_warmed_fixture(1, "H1");
+        opt.config.line_search_fn = policy;
+        opt.config.lr = 4.0;
+        opt.config.max_iter = 1;
+        opt.config.max_eval = Some(4);
+        opt.config.tolerance_grad = 0.0;
+        opt.config.tolerance_change = 0.0;
+        let mut points = Vec::new();
+        let loss = opt
+            .step_lbfgs(&mut net, |net| {
+                let p = LBFGS::flatten_params(net);
+                let x = p[0];
+                points.push(p);
+                let mut g = vec![0.0; 14];
+                g[0] = 2.0 * x;
+                Ok((f64::from(x).powi(2), g))
+            })
+            .unwrap();
+        assert_eq!(
+            points.iter().map(|p| p[0].to_bits()).collect::<Vec<_>>(),
+            [0.5f32, -1.5, -0.5, 0.0].map(f32::to_bits)
+        );
+        assert!(points
+            .iter()
+            .all(|p| p[1..].iter().all(|v| v.to_bits() == 0)));
+        assert_eq!(
+            l3_bits(&LBFGS::flatten_params(&net)),
+            l3_bits(points.last().unwrap())
+        );
+        assert_eq!(loss.to_bits(), 0.0f64.to_bits());
+        assert_eq!(opt.num_evals(), 6);
+    }
+}

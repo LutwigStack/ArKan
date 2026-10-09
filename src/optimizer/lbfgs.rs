@@ -2,6 +2,9 @@
 
 use super::*;
 
+// Accepted trial parameters, gradient, and loss.
+type AcceptedTrial = (Vec<f32>, Vec<f32>, f64);
+
 // =============================================================================
 // L-BFGS OPTIMIZER (Second-Order)
 // =============================================================================
@@ -313,7 +316,7 @@ impl LBFGS {
     fn exhausted_line_search(
         numerical_rejection: bool,
         reason: &str,
-    ) -> ArkanResult<Option<(f64, Vec<f32>, f64)>> {
+    ) -> ArkanResult<Option<AcceptedTrial>> {
         if numerical_rejection {
             Ok(None)
         } else {
@@ -339,7 +342,7 @@ impl LBFGS {
         f0: f64,
         g0: &[f32],
         direction: &[f32],
-    ) -> ArkanResult<Option<(f64, Vec<f32>, f64)>>
+    ) -> ArkanResult<Option<AcceptedTrial>>
     where
         F: FnMut(&KanNetwork) -> ArkanResult<LBFGSEvaluation>,
     {
@@ -398,7 +401,7 @@ impl LBFGS {
                 // Check Strong Wolfe curvature condition
                 if dg_new.abs() <= -C2 * dg0 {
                     // Both conditions satisfied
-                    return Ok(Some((alpha, g_new, f_new)));
+                    return Ok(Some((x_new, g_new, f_new)));
                 }
 
                 if dg_new >= 0.0 {
@@ -439,7 +442,7 @@ impl LBFGS {
         f0: f64,
         g0: &[f32],
         direction: &[f32],
-    ) -> ArkanResult<Option<(f64, Vec<f32>, f64)>>
+    ) -> ArkanResult<Option<AcceptedTrial>>
     where
         F: FnMut(&KanNetwork) -> ArkanResult<LBFGSEvaluation>,
     {
@@ -476,7 +479,7 @@ impl LBFGS {
 
             // Check Armijo condition
             if f_new <= f0 + C1 * alpha * dg0 {
-                return Ok(Some((alpha, g_new, f_new)));
+                return Ok(Some((x_new, g_new, f_new)));
             }
 
             alpha *= RHO;
@@ -751,7 +754,7 @@ impl LBFGS {
                         Self::restore_params(network, &trial);
                         match evaluate(network)? {
                             LBFGSEvaluation::Finite(new_loss, new_gradient) => {
-                                Some((alpha, new_gradient, new_loss))
+                                Some((trial, new_gradient, new_loss))
                             }
                             LBFGSEvaluation::RejectedNonFinite => None,
                             LBFGSEvaluation::BudgetExhausted => {
@@ -762,19 +765,13 @@ impl LBFGS {
                         }
                     }
                 };
-                let Some((alpha, new_gradient, new_loss)) = accepted_point else {
+                let Some((accepted, new_gradient, new_loss)) = accepted_point else {
                     numerical_failure = true;
                     return Err(ArkanError::nan_encountered(
                         0,
                         "LBFGS numerical trials exhausted",
                     ));
                 };
-                let accepted: Vec<f32> = params
-                    .iter()
-                    .zip(&direction)
-                    .map(|(&x, &d)| (x as f64 + alpha * d as f64) as f32)
-                    .collect();
-                Self::restore_params(network, &accepted);
                 let s: Vec<f32> = accepted
                     .iter()
                     .zip(&params)
