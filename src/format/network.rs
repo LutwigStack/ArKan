@@ -81,20 +81,15 @@ impl KanNetwork {
     /// ```
     #[cfg(feature = "serde")]
     pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
-        use std::io::Write;
-
-        let mut bytes = Vec::new();
-        // Magic bytes
-        bytes
-            .write_all(SERIALIZATION_MAGIC)
-            .map_err(|e| bincode::Error::from(bincode::ErrorKind::Io(e)))?;
-        // Version
-        bytes
-            .write_all(&SERIALIZATION_VERSION.to_le_bytes())
-            .map_err(|e| bincode::Error::from(bincode::ErrorKind::Io(e)))?;
-        // Network data
-        let network_bytes = bincode::serialize(self)?;
-        bytes.extend(network_bytes);
+        let body_len = usize::try_from(bincode::serialized_size(self)?)
+            .map_err(|_| bincode::Error::from(bincode::ErrorKind::SizeLimit))?;
+        let total_len = (SERIALIZATION_MAGIC.len() + 4)
+            .checked_add(body_len)
+            .ok_or_else(|| bincode::Error::from(bincode::ErrorKind::SizeLimit))?;
+        let mut bytes = Vec::with_capacity(total_len);
+        bytes.extend_from_slice(SERIALIZATION_MAGIC);
+        bytes.extend_from_slice(&SERIALIZATION_VERSION.to_le_bytes());
+        bincode::serialize_into(&mut bytes, self)?;
         Ok(bytes)
     }
 

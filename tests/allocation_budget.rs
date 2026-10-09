@@ -330,4 +330,112 @@ fn allocation_budget() {
     optimizer_step_is_allocation_free();
     workspace_size_ignores_the_multithreading_threshold();
     try_create_workspace_does_not_panic_on_a_valid_config();
+    #[cfg(feature = "serde")]
+    serialization::exports_have_one_output_allocation();
+}
+
+#[cfg(feature = "serde")]
+mod serialization {
+    use super::*;
+    use arkan::baked::BakedModel;
+    fn serialization_fixture_network() -> KanNetwork {
+        let mut network = KanNetwork::new(KanConfig {
+            input_dim: 2,
+            output_dim: 1,
+            hidden_dims: vec![2],
+            grid_size: 3,
+            spline_order: 2,
+            grid_range: (-2.0, 2.0),
+            input_mean: vec![0.25, -0.5],
+            input_std: vec![0.5, 2.0],
+            init_seed: Some(7),
+            ..KanConfig::default()
+        });
+        for (i, layer) in network.layers.iter_mut().enumerate() {
+            for (j, weight) in layer.weights.iter_mut().enumerate() {
+                *weight = (j as f32 - 3.0) * (i + 1) as f32 / 32.0;
+            }
+            for (j, bias) in layer.bias.iter_mut().enumerate() {
+                *bias = (j + 1) as f32 / 16.0;
+            }
+        }
+        network.layers[1].set_normalization(&[0.125, -0.25], &[1.5, 0.75]);
+        network
+    }
+
+    fn large_network(width: usize) -> KanNetwork {
+        KanNetwork::new(KanConfig {
+            input_dim: 21,
+            output_dim: 24,
+            hidden_dims: vec![width, width],
+            grid_size: 5,
+            spline_order: 3,
+            grid_range: (-3.0, 3.0),
+            input_mean: vec![0.0; 21],
+            input_std: vec![1.0; 21],
+            multithreading_threshold: 128,
+            simd_width: 8,
+            init_seed: Some(42),
+        })
+    }
+
+    fn networks() -> [KanNetwork; 3] {
+        [
+            serialization_fixture_network(),
+            large_network(64),
+            large_network(128),
+        ]
+    }
+
+    fn baked_models(networks: &[KanNetwork; 3]) -> [BakedModel; 3] {
+        [
+            BakedModel::try_from_network(&networks[0], Some(&[-0.5, 0.25, 0.25, -0.5, 1.0, 0.75]))
+                .unwrap(),
+            BakedModel::try_from_network(&networks[1], None).unwrap(),
+            BakedModel::try_from_network(&networks[2], None).unwrap(),
+        ]
+    }
+
+    pub(super) fn exports_have_one_output_allocation() {
+        let networks = networks();
+        let baked = baked_models(&networks);
+        let ids = ["n_literal", "b_literal", "n_64", "b_64", "n_128", "b_128"];
+        let observations = std::array::from_fn::<_, 6, _>(|row| {
+            let i = row / 2;
+            let body = if row % 2 == 0 {
+                bincode::serialize(&networks[i]).unwrap()
+            } else {
+                bincode::serialize(&baked[i]).unwrap()
+            };
+            let header = if row % 2 == 0 { 9 } else { 16 };
+            let mut output = None;
+            let counts = measure(|| {
+                output = Some(if row % 2 == 0 {
+                    networks[i].to_bytes()
+                } else {
+                    baked[i].to_bytes()
+                });
+            });
+            let classes: [usize; 3] = std::array::from_fn(|i| CLASSES[i].load(Ordering::Relaxed));
+            let output = output.unwrap().unwrap();
+            let length = output.len();
+            let capacity = output.capacity();
+            drop(output);
+            (header + body.len(), counts, classes, length, capacity)
+        });
+        // Print all original rows before the intentional one-request RED assertion.
+        for (id, (expected, counts, classes, length, capacity)) in ids.into_iter().zip(observations)
+        {
+            println!("serialization id={id} expected={expected} requests={} bytes={} classes={classes:?} len={length} cap={capacity}", counts.0, counts.1);
+        }
+        for (expected, counts, classes, length, capacity) in observations {
+            assert_eq!(
+                counts,
+                (1, expected),
+                "export must allocate only its returned output"
+            );
+            assert_eq!(classes, [1, 0, 0], "export must not reallocate");
+            assert_eq!((length, capacity), (expected, expected));
+        }
+    }
 }

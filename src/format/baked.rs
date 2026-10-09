@@ -56,11 +56,15 @@ impl BakedModel {
     pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
         use crate::MAGIC_BAKED;
 
-        let body = bincode::serialize(self)?;
-        let mut out = Vec::with_capacity(MAGIC_BAKED.len() + 4 + body.len());
+        let body_len = usize::try_from(bincode::serialized_size(self)?)
+            .map_err(|_| bincode::Error::from(bincode::ErrorKind::SizeLimit))?;
+        let total_len = (MAGIC_BAKED.len() + 4)
+            .checked_add(body_len)
+            .ok_or_else(|| bincode::Error::from(bincode::ErrorKind::SizeLimit))?;
+        let mut out = Vec::with_capacity(total_len);
         out.extend_from_slice(MAGIC_BAKED);
         out.extend_from_slice(&Self::FORMAT_VERSION.to_le_bytes());
-        out.extend_from_slice(&body);
+        bincode::serialize_into(&mut out, self)?;
         Ok(out)
     }
 

@@ -89,3 +89,114 @@ fn baked_v2_bytes_and_json_survive_runtime_changes() {
         assert_eq!(actual, expected);
     }
 }
+
+fn large_network(width: usize) -> KanNetwork {
+    KanNetwork::new(KanConfig {
+        input_dim: 21,
+        output_dim: 24,
+        hidden_dims: vec![width, width],
+        grid_size: 5,
+        spline_order: 3,
+        grid_range: (-3.0, 3.0),
+        input_mean: vec![0.0; 21],
+        input_std: vec![1.0; 21],
+        multithreading_threshold: 128,
+        simd_width: 8,
+        init_seed: Some(42),
+    })
+}
+
+fn networks() -> [KanNetwork; 3] {
+    [fixture_network(), large_network(64), large_network(128)]
+}
+
+fn baked_models(networks: &[KanNetwork; 3]) -> [BakedModel; 3] {
+    [
+        BakedModel::try_from_network(&networks[0], Some(&[-0.5, 0.25, 0.25, -0.5, 1.0, 0.75]))
+            .unwrap(),
+        BakedModel::try_from_network(&networks[1], None).unwrap(),
+        BakedModel::try_from_network(&networks[2], None).unwrap(),
+    ]
+}
+
+fn network_wire_oracle(network: &KanNetwork) -> Vec<u8> {
+    let mut expected = b"ARKAN\x01\x00\x00\x00".to_vec();
+    expected.extend(bincode::serialize(network).unwrap());
+    expected
+}
+
+fn baked_wire_oracle(model: &BakedModel) -> Vec<u8> {
+    let mut expected = b"KAN_BAKED_v1\x02\x00\x00\x00".to_vec();
+    expected.extend(bincode::serialize(model).unwrap());
+    expected
+}
+
+#[test]
+fn public_exports_match_direct_bincode_with_literal_headers() {
+    let networks = networks();
+    let baked = baked_models(&networks);
+    for i in 0..3 {
+        assert_eq!(
+            networks[i].to_bytes().unwrap(),
+            network_wire_oracle(&networks[i])
+        );
+        assert_eq!(baked[i].to_bytes().unwrap(), baked_wire_oracle(&baked[i]));
+    }
+}
+
+#[test]
+fn cpu_export_preserves_signed_zero_infinity_and_nan_payload_bits() {
+    let patterns = [
+        0x00000000, 0x80000000, 0x7f800000, 0xff800000, 0x7fc12345, 0xffc54321,
+    ];
+    for bits in patterns {
+        let mut network = fixture_network();
+        network.layers[0].weights[0] = f32::from_bits(bits);
+        network.layers[0].bias[0] = f32::from_bits(bits);
+        assert_eq!(network.to_bytes().unwrap(), network_wire_oracle(&network));
+    }
+    let mut mixed = fixture_network();
+    for (i, weight) in mixed.layers[0].weights.iter_mut().enumerate() {
+        *weight = f32::from_bits(patterns[i % patterns.len()]);
+    }
+    mixed.layers[0].bias[0] = f32::from_bits(0x00000000);
+    mixed.layers[0].bias[1] = f32::from_bits(0x80000000);
+    assert_eq!(mixed.to_bytes().unwrap(), network_wire_oracle(&mixed));
+}
+
+#[test]
+fn mutable_invalid_baked_models_still_export_but_import_rejects_them() {
+    let valid = BakedModel::try_from_network(
+        &fixture_network(),
+        Some(&[-0.5, 0.25, 0.25, -0.5, 1.0, 0.75]),
+    )
+    .unwrap();
+    for case in 0..4 {
+        let mut model = valid.clone();
+        match case {
+            0 => {
+                model.layers[0].weights_i8.pop();
+            }
+            1 => model.layers[0].requant_shift[0] = 63,
+            2 => model.layers[0].std[0] = 0.0,
+            3 => model.layers[0].s_act_out = f32::from_bits(0x7fc12345),
+            _ => unreachable!(),
+        }
+        let bytes = model.to_bytes().unwrap();
+        assert_eq!(bytes, baked_wire_oracle(&model));
+        assert!(matches!(
+            *BakedModel::from_bytes(&bytes).unwrap_err(),
+            bincode::ErrorKind::Custom(_)
+        ));
+        let body = bincode::serialize(&model).unwrap();
+        assert!(matches!(
+            *bincode::deserialize::<BakedModel>(&body).unwrap_err(),
+            bincode::ErrorKind::Custom(_)
+        ));
+    }
+    let bytes = valid.to_bytes().unwrap();
+    assert_eq!(
+        BakedModel::from_bytes(&bytes).unwrap().to_bytes().unwrap(),
+        bytes
+    );
+}
