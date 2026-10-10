@@ -235,8 +235,7 @@ impl GpuDqnAgent {
             } else {
                 let next_state = &next_states[i * state_dim..(i + 1) * state_dim];
                 let next_q = self.get_target_q_values(next_state);
-                let max_next_q = next_q.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                reward + gamma * max_next_q
+                crate::utils::bellman_target(next_state, &next_q, reward, gamma)
             };
 
             targets[i * action_dim + action] = target_q;
@@ -281,8 +280,9 @@ impl GpuDqnAgent {
         let next_q = self.gpu_target.as_mut().ok_or("native GPU target not initialized")?
             .forward_batch(next_states, batch, self.gpu_target_workspace.as_mut().ok_or("native target workspace not initialized")?)?;
         for i in 0..batch {
-            let next = next_q[i*4..i*4+4].iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            targets[i*4+actions[i]] = if dones[i] { rewards[i] } else { rewards[i]+gamma*next };
+            targets[i*4+actions[i]] = if dones[i] { rewards[i] } else {
+                crate::utils::bellman_target(&next_states[i*256..(i+1)*256], &next_q[i*4..i*4+4], rewards[i], gamma)
+            };
         }
         Ok(targets)
     }
@@ -347,11 +347,8 @@ impl GpuDqnAgent {
             } else {
                 // Max Q from target network for next state
                 let next_q_start = i * action_dim;
-                let max_next_q = self.batch_next_q[next_q_start..next_q_start + action_dim]
-                    .iter()
-                    .cloned()
-                    .fold(f32::NEG_INFINITY, f32::max);
-                reward + gamma * max_next_q
+                crate::utils::bellman_target(&next_states[i*256..(i+1)*256],
+                    &self.batch_next_q[next_q_start..next_q_start + action_dim], reward, gamma)
             };
 
             targets[i * action_dim + action] = target_q;
@@ -812,6 +809,50 @@ fn train_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "Requires GPU adapter"]
+    fn hybrid_bellman_builders_exclude_invalid_next_actions() {
+        check_bellman_builders(false);
+    }
+
+    #[test]
+    #[ignore = "Requires GPU adapter"]
+    fn native_bellman_builders_exclude_invalid_next_actions() {
+        check_bellman_builders(true);
+    }
+
+    fn check_bellman_builders(native: bool) {
+        use crate::{game::Board, utils::board_to_onehot_inplace};
+        let mut board = Board::empty();
+        board.set(0, 0, 1);
+        board.set(0, 3, 2);
+        let mut state = [0.0; 256];
+        board_to_onehot_inplace(&board, &mut state);
+        {
+            let mut agent = GpuDqnAgent::new(0.0, native).unwrap();
+            for layer in agent.cpu_policy.layers.iter_mut().chain(&mut agent.cpu_target.layers) {
+                layer.weights.fill(0.0);
+                layer.bias.fill(0.0);
+            }
+            agent.cpu_target.layers.last_mut().unwrap().bias.copy_from_slice(&[100.0, 1.0, 2.0, 3.0]);
+            agent.gpu_policy.sync_weights(&agent.cpu_policy).unwrap();
+            if let Some(target) = &mut agent.gpu_target {
+                target.sync_weights(&agent.cpu_target).unwrap();
+            }
+            assert_eq!(agent.compute_targets(&state, &[1], &[0.0], &state, &[false], 1.0), vec![0.0, 3.0, 0.0, 0.0]);
+            let loss = if native {
+                agent.train_batch_native(&state, &[1], &[0.0], &state, &[false], 1.0).unwrap()
+            } else {
+                agent.train_batch_hybrid(&state, &[1], &[0.0], &state, &[false], 1.0).unwrap()
+            };
+            assert_eq!(loss, 2.25);
+            assert_eq!(agent.compute_targets(&state, &[1], &[2.0], &state, &[true], 1.0)[1], 2.0);
+            board_to_onehot_inplace(&Board::empty(), &mut state);
+            assert_eq!(agent.compute_targets(&state, &[1], &[2.0], &state, &[false], 1.0)[1], 2.0);
+            board_to_onehot_inplace(&board, &mut state);
+        }
+    }
 
     #[test]
     #[ignore = "Requires GPU adapter"]

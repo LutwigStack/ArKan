@@ -50,19 +50,16 @@ fn main() {
     println!("  Parameters: {}", network.param_count());
     println!("  Batch size: {}", batch_size);
 
-    // 3. Create Adam optimizer
-    let optimizer_config = AdamConfig::with_lr(0.001);
-    let optimizer = Adam::new(&network, optimizer_config);
-
-    println!("\nOptimizer: Adam");
-    println!("  Learning rate: {}", optimizer.learning_rate());
-
-    // 4. Set training options (gradient clipping + weight decay)
+    // 3. Set gradient clipping and Adam's decoupled weight decay
     let train_opts = TrainOptions {
         max_grad_norm: Some(1.0),
         weight_decay: 0.01,
     };
-    network.set_default_train_options(train_opts);
+    let optimizer_config = AdamConfig::with_decay(0.001, train_opts.weight_decay);
+    let mut optimizer = Adam::new(&network, optimizer_config);
+
+    println!("\nOptimizer: Adam");
+    println!("  Learning rate: {}", optimizer.learning_rate());
 
     println!("\nTraining options:");
     println!("  Gradient clipping: max norm = 1.0");
@@ -94,14 +91,16 @@ fn main() {
             let batch_inputs = &inputs[start * config.input_dim..end_input];
             let batch_targets = &targets[start * config.output_dim..end_target];
 
-            // Train step with SGD (or use train_step_with_options for advanced control)
-            let loss = network.train_step(
-                batch_inputs,
-                batch_targets,
-                None, // MSE loss, no mask
-                optimizer.learning_rate(),
-                &mut workspace,
-            );
+            let loss = network
+                .train_step_with_optimizer(
+                    batch_inputs,
+                    batch_targets,
+                    None, // MSE loss, no mask
+                    &mut workspace,
+                    &mut optimizer,
+                    &train_opts,
+                )
+                .expect("Adam training step failed");
 
             epoch_loss += loss;
         }
@@ -176,6 +175,15 @@ fn main() {
     }
 
     println!("Training complete!");
+
+    #[cfg(test)]
+    {
+        assert!(optimizer
+            .layer_states
+            .iter()
+            .all(|layer| layer.weights.t > 0 && layer.bias.t > 0));
+        assert_eq!(optimizer.config.weight_decay, 0.01);
+    }
 }
 
 /// Generate synthetic XOR-like dataset for demonstration.
@@ -222,4 +230,12 @@ fn generate_xor_dataset(
     }
 
     (inputs, targets)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn training_loop_advances_adam_history() {
+        super::main();
+    }
 }

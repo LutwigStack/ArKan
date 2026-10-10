@@ -120,6 +120,7 @@ impl GpuLayer {
     ) -> ArkanResult<Self> {
         cpu_layer.validate_layout()?;
         Self::validate_normalization(cpu_layer)?;
+        Self::validate_grid(cpu_layer)?;
         let in_dim = cpu_layer.in_dim;
         let out_dim = cpu_layer.out_dim;
         let grid_size = cpu_layer.grid_size;
@@ -161,11 +162,7 @@ impl GpuLayer {
             Some(max_vram_alloc),
         )?;
         let stats = cpu_layer.normalization();
-        let inverse: Vec<_> = stats
-            .std
-            .iter()
-            .map(|s| 1.0 / s.max(crate::config::EPSILON))
-            .collect();
+        let inverse: Vec<_> = stats.std.iter().map(|s| 1.0 / s).collect();
         let normalized: Vec<_> = stats
             .mean
             .iter()
@@ -247,6 +244,38 @@ impl GpuLayer {
         })
     }
 
+    /// The polynomial shaders require knots uniform to 16 binary fractional bits
+    /// in cell units (2^-16), both in position and adjacent spacing. This fixed
+    /// geometry budget never grows with grid size or coordinate magnitude.
+    /// ponytail: reject distorted/underflowing grids; upload actual knots if wider support is needed.
+    pub(crate) fn validate_grid(cpu_layer: &KanLayer) -> ArkanResult<()> {
+        let (min, max) = cpu_layer.grid_range;
+        let step = (max - min) / cpu_layer.grid_size as f32;
+        let tolerance = 1.0 / 65536.0;
+        if !step.is_normal() || !step.recip().is_finite() {
+            return Err(crate::ArkanError::validation(
+                "GPU grid requires a normal interval and finite reciprocal",
+            ));
+        }
+        let mut previous = None;
+        for i in 0..(cpu_layer.grid_size + 2 * cpu_layer.order + 1) {
+            let offset = i as f32 - cpu_layer.order as f32;
+            let actual = min + offset * step;
+            let ideal = min as f64 + offset as f64 * step as f64;
+            let position_error = (actual as f64 - ideal).abs() / step as f64;
+            let spacing_error = previous.map_or(0.0, |p: f32| {
+                ((actual as f64 - p as f64) / step as f64 - 1.0).abs()
+            });
+            if position_error > tolerance || spacing_error > tolerance {
+                return Err(crate::ArkanError::validation(
+                    "GPU grid rounding exceeds 2^-16 cell geometry budget",
+                ));
+            }
+            previous = Some(actual);
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_normalization(cpu_layer: &KanLayer) -> ArkanResult<()> {
         // GPU float arithmetic may flush subnormal values to zero.
         if cpu_layer.std.iter().any(|&std| std < f32::MIN_POSITIVE) {
@@ -259,11 +288,7 @@ impl GpuLayer {
 
     pub(crate) fn update_normalization(&self, queue: &wgpu::Queue, cpu_layer: &KanLayer) {
         let stats = cpu_layer.normalization();
-        let inverse: Vec<_> = stats
-            .std
-            .iter()
-            .map(|s| 1.0 / s.max(crate::config::EPSILON))
-            .collect();
+        let inverse: Vec<_> = stats.std.iter().map(|s| 1.0 / s).collect();
         let normalized: Vec<_> = stats
             .mean
             .iter()

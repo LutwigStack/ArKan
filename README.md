@@ -205,10 +205,9 @@ and `cargo bench --bench baked`. Random-init networks, `grid_range = (-1, 1)`,
 
 Three things this table is saying that are easy to skim past:
 
-1. **Baked is slower, not faster.** Its only current win is size. A design that
-   reverses this exists and is measured at roughly 1.5–2.8× *faster* than f32 —
-   the win is a weight-layout change, not SIMD — but it is **not implemented**.
-   Do not adopt `BakedModel` for latency.
+1. **Baked latency needs a fresh measurement.** The historical table measured
+   the allocating convenience method. Current benchmarks use reusable workspaces;
+   the archived latency ratios do not describe that path.
 2. **The ≥1σ tail used to be 34–54% and is now 3–8%.** Three fixed-point defects
    caused it, all now fixed: activations saturated at the calibration set's
    99.9th percentile on *every* layer (so the model could never return a larger
@@ -314,46 +313,16 @@ ARKAN_GPU_BENCH=1 cargo bench --bench gpu_forward --features gpu
 
 ### **GPU производительность vs PyTorch CUDA**
 
-Forward, batch=64, перемерено 2026-06-27. ArKan использует wgpu/Vulkan, конкуренты — PyTorch CUDA.
-Конфигурации не совпадают: Python-бенчи гоняют `[16,64,64,8]`, ArKan GPU — `[21,64,64,24]` (немного больше).
-
-| Implementation | Forward (batch=64) | Математика | Notes |
-|----------------|-------------------|------------|-------|
-| **FastKAN (CUDA)** | **0.790 ms** | RBF | Быстрее всех — просто не считает B-сплайны |
-| **ArKan (wgpu)** | **1.296 ms** | Чистый B-сплайн | Самая быстрая B-сплайновая GPU-реализация в сравнении |
-| efficient-kan (CUDA) | 2.242 ms | B-сплайн + SiLU | |
-| faithful-PyTorch (CUDA) | 4.277 ms | Чистый B-сплайн | Без оптимизации ядер |
-
-**Честный вывод:** ArKan GPU в ~1.7 раза быстрее efficient-kan и в ~3 раза быстрее
-эталонной PyTorch-реализации той же математики. FastKAN быстрее ArKan в ~1.6 раза,
-но считает RBF вместо B-сплайнов — это размен математики, а не чистый выигрыш в скорости.
-Полная методика: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Старые сравнительные результаты недействительны до повторных замеров с одинаковыми
+конфигурациями и математикой. Методика и архив: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## **Бенчмарки (CPU)**
 
-Сравнение ArKan (Rust) против оптимизированной векторизованной реализации на PyTorch (CPU).
+Старые CPU/PyTorch сравнения недействительны до согласованного повторного замера.
+Новые времена и коэффициенты ускорения здесь не заявлены. См.
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-**Тестовый стенд:**
-
-* **Config:** Input 21, Output 24, Hidden \[64, 64\], Grid 5, Spline Order 3\.
-* **ArKan:** `cargo bench --bench forward`, release, фичи по умолчанию. SIMD через `wide` включён всегда; `parallel` **не** включён — это однопоточные числа.
-* **PyTorch:** Optimized vectorized implementation (без Python-циклов).
-
-> Колонка PyTorch — **оценка**, экстраполированная с измеренной конфигурации
-> `[16,64,64,8]`, а не замер на `[21,64,64,24]`. Множители наследуют эту погрешность.
-
-| Batch Size | ArKan (Time) | ArKan (Throughput) | PyTorch (est.) | Вывод |
-| :---- | :---- | :---- | :---- | :---- |
-| **1** | **26.8 µs** | 0.79 M elems/s | ~1.5 ms | **Rust быстрее в ~56x** (низкая задержка) |
-| 64 | 1.694 ms | 0.79 M elems/s | ~2.9 ms | Rust быстрее в ~1.7x |
-| 256 | 6.687 ms | 0.79 M elems/s | ~4.4 ms | **0.66x — здесь выигрывает PyTorch** (BLAS) |
-
-### **Анализ производительности**
-
-1. **Small Batch Dominance:** На единичных запросах (`batch=1`) ArKan **опережает** PyTorch за счет отсутствия оверхеда интерпретатора и абстракций. Это позволяет совершать \~37,000 инференсов в секунду.
-2. **Mid-Batch Performance:** На средних батчах (16-64) ArKan сохраняет преимущество, демонстрируя хорошую масштабируемость.
-3. **Где ArKan проигрывает:** на батчах 256+ BLAS-ядра PyTorch обгоняют ArKan CPU (см. `docs/BENCHMARKS.md`, замер 2026-06-27). Ниша библиотеки — низкая задержка на batch=1, а не пропускная способность на больших батчах.
-4. **Reusable Training Storage:** training loop (forward + backward + optimizer step) повторно использует память ArKan при прогретом Workspace. Проверяется `tests/allocation_budget.rs` — counting `GlobalAlloc` на forward_batch, forward_single, train_step и train_step_with_optimizer (Adam и SGD). При включённом `parallel` вызовы из внешнего потока могут регулярно выделять блоки очереди планировщика Rayon. Нулевое число аллокаций наблюдалось для повторных вызовов внутри одного охватывающего их прогретого пула Rayon; это не гарантия для произвольного пула или контекста вызова.
+**Reusable Training Storage:** training loop (forward + backward + optimizer step) повторно использует память ArKan при прогретом Workspace. Проверяется `tests/allocation_budget.rs` — counting `GlobalAlloc` на forward_batch, forward_single, train_step и train_step_with_optimizer (Adam и SGD). При включённом `parallel` вызовы из внешнего потока могут регулярно выделять блоки очереди планировщика Rayon. Нулевое число аллокаций наблюдалось для повторных вызовов внутри одного охватывающего их прогретого пула Rayon; это не гарантия для произвольного пула или контекста вызова.
 
 ## **Сравнение с аналогами (Prior Art)**
 
@@ -691,46 +660,17 @@ ARKAN_GPU_BENCH=1 cargo bench --bench gpu_backward --features gpu
 
 ### **GPU Performance vs PyTorch CUDA**
 
-Forward, batch=64, re-measured 2026-06-27. ArKan uses wgpu/Vulkan; the competitors use PyTorch CUDA.
-Configs do not match: the Python benches run `[16,64,64,8]`, ArKan GPU runs `[21,64,64,24]` (slightly larger).
-
-| Implementation | Forward (batch=64) | Math | Notes |
-|----------------|-------------------|------|-------|
-| **FastKAN (CUDA)** | **0.790 ms** | RBF | Fastest — it avoids B-spline compute entirely |
-| **ArKan (wgpu)** | **1.296 ms** | Pure B-spline | Fastest pure-B-spline GPU implementation here |
-| efficient-kan (CUDA) | 2.242 ms | B-spline + SiLU base | |
-| faithful-PyTorch (CUDA) | 4.277 ms | Pure B-spline | No kernel optimization |
-
-**Honest conclusion:** ArKan GPU is ~1.7x faster than efficient-kan and ~3x faster than
-a reference PyTorch implementation of the same math. FastKAN is ~1.6x faster than ArKan,
-but computes RBF instead of B-splines — that is a math trade-off, not a pure speed win.
-Full methodology: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Historical comparison ratios are invalid pending a matched rerun with consistent
+model shapes and mathematics. Methodology and archived results:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## **Benchmarks (CPU)**
 
-Comparison of ArKan (Rust) vs. optimized vectorized PyTorch implementation (CPU).
+Historical CPU/PyTorch comparisons are invalid pending a matched rerun. No current
+timings or speedup ratios are claimed here. See
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-**Test Setup:**
-
-* **Config:** Input 21, Output 24, Hidden \[64, 64\], Grid 5, Spline Order 3\.
-* **ArKan:** `cargo bench --bench forward`, release, default features. SIMD via `wide` is always on; `parallel` was **not** enabled — these are single-threaded numbers.
-* **PyTorch:** Optimized vectorized implementation (no Python loops).
-
-> The PyTorch column is **estimated**, extrapolated from a measured `[16,64,64,8]`
-> run rather than measured at `[21,64,64,24]`. The speedup ratios inherit that.
-
-| Batch Size | ArKan (Time) | ArKan (Throughput) | PyTorch (est.) | Conclusion |
-| :---- | :---- | :---- | :---- | :---- |
-| **1** | **26.8 µs** | 0.79 M elems/s | ~1.5 ms | **Rust is ~56x faster** (low latency) |
-| 64 | 1.694 ms | 0.79 M elems/s | ~2.9 ms | Rust is ~1.7x faster |
-| 256 | 6.687 ms | 0.79 M elems/s | ~4.4 ms | **0.66x — PyTorch wins here** (BLAS) |
-
-### **Performance Analysis**
-
-1. **Small Batch Dominance:** On single requests (`batch=1`), ArKan **outperforms** PyTorch due to the lack of interpreter overhead and abstractions. This allows for \~37,000 inferences per second.
-2. **Mid-Batch Performance:** On medium batches (16-64), ArKan keeps a solid advantage and scales predictably.
-3. **Where ArKan loses:** at batch 256+, PyTorch's BLAS kernels overtake ArKan CPU (see the 2026-06-27 measurement in `docs/BENCHMARKS.md`). This library's niche is batch=1 latency, not large-batch throughput.
-4. **Reusable Training Storage:** the training loop (forward + backward + optimizer step) reuses ArKan storage on a warmed-up Workspace. Checked by `tests/allocation_budget.rs` — a counting `GlobalAlloc` over forward_batch, forward_single, train_step and train_step_with_optimizer (both Adam and SGD). With `parallel`, external-thread calls can allocate recurring Rayon scheduling-queue blocks. Repeated calls inside one enclosing, warmed Rayon pool observed zero allocations; arbitrary pools and call contexts are not guaranteed to allocate nothing.
+**Reusable Training Storage:** the training loop (forward + backward + optimizer step) reuses ArKan storage on a warmed-up Workspace. Checked by `tests/allocation_budget.rs` — a counting `GlobalAlloc` over forward_batch, forward_single, train_step and train_step_with_optimizer (both Adam and SGD). With `parallel`, external-thread calls can allocate recurring Rayon scheduling-queue blocks. Repeated calls inside one enclosing, warmed Rayon pool observed zero allocations; arbitrary pools and call contexts are not guaranteed to allocate nothing.
 
 ## **Comparison with Analogues (Prior Art)**
 

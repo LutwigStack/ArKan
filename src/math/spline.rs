@@ -233,8 +233,15 @@ pub fn compute_basis(x: f32, span: usize, knots: &[f32], order: usize, basis_out
             } else {
                 0.0
             };
-            basis_out[r] = saved + right[r + 1] * temp;
-            saved = left[j - r] * temp;
+            if temp.is_finite() {
+                basis_out[r] = saved + right[r + 1] * temp;
+                saved = left[j - r] * temp;
+            } else {
+                // Divide intervals first when the standalone reciprocal overflows.
+                let previous = basis_out[r];
+                basis_out[r] = saved + (right[r + 1] / denom) * previous;
+                saved = (left[j - r] / denom) * previous;
+            }
         }
         basis_out[j] = saved;
     }
@@ -400,6 +407,26 @@ pub fn compute_basis_and_deriv(
         deriv_out[i] = (order as f32) * (term1 - term2);
         // This right quotient is the next iteration's left quotient.
         term1 = term2;
+    }
+}
+
+/// Factors for the derivative expressed in adjacent coefficient differences.
+/// Keep these wide: a tiny knot interval can overflow f32 before coefficients cancel or scale it.
+pub(crate) fn compute_derivative_factors(
+    x: f32,
+    span: usize,
+    knots: &[f32],
+    order: usize,
+    factors: &mut [f64],
+) {
+    debug_assert!(order > 0 && order <= MAX_ORDER);
+    debug_assert!(factors.len() >= order);
+    let mut lower_basis = [0.0f32; MAX_ORDER + 1];
+    compute_basis(x, span, knots, order - 1, &mut lower_basis);
+    let start = span - order + 1;
+    for k in 0..order {
+        let interval = knots[start + k + order] as f64 - knots[start + k] as f64;
+        factors[k] = order as f64 * lower_basis[k] as f64 / interval;
     }
 }
 

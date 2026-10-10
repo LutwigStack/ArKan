@@ -20,6 +20,8 @@ use super::*;
 /// # Note
 ///
 /// Predictions are clamped to `[EPSILON, 1-EPSILON]` to avoid log(0).
+/// The gradient is with respect to the clamped probability, treating the clamp
+/// as identity during backpropagation; it can be nonzero outside that interval.
 pub fn masked_cross_entropy(
     predictions: &[f32],
     targets: &[f32],
@@ -461,7 +463,11 @@ pub fn masked_categorical_cross_entropy_with_logits(
     debug_assert!(num_classes > 0);
     let mut gradient = vec![0.0; logits.len()];
     let mut loss = 0.0f64;
-    let mut count = 0.0f64;
+    let samples = logits.len().min(targets.len()) / num_classes;
+    let count = (0..samples)
+        .map(|sample| mask.map_or(1.0, |mask| f64::from(mask[sample])))
+        .filter(|&weight| weight > 0.0 || weight.is_nan())
+        .sum::<f64>();
     for (sample, (scores, labels)) in logits
         .chunks_exact(num_classes)
         .zip(targets.chunks_exact(num_classes))
@@ -484,16 +490,13 @@ pub fn masked_categorical_cross_entropy_with_logits(
         for (class, (&z, &t)) in scores.iter().zip(labels).enumerate() {
             loss += m * t as f64 * (log_sum - (z as f64 - maximum));
             let probability = (z as f64 - maximum).exp() / sum;
+            let normalized_weight = if count > 0.0 { m / count } else { m };
             gradient[sample * num_classes + class] =
-                (m * (probability * target_sum - t as f64)) as f32;
+                (normalized_weight * (probability * target_sum - t as f64)) as f32;
         }
-        count += m;
     }
     if count > 0.0 {
         loss /= count;
-        for g in &mut gradient {
-            *g = (*g as f64 / count) as f32;
-        }
     }
     (loss as f32, gradient)
 }

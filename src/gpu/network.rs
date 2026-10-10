@@ -8,7 +8,7 @@ use crate::error::{ArkanError, ArkanResult};
 use crate::gpu::backend::WgpuBackend;
 use crate::gpu::layer::GpuLayer;
 use crate::gpu::optimizer::{GpuAdam, GpuSgd};
-use crate::gpu::pipeline::{workgroup_count, PipelineCache, WORKGROUP_SIZE};
+use crate::gpu::pipeline::{checked_workgroup_count, PipelineCache, WORKGROUP_SIZE};
 use crate::gpu::workspace::GpuWorkspace;
 use crate::loss::{masked_bce_with_logits, masked_mse};
 use crate::network::{KanNetwork, TrainOptions};
@@ -370,11 +370,45 @@ impl GpuNetwork {
         Ok(())
     }
 
+    fn validate_forward_dispatch(&self, batch: usize) -> ArkanResult<()> {
+        for layer in &self.layers {
+            for dim in [layer.in_dim, layer.out_dim] {
+                let extent = batch
+                    .checked_mul(dim)
+                    .ok_or_else(|| ArkanError::unsupported_limits("GPU batch extent overflow"))?;
+                if extent > u32::MAX as usize {
+                    return Err(ArkanError::unsupported_limits(
+                        "GPU tensor indexing exceeds u32",
+                    ));
+                }
+            }
+            checked_workgroup_count(&self.device, batch * layer.out_dim, WORKGROUP_SIZE)?;
+        }
+        Ok(())
+    }
+
+    fn validate_backward_dispatch(&self, batch: usize) -> ArkanResult<()> {
+        self.validate_forward_dispatch(batch)?;
+        for layer in &self.layers {
+            let weights = layer
+                .in_dim
+                .checked_mul(layer.out_dim)
+                .and_then(|n| n.checked_mul(layer.basis_padded))
+                .ok_or_else(|| ArkanError::unsupported_limits("GPU weight extent overflow"))?;
+            for extent in [weights, layer.out_dim, batch * layer.in_dim] {
+                checked_workgroup_count(&self.device, extent, WORKGROUP_SIZE)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Creates a GPU network from a CPU network.
     ///
     /// Uploads weights, bias and per-feature normalization to GPU memory.
     /// Subnormal standard deviations are rejected before execution because GPU
-    /// float arithmetic may flush them to zero.
+    /// float arithmetic may flush them to zero. Polynomial GPU shaders require
+    /// generated knot positions and spacings within 2^-16 cell units of uniform;
+    /// more distorted shifted/narrow grids return `Validation` before upload.
     pub fn from_cpu(backend: &WgpuBackend, cpu_network: &KanNetwork) -> ArkanResult<Self> {
         let layout = cpu_network.checked_layout()?.clone();
         let device = backend.device_arc();
@@ -389,6 +423,11 @@ impl GpuNetwork {
             ));
         }
 
+        // Preflight every layer before allocating or uploading any of them.
+        for layer in &cpu_network.layers {
+            GpuLayer::validate_normalization(layer)?;
+            GpuLayer::validate_grid(layer)?;
+        }
         // Upload all layers
         let mut layers = Vec::with_capacity(cpu_network.layers.len());
         for cpu_layer in &cpu_network.layers {
@@ -643,6 +682,7 @@ impl GpuNetwork {
         }
 
         // Ensure workspace capacity
+        self.validate_forward_dispatch(batch_size)?;
         workspace.ensure_capacity(&self.device, batch_size)?;
         workspace.validate_io_capacity(batch_size)?;
         workspace.ensure_intermediates(&self.device, self.layout.layer_dims(), batch_size)?;
@@ -716,6 +756,7 @@ impl GpuNetwork {
         }
 
         // Ensure workspace capacity
+        self.validate_forward_dispatch(batch_size)?;
         workspace.ensure_capacity(&self.device, batch_size)?;
         workspace.validate_io_capacity(batch_size)?;
         workspace.ensure_intermediates(&self.device, self.layout.layer_dims(), batch_size)?;
@@ -833,7 +874,8 @@ impl GpuNetwork {
 
             // One thread per output element
             let total_outputs = batch_size * layer.out_dim;
-            let num_workgroups = workgroup_count(total_outputs, WORKGROUP_SIZE);
+            let num_workgroups =
+                checked_workgroup_count(&self.device, total_outputs, WORKGROUP_SIZE)?;
             pass.dispatch_workgroups(num_workgroups, 1, 1);
         }
 
@@ -894,7 +936,8 @@ impl GpuNetwork {
             pass.set_bind_group(1, io_bind_group, &[]);
 
             let total_outputs = batch_size * out_dim;
-            let num_workgroups = workgroup_count(total_outputs, WORKGROUP_SIZE);
+            let num_workgroups =
+                checked_workgroup_count(&self.device, total_outputs, WORKGROUP_SIZE)?;
             pass.dispatch_workgroups(num_workgroups, 1, 1);
         }
 
@@ -943,6 +986,10 @@ impl GpuNetwork {
         batch_size: usize,
         workspace: &mut GpuWorkspace,
     ) -> ArkanResult<()> {
+        self.validate_workspace(workspace)?;
+        self.validate_forward_dispatch(batch_size)?;
+        checked_workgroup_count(&self.device, batch_size, WORKGROUP_SIZE)?;
+        workspace.validate_io_capacity(batch_size)?;
         // Create uniform buffer for softmax config
         // struct Uniforms { num_elements: u32, dim: u32, batch_size: u32, _padding: u32 }
         let config_data = [
@@ -1003,7 +1050,7 @@ impl GpuNetwork {
             pass.set_bind_group(0, &bind_group, &[]);
 
             // One workgroup per batch sample
-            let num_workgroups = workgroup_count(batch_size, WORKGROUP_SIZE);
+            let num_workgroups = checked_workgroup_count(&self.device, batch_size, WORKGROUP_SIZE)?;
             pass.dispatch_workgroups(num_workgroups, 1, 1);
         }
 
@@ -1041,6 +1088,7 @@ impl GpuNetwork {
                 &[input.len()],
             ));
         }
+        self.validate_forward_dispatch(batch_size)?;
         workspace.ensure_capacity(&self.device, batch_size)?;
         workspace.validate_io_capacity(batch_size)?;
         workspace.ensure_intermediates(&self.device, self.layout.layer_dims(), batch_size)?;
@@ -1072,6 +1120,7 @@ impl GpuNetwork {
         self.validate_cpu_sync_layout(cpu_network)?;
         for layer in &cpu_network.layers {
             GpuLayer::validate_normalization(layer)?;
+            GpuLayer::validate_grid(layer)?;
         }
         Ok(())
     }
@@ -1119,6 +1168,7 @@ impl GpuNetwork {
         }
 
         // Ensure workspace capacity
+        self.validate_forward_dispatch(batch_size)?;
         workspace.ensure_capacity(&self.device, batch_size)?;
         workspace.validate_io_capacity(batch_size)?;
         workspace.ensure_intermediates(&self.device, self.layout.layer_dims(), batch_size)?;
@@ -1231,7 +1281,8 @@ impl GpuNetwork {
 
             // One thread per output element
             let total_outputs = batch_size * out_dim;
-            let num_workgroups = workgroup_count(total_outputs, WORKGROUP_SIZE);
+            let num_workgroups =
+                checked_workgroup_count(&self.device, total_outputs, WORKGROUP_SIZE)?;
             pass.dispatch_workgroups(num_workgroups, 1, 1);
         }
 
@@ -1295,7 +1346,8 @@ impl GpuNetwork {
             pass.set_bind_group(1, training_bg, &[]);
 
             let total_outputs = batch_size * out_dim;
-            let num_workgroups = workgroup_count(total_outputs, WORKGROUP_SIZE);
+            let num_workgroups =
+                checked_workgroup_count(&self.device, total_outputs, WORKGROUP_SIZE)?;
             pass.dispatch_workgroups(num_workgroups, 1, 1);
         }
 
@@ -1342,6 +1394,7 @@ impl GpuNetwork {
         grad_biases: &mut Vec<Vec<f32>>,
     ) -> ArkanResult<Vec<f32>> {
         self.validate_training_tape(batch_size, workspace)?;
+        self.validate_backward_dispatch(batch_size)?;
 
         // Validate
         let expected_len = batch_size
@@ -1494,7 +1547,7 @@ impl GpuNetwork {
         // Dispatch weight gradients shader
         {
             let total_weights = out_dim * in_dim * basis_padded;
-            let workgroups = workgroup_count(total_weights, WORKGROUP_SIZE);
+            let workgroups = checked_workgroup_count(&self.device, total_weights, WORKGROUP_SIZE)?;
 
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Backward Weights"),
@@ -1550,7 +1603,7 @@ impl GpuNetwork {
             let bias_pipeline = self
                 .pipeline_cache
                 .get_backward_bias_pipeline(&bias_layout)?;
-            let workgroups = workgroup_count(out_dim, WORKGROUP_SIZE);
+            let workgroups = checked_workgroup_count(&self.device, out_dim, WORKGROUP_SIZE)?;
 
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Backward Bias"),
@@ -1569,7 +1622,7 @@ impl GpuNetwork {
             )?;
 
             let total_inputs = batch_size * in_dim;
-            let workgroups = workgroup_count(total_inputs, WORKGROUP_SIZE);
+            let workgroups = checked_workgroup_count(&self.device, total_inputs, WORKGROUP_SIZE)?;
 
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Backward Input"),
@@ -1722,6 +1775,8 @@ impl GpuNetwork {
             ));
         }
 
+        self.validate_backward_dispatch(batch_size)?;
+
         // 1. Forward pass with training data
         let output = self.forward_batch_training(input, batch_size, workspace)?;
 
@@ -1738,6 +1793,10 @@ impl GpuNetwork {
             &mut grad_weights,
             &mut grad_biases,
         )?;
+
+        if batch_size == 0 {
+            return Ok(0.0);
+        }
 
         // 4. Optimizer step on CPU network. No gradient clipping by default; for
         //    configurable clipping pass max_grad_norm to optimizer.step in your own
@@ -1794,6 +1853,17 @@ impl GpuNetwork {
             ));
         }
 
+        if let Some(mask) = mask {
+            if mask.len() != expected_target_len {
+                return Err(ArkanError::shape_mismatch(
+                    &[expected_target_len],
+                    &[mask.len()],
+                ));
+            }
+        }
+
+        self.validate_backward_dispatch(batch_size)?;
+
         // 1. Forward pass with training data
         let output = self.forward_batch_training(input, batch_size, workspace)?;
 
@@ -1810,6 +1880,10 @@ impl GpuNetwork {
             &mut grad_weights,
             &mut grad_biases,
         )?;
+
+        if batch_size == 0 {
+            return Ok(0.0);
+        }
 
         // 4–6. Keep additional decay and upload only an applied optimizer update.
         let outcome = step_cpu_with_decay(cpu_network, optimizer.config.lr, opts, |network| {
@@ -1860,6 +1934,8 @@ impl GpuNetwork {
             ));
         }
 
+        self.validate_backward_dispatch(batch_size)?;
+
         // 1. Forward pass with training data
         let output = self.forward_batch_training(input, batch_size, workspace)?;
 
@@ -1876,6 +1952,10 @@ impl GpuNetwork {
             &mut grad_weights,
             &mut grad_biases,
         )?;
+
+        if batch_size == 0 {
+            return Ok(0.0);
+        }
 
         // 4. Optimizer step on CPU network
         optimizer.step(cpu_network, &grad_weights, &grad_biases, None)?;
@@ -1928,6 +2008,17 @@ impl GpuNetwork {
             ));
         }
 
+        if let Some(mask) = mask {
+            if mask.len() != expected_target_len {
+                return Err(ArkanError::shape_mismatch(
+                    &[expected_target_len],
+                    &[mask.len()],
+                ));
+            }
+        }
+
+        self.validate_backward_dispatch(batch_size)?;
+
         // 1. Forward pass with training data
         let output = self.forward_batch_training(input, batch_size, workspace)?;
 
@@ -1945,6 +2036,10 @@ impl GpuNetwork {
             &mut grad_biases,
         )?;
 
+        if batch_size == 0 {
+            return Ok(0.0);
+        }
+
         // 4–6. Keep additional decay and upload only an applied optimizer update.
         let outcome = step_cpu_with_decay(cpu_network, optimizer.config.lr, opts, |network| {
             optimizer.step_with_outcome(network, &grad_weights, &grad_biases, opts.max_grad_norm)
@@ -1961,6 +2056,8 @@ impl GpuNetwork {
     // These methods perform the entire training loop on GPU without CPU transfers.
     // Forward, backward, and optimizer steps all happen on GPU.
     //
+    // Native optimizers require finite inputs/intermediates and valid optimizer
+    // configuration; they do not implement CPU SafetyConfig numerical rollback.
     // Benefits:
     // - No CPU↔GPU weight transfers per step
     // - All computation on GPU
@@ -1972,6 +2069,9 @@ impl GpuNetwork {
     // - Call `sync_weights_to_cpu()` to get trained weights back if needed
 
     /// Performs a complete training step entirely on GPU using Adam optimizer.
+    ///
+    /// Native training requires finite inputs/intermediates and valid optimizer
+    /// configuration. It does not provide CPU `SafetyConfig` numerical rollback.
     ///
     /// This is the **recommended** method for GPU training as it avoids
     /// CPU↔GPU weight transfers that dominate training time in hybrid methods.
@@ -2056,6 +2156,11 @@ impl GpuNetwork {
             ));
         }
 
+        if batch_size != 0 {
+            optimizer.validate_dispatch()?;
+        }
+        self.validate_backward_dispatch(batch_size)?;
+
         // 1. Forward pass with training data
         let output = self.forward_batch_training(input, batch_size, workspace)?;
 
@@ -2064,6 +2169,10 @@ impl GpuNetwork {
 
         // 3. Backward pass - gradients stay on GPU in workspace buffers
         self.backward_batch_gpu_only(&grad_output, batch_size, workspace)?;
+
+        if batch_size == 0 {
+            return Ok(0.0);
+        }
 
         // 4. GPU optimizer step - updates weights directly on GPU
         let layer_params = self.get_layer_param_buffers();
@@ -2096,6 +2205,11 @@ impl GpuNetwork {
             ));
         }
 
+        if batch_size != 0 {
+            optimizer.validate_dispatch()?;
+        }
+        self.validate_backward_dispatch(batch_size)?;
+
         // 1. Forward pass with training data
         let output = self.forward_batch_training(input, batch_size, workspace)?;
 
@@ -2104,6 +2218,10 @@ impl GpuNetwork {
 
         // 3. Backward pass
         self.backward_batch_gpu_only(&grad_output, batch_size, workspace)?;
+
+        if batch_size == 0 {
+            return Ok(0.0);
+        }
 
         // 4. GPU optimizer step
         let layer_params = self.get_layer_param_buffers();
@@ -2159,6 +2277,20 @@ impl GpuNetwork {
             ));
         }
 
+        if let Some(mask) = mask {
+            if mask.len() != expected_target_len {
+                return Err(ArkanError::shape_mismatch(
+                    &[expected_target_len],
+                    &[mask.len()],
+                ));
+            }
+        }
+
+        if batch_size != 0 {
+            optimizer.validate_dispatch()?;
+        }
+        self.validate_backward_dispatch(batch_size)?;
+
         // 1. Forward pass with training data
         let output = self.forward_batch_training(input, batch_size, workspace)?;
 
@@ -2167,6 +2299,10 @@ impl GpuNetwork {
 
         // 3. Backward pass - gradients stay on GPU in workspace buffers
         self.backward_batch_gpu_only(&grad_output, batch_size, workspace)?;
+
+        if batch_size == 0 {
+            return Ok(0.0);
+        }
 
         // 4. Apply gradient clipping if requested
         if let Some(max_norm) = options.max_grad_norm {
@@ -2303,6 +2439,7 @@ impl GpuNetwork {
         workspace: &mut GpuWorkspace,
     ) -> ArkanResult<()> {
         self.validate_training_tape(batch_size, workspace)?;
+        self.validate_backward_dispatch(batch_size)?;
 
         // Validate
         let expected_len = batch_size

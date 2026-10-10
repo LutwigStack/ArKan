@@ -669,7 +669,11 @@ impl KanConfigBuilder {
         let input_mean = self.input_mean.unwrap_or_else(|| vec![0.0; input_dim]);
         let input_std = self
             .input_std
-            .map(|s| s.into_iter().map(|v| v.max(EPSILON)).collect())
+            .map(|s| {
+                s.into_iter()
+                    .map(|v| if v.is_finite() { v.max(EPSILON) } else { v })
+                    .collect()
+            })
             .unwrap_or_else(|| vec![1.0; input_dim]);
 
         let config = KanConfig {

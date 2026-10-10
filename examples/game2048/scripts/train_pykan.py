@@ -125,7 +125,7 @@ class Game2048:
             _, changed = test.move(action)
             if changed:
                 valid.append(action)
-        return valid if valid else [0]
+        return valid
     
     def max_tile(self):
         return np.max(self.board)
@@ -141,6 +141,19 @@ class Game2048:
                 else:
                     state[i * 4 + j] = (np.log2(val) / 8.0) - 0.5
         return state
+
+
+def legal_next_q(next_state, q_values):
+    """Reuse the game rules on the replay state's existing normalized encoding."""
+    game = Game2048.__new__(Game2048)
+    game.board = np.zeros((4, 4), dtype=np.int32)
+    game.score = 0
+    game.game_over = False
+    for cell, value in enumerate(next_state):
+        if value != -1.0:
+            game.board[cell // 4, cell % 4] = 2 ** round((float(value) + 0.5) * 8)
+    actions = game.valid_actions()
+    return max((float(q_values[action]) for action in actions), default=0.0)
 
 
 # ============== Simple MLP for speed comparison ==============
@@ -194,6 +207,8 @@ class DQNAgent:
     
     def select_action(self, state, game, epsilon):
         valid_actions = game.valid_actions()
+        if not valid_actions:
+            return 0
         
         if random.random() < epsilon:
             return random.choice(valid_actions)
@@ -222,7 +237,10 @@ class DQNAgent:
         
         with torch.no_grad():
             next_q = self.target_net(next_states_t)
-            max_next_q = next_q.max(1)[0]
+            max_next_q = torch.FloatTensor([
+                0.0 if done else legal_next_q(state, q_values)
+                for state, q_values, done in zip(next_states, next_q, dones)
+            ]).to(device)
             target_q = rewards_t + self.gamma * max_next_q * (1 - dones_t)
         
         loss = nn.MSELoss()(current_q_actions, target_q)

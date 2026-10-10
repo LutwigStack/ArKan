@@ -85,13 +85,23 @@ impl Training {
 
     // Exercise every public trainer, including the MSE delegator.
     fn step(&mut self, entry: usize, target: f32, options: &TrainOptions) -> ArkanResult<f32> {
-        let input = &[0.0];
-        let target = &[target];
+        self.step_batch(entry, &[0.0], &[target], None, 1, options)
+    }
+
+    fn step_batch(
+        &mut self,
+        entry: usize,
+        input: &[f32],
+        target: &[f32],
+        mask: Option<&[f32]>,
+        batch: usize,
+        options: &TrainOptions,
+    ) -> ArkanResult<f32> {
         match entry {
             0 => self.gpu.train_step_mse(
                 input,
                 target,
-                1,
+                batch,
                 &mut self.workspace,
                 &mut self.adam,
                 &mut self.cpu,
@@ -99,7 +109,7 @@ impl Training {
             1 => self.gpu.train_step_cross_entropy(
                 input,
                 target,
-                1,
+                batch,
                 &mut self.workspace,
                 &mut self.adam,
                 &mut self.cpu,
@@ -107,8 +117,8 @@ impl Training {
             2 => self.gpu.train_step_with_options(
                 input,
                 target,
-                None,
-                1,
+                mask,
+                batch,
                 &mut self.workspace,
                 &mut self.adam,
                 &mut self.cpu,
@@ -117,7 +127,7 @@ impl Training {
             3 => self.gpu.train_step_sgd(
                 input,
                 target,
-                1,
+                batch,
                 &mut self.workspace,
                 &mut self.sgd,
                 &mut self.cpu,
@@ -125,8 +135,8 @@ impl Training {
             4 => self.gpu.train_step_sgd_with_options(
                 input,
                 target,
-                None,
-                1,
+                mask,
+                batch,
                 &mut self.workspace,
                 &mut self.sgd,
                 &mut self.cpu,
@@ -135,22 +145,22 @@ impl Training {
             5 => self.gpu.train_step_gpu_native(
                 input,
                 target,
-                1,
+                batch,
                 &mut self.workspace,
                 &mut self.gpu_adam,
             ),
             6 => self.gpu.train_step_gpu_native_sgd(
                 input,
                 target,
-                1,
+                batch,
                 &mut self.workspace,
                 &mut self.gpu_sgd,
             ),
             7 => self.gpu.train_step_gpu_native_with_options(
                 input,
                 target,
-                1,
-                None,
+                batch,
+                mask,
                 &mut self.workspace,
                 &mut self.gpu_adam,
                 options,
@@ -478,5 +488,95 @@ fn successful_zero_lr_hybrid_step_advances_history_and_syncs() {
         let mut downloaded = model(1.0);
         training.gpu.sync_weights_to_cpu(&mut downloaded).unwrap();
         assert_cpu_unchanged(&downloaded, &before);
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn low_memory_supports_training_backward() {
+    let backend = WgpuBackend::init(WgpuOptions::low_memory()).unwrap();
+    let mut training = Training::new(&backend);
+    training.step(0, 0.0, &TrainOptions::default()).unwrap();
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn empty_batches_preserve_every_trainer_and_optimizer_history() {
+    let backend = backend();
+    for entry in 0..8 {
+        eprintln!("empty trainer {entry}");
+        let mut actual = Training::new(&backend);
+        let mut control = Training::new(&backend);
+        let opts = TrainOptions {
+            weight_decay: 0.5,
+            max_grad_norm: None,
+        };
+        actual.step(entry, 0.0, &opts).unwrap();
+        control.step(entry, 0.0, &opts).unwrap();
+        let before = actual.cpu.clone();
+        let adam = actual.adam.clone();
+        let sgd = actual.sgd.clone();
+        let timestep = actual.gpu_adam.t;
+        assert_eq!(
+            actual.step_batch(entry, &[], &[], None, 0, &opts).unwrap(),
+            0.0
+        );
+        assert_cpu_unchanged(&actual.cpu, &before);
+        assert_adam_unchanged(&actual.adam, &adam);
+        assert_sgd_unchanged(&actual.sgd, &sgd);
+        assert_eq!(actual.gpu_adam.t, timestep);
+        assert!(actual
+            .workspace
+            .download_grad_weights(&backend.device, &backend.queue, 0)
+            .unwrap()
+            .iter()
+            .all(|&x| x == 0.0));
+        assert!(actual
+            .workspace
+            .download_grad_bias(&backend.device, &backend.queue, 0)
+            .unwrap()
+            .iter()
+            .all(|&x| x == 0.0));
+        let mut downloaded = model(1.0);
+        let mut expected = model(1.0);
+        actual.gpu.sync_weights_to_cpu(&mut downloaded).unwrap();
+        control.gpu.sync_weights_to_cpu(&mut expected).unwrap();
+        assert_cpu_unchanged(&downloaded, &expected);
+        for (input, target) in [(&[0.0][..], &[][..]), (&[][..], &[0.0][..])] {
+            assert!(actual
+                .step_batch(entry, input, target, None, 0, &opts)
+                .is_err());
+        }
+        // A subsequent update observes private native moments and velocities.
+        actual.step(entry, 0.0, &opts).unwrap();
+        control.step(entry, 0.0, &opts).unwrap();
+        actual.gpu.sync_weights_to_cpu(&mut downloaded).unwrap();
+        control.gpu.sync_weights_to_cpu(&mut expected).unwrap();
+        assert_cpu_unchanged(&downloaded, &expected);
+    }
+}
+
+#[test]
+#[ignore = "Requires GPU adapter"]
+fn options_trainers_return_shape_errors_for_bad_masks() {
+    let backend = backend();
+    for entry in [2, 4, 7] {
+        let mut training = Training::new(&backend);
+        for (input, target, mask, batch) in [
+            (&[0.0][..], &[0.0][..], &[][..], 1),
+            (&[][..], &[][..], &[1.0][..], 0),
+        ] {
+            assert!(matches!(
+                training.step_batch(
+                    entry,
+                    input,
+                    target,
+                    Some(mask),
+                    batch,
+                    &TrainOptions::default()
+                ),
+                Err(arkan::ArkanError::ShapeMismatch { .. })
+            ));
+        }
     }
 }

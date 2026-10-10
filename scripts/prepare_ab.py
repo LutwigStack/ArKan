@@ -138,6 +138,8 @@ def expand_commands(vectors, profiles, commands):
         selected = command["profile"]
         if selected is not None:
             require(type(selected) is str and selected in profiles, "unknown profile")
+            require(not any(value.startswith("@") for value in argv[1:]),
+                    "response files are not allowed in profiled commands")
             profile = profiles[selected]
             options = {"-C": [], "--cfg": [], "--extern": []}
             i = 1

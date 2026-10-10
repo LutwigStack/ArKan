@@ -12,6 +12,7 @@
 //! Both optimizers use compute shaders to update weights directly on the GPU.
 
 use crate::error::{ArkanError, ArkanResult};
+use crate::gpu::pipeline::checked_workgroup_count;
 use crate::gpu::shaders::{ADAM_SHADER, SGD_SHADER};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -382,7 +383,12 @@ impl GpuAdam {
             ],
         });
 
-        let workgroups = (state.num_params as u32).div_ceil(OPTIMIZER_WORKGROUP_SIZE);
+        let workgroups = checked_workgroup_count(
+            &self.device,
+            state.num_params,
+            OPTIMIZER_WORKGROUP_SIZE as usize,
+        )
+        .expect("dispatch preflight");
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -393,6 +399,17 @@ impl GpuAdam {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
+    }
+
+    pub(crate) fn validate_dispatch(&self) -> ArkanResult<()> {
+        for state in self.weight_states.iter().chain(&self.bias_states) {
+            checked_workgroup_count(
+                &self.device,
+                state.num_params,
+                OPTIMIZER_WORKGROUP_SIZE as usize,
+            )?;
+        }
+        Ok(())
     }
 
     /// Increments timestep and performs Adam update for all network parameters.
@@ -424,6 +441,7 @@ impl GpuAdam {
                 &[layer_grads.len()],
             ));
         }
+        self.validate_dispatch()?;
         // Validate every layer before encoding any updates (or advancing Adam time).
         for (i, ((w, b), (gw, gb))) in layer_params.iter().zip(layer_grads).enumerate() {
             let expected = [
@@ -770,6 +788,17 @@ impl GpuSgd {
         })
     }
 
+    pub(crate) fn validate_dispatch(&self) -> ArkanResult<()> {
+        for state in self.weight_states.iter().chain(&self.bias_states) {
+            checked_workgroup_count(
+                &self.device,
+                state.num_params,
+                OPTIMIZER_WORKGROUP_SIZE as usize,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Performs one SGD update step.
     pub fn step(
         &mut self,
@@ -789,6 +818,7 @@ impl GpuSgd {
                 &[layer_grads.len()],
             ));
         }
+        self.validate_dispatch()?;
         // Validate every layer before encoding any updates (or advancing Adam time).
         for (i, ((w, b), (gw, gb))) in layer_params.iter().zip(layer_grads).enumerate() {
             let expected = [
@@ -857,8 +887,11 @@ impl GpuSgd {
                 ],
             });
 
-            let workgroups =
-                (self.weight_states[i].num_params as u32).div_ceil(OPTIMIZER_WORKGROUP_SIZE);
+            let workgroups = checked_workgroup_count(
+                &self.device,
+                self.weight_states[i].num_params,
+                OPTIMIZER_WORKGROUP_SIZE as usize,
+            )?;
 
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -909,8 +942,11 @@ impl GpuSgd {
                 ],
             });
 
-            let workgroups =
-                (self.bias_states[i].num_params as u32).div_ceil(OPTIMIZER_WORKGROUP_SIZE);
+            let workgroups = checked_workgroup_count(
+                &self.device,
+                self.bias_states[i].num_params,
+                OPTIMIZER_WORKGROUP_SIZE as usize,
+            )?;
 
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

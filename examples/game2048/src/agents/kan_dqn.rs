@@ -45,7 +45,7 @@ impl KanDqnAgent {
             .build()?;
 
         let policy_net = KanNetwork::new(config.clone());
-        let target_net = KanNetwork::new(config.clone());
+        let target_net = policy_net.clone();
         let workspace = Workspace::new(&config);
         let output = vec![0.0f32; 4];
 
@@ -138,8 +138,7 @@ impl KanDqnAgent {
             } else {
                 let next_state = &next_states[i * state_dim..(i + 1) * state_dim];
                 let next_q = self.get_target_q_values(next_state);
-                let max_next_q = next_q.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                reward + gamma * max_next_q
+                crate::utils::bellman_target(next_state, &next_q, reward, gamma)
             };
             
             targets[i * action_dim + action] = target_q;
@@ -204,5 +203,39 @@ impl super::Agent for KanDqnAgent {
 
     fn name(&self) -> &str {
         "KAN-DQN"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{game::Board, utils::board_to_onehot_inplace};
+
+    #[test]
+    fn initial_target_is_policy_snapshot() {
+        let agent = KanDqnAgent::new(0.0).unwrap();
+        for (policy, target) in agent.policy_net.layers.iter().zip(&agent.target_net.layers) {
+            assert_eq!(policy.weights, target.weights);
+            assert_eq!(policy.bias, target.bias);
+        }
+    }
+
+    #[test]
+    fn bellman_loss_excludes_board_preserving_actions() {
+        let mut agent = KanDqnAgent::new(0.0).unwrap();
+        for layer in agent.policy_net.layers.iter_mut().chain(&mut agent.target_net.layers) {
+            layer.weights.fill(0.0);
+            layer.bias.fill(0.0);
+        }
+        agent.target_net.layers.last_mut().unwrap().bias.copy_from_slice(&[100.0, 1.0, 2.0, 3.0]);
+        let mut board = Board::empty();
+        board.set(0, 0, 1);
+        board.set(0, 3, 2);
+        let mut state = [0.0; 256];
+        board_to_onehot_inplace(&board, &mut state);
+        assert_eq!(agent.train_batch(&state, &[1], &[0.0], &state, &[false], 1.0), 2.25);
+        assert_eq!(agent.train_batch(&state, &[1], &[2.0], &state, &[true], 1.0), 1.0);
+        board_to_onehot_inplace(&Board::empty(), &mut state);
+        assert_eq!(agent.train_batch(&state, &[1], &[2.0], &state, &[false], 1.0), 1.0);
     }
 }

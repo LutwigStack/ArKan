@@ -571,6 +571,8 @@ impl LBFGS {
     /// cannot change model parameters or topology. It retains `FnMut`: captured
     /// workspace, gradient buffers and external state may be mutated between calls.
     /// It may be called multiple times during line search; returning `Err` cancels the step.
+    /// With AMP, the closure returns the unscaled loss and scaled gradients. Gradients
+    /// are unscaled before numerical checks, convergence, line search and history updates.
     ///
     /// # Arguments
     ///
@@ -678,6 +680,7 @@ impl LBFGS {
         let evaluations = std::cell::Cell::new(0usize);
         let mut numerical_failure = false;
         let mut initial_loss = None;
+        let gradient_scale = self.config.safety.grad_scaling_factor;
         let result = (|| {
             let mut evaluate = |net: &KanNetwork| -> ArkanResult<LBFGSEvaluation> {
                 if evaluations.get() >= budget {
@@ -692,9 +695,14 @@ impl LBFGS {
                     return Ok(LBFGSEvaluation::RejectedNonFinite);
                 }
                 evaluations.set(evaluations.get() + 1);
-                let (loss, gradient) = closure(net)?;
+                let (loss, mut gradient) = closure(net)?;
                 initial_loss.get_or_insert(loss);
                 validate_shape(size, gradient.len())?;
+                if let Some(factor) = gradient_scale {
+                    for value in &mut gradient {
+                        *value = (f64::from(*value) / factor) as f32;
+                    }
+                }
                 if !loss.is_finite() || find_nan_in_grads(&gradient).is_some() {
                     return Ok(LBFGSEvaluation::RejectedNonFinite);
                 }

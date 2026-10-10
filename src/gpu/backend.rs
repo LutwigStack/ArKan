@@ -81,7 +81,8 @@ pub struct WgpuOptions {
     pub force_adapter_name: Option<String>,
     /// Required features.
     pub required_features: wgpu::Features,
-    /// Required limits (minimum).
+    /// Required limits (minimum). Initialization raises storage bindings and
+    /// workgroup invocations to ArKan's pipeline minimums (8 and 256).
     pub required_limits: wgpu::Limits,
     /// If true, use maximum limits supported by the adapter instead of required_limits.
     /// This allows using full GPU capabilities (e.g., larger buffers on desktop GPUs).
@@ -269,7 +270,8 @@ impl WgpuBackend {
     ///
     /// - `ArkanError::AdapterNotFound` - No suitable GPU adapter found.
     /// - `ArkanError::DeviceRequestFailed` - Failed to create device with requested limits.
-    pub fn init(options: WgpuOptions) -> ArkanResult<Self> {
+    /// - `ArkanError::UnsupportedLimits` - Adapter cannot support requested pipeline limits.
+    pub fn init(mut options: WgpuOptions) -> ArkanResult<Self> {
         // Create instance
         let backends = options.backend.unwrap_or(wgpu::Backends::all());
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -287,6 +289,21 @@ impl WgpuBackend {
             adapter_info.backend
         );
 
+        // All supported pipelines need eight storage bindings and 256 invocations.
+        options.required_limits.max_storage_buffers_per_shader_stage = options
+            .required_limits
+            .max_storage_buffers_per_shader_stage
+            .max(8);
+        options.required_limits.max_compute_workgroup_size_x = options
+            .required_limits
+            .max_compute_workgroup_size_x
+            .max(256);
+        options
+            .required_limits
+            .max_compute_invocations_per_workgroup = options
+            .required_limits
+            .max_compute_invocations_per_workgroup
+            .max(256);
         // Check limits
         let adapter_limits = adapter.limits();
         Self::check_limits(&adapter_limits, &options.required_limits)?;
@@ -414,6 +431,11 @@ impl WgpuBackend {
     }
 
     fn check_limits(adapter: &wgpu::Limits, required: &wgpu::Limits) -> ArkanResult<()> {
+        if !required.check_limits(adapter) {
+            return Err(ArkanError::unsupported_limits(
+                "Adapter cannot satisfy the requested ArKan compute pipeline limits",
+            ));
+        }
         // Check critical limits for compute
         if adapter.max_storage_buffer_binding_size < required.max_storage_buffer_binding_size {
             return Err(ArkanError::unsupported_limits(format!(

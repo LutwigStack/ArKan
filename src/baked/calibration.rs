@@ -174,19 +174,30 @@ impl BakedModel {
 
             // Per-output-channel weight quantization (WS02).
             // s_w[j] = 127 / max over (i,k) of |coeff[j, i, k]|
-            // Channels with all-zero weights get scale 1.0 (identity, avoids div-by-zero).
+            // Bias-only channels use their bias magnitude; only zero channels use scale 1.
             let s_act_l = s_act[l];
             let basis_scale = 32768.0f64; // Q0.15 basis scale
 
             // Compute per-channel max|w| and scales.
             let coeff_per_channel = in_dim * global_basis_size; // weights per output channel
             let mut s_w_per_channel = vec![1.0f32; out_dim];
-            for (s_w, chunk) in s_w_per_channel
+            for ((s_w, chunk), &bias) in s_w_per_channel
                 .iter_mut()
                 .zip(layer.weights.chunks_exact(coeff_per_channel))
+                .zip(&layer.bias)
             {
                 let max_w = chunk.iter().map(|w| w.abs()).fold(0.0f32, f32::max);
-                *s_w = if max_w > EPSILON { 127.0 / max_w } else { 1.0 };
+                let magnitude = if max_w > 0.0 { max_w } else { bias.abs() };
+                *s_w = if magnitude > 0.0 {
+                    127.0 / magnitude
+                } else {
+                    1.0
+                };
+                if !s_w.is_finite() || *s_w <= 0.0 {
+                    return Err(ArkanError::cpu(format!(
+                        "baked layer {l}: channel scale exceeds representation"
+                    )));
+                }
             }
 
             // Quantize weights using per-channel scale.
@@ -201,12 +212,16 @@ impl BakedModel {
             }
 
             // Bias per channel: q_bias[j] = round(b_j * s_w[j] * basis_scale)
-            let q_bias: Vec<i64> = layer
-                .bias
-                .iter()
-                .enumerate()
-                .map(|(j, &b)| (b as f64 * s_w_per_channel[j] as f64 * basis_scale).round() as i64)
-                .collect();
+            let mut q_bias = Vec::with_capacity(out_dim);
+            for (&bias, &scale) in layer.bias.iter().zip(&s_w_per_channel) {
+                let folded = (bias as f64 * scale as f64 * basis_scale).round();
+                if !folded.is_finite() || folded.abs() >= (1u64 << 63) as f64 {
+                    return Err(ArkanError::cpu(format!(
+                        "baked layer {l}: folded bias exceeds fixed-point range"
+                    )));
+                }
+                q_bias.push(folded as i64);
+            }
 
             // Per-channel requant: M_real[j] = s_act[l] / (s_w[j] * basis_scale)
             // Represent M_real[j] as M0[j] / 2^S[j] where M0[j] in [2^28, 2^29).
@@ -215,16 +230,20 @@ impl BakedModel {
             for &sw_j in &s_w_per_channel {
                 let sw_j = sw_j as f64;
                 let m_real = s_act_l as f64 / (sw_j * basis_scale);
-                let (m0, shift) = if m_real <= 0.0 || !m_real.is_finite() {
-                    (1i32, 0u32)
-                } else {
-                    let log2_m = m_real.log2().floor() as i32;
-                    let s = (28i32 - log2_m).clamp(0, 62) as u32;
-                    let m0_f = (m_real * (1u64 << s) as f64).round();
-                    let m0 = (m0_f as i64).clamp(1, (1i64 << 30) - 1) as i32;
-                    (m0, s)
-                };
-                requant_m0.push(m0);
+                if m_real <= 0.0 || !m_real.is_finite() {
+                    return Err(ArkanError::cpu(format!(
+                        "baked layer {l}: invalid requantization scale"
+                    )));
+                }
+                let log2_m = m_real.log2().floor() as i32;
+                let shift = (28i32 - log2_m).clamp(0, 62) as u32;
+                let m0 = (m_real * (1u64 << shift) as f64).round();
+                if !(1.0..=((1i64 << 30) - 1) as f64).contains(&m0) {
+                    return Err(ArkanError::cpu(format!(
+                        "baked layer {l}: requantization scale exceeds fixed-point range"
+                    )));
+                }
+                requant_m0.push(m0 as i32);
                 requant_shift.push(shift);
             }
 

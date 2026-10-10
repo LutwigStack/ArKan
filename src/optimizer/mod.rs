@@ -12,7 +12,7 @@
 //! - **Thread Safety**: All optimizers implement `Send + Sync`
 //! - **Versioning**: Support for dynamic topology (Grid Extension) via `bump_version()`
 //! - **NaN/Inf Handling**: Configurable behavior for numerical instability (NaN and ±inf)
-//! - **AMP Support**: Gradient scaling placeholders for mixed precision training
+//! - **AMP Support**: Gradient unscaling for mixed precision training
 //!
 //! # Example
 //!

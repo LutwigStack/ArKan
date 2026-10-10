@@ -46,7 +46,8 @@
 //! - Scalar fallback for non-aligned cases
 
 use crate::buffer::{Workspace, MAX_BUFFER_ELEMENTS};
-use crate::config::{KanConfig, EPSILON};
+use crate::config::{KanConfig, EPSILON, MAX_SPLINE_ORDER};
+use crate::math::spline::compute_derivative_factors;
 use crate::model::{LayerSpec, Normalization};
 use crate::spline::{
     compute_basis, compute_basis_and_deriv, compute_knots, find_span, SPAN_CLAMPED_FLAG,
@@ -880,6 +881,35 @@ impl KanLayer {
         self.bias.copy_from_slice(&params[w_end..]);
     }
 
+    /// Recompute exceptional input derivatives before any range-losing f32 narrowing.
+    fn wide_input_derivative(
+        &self,
+        x: f32,
+        span: usize,
+        in_idx: usize,
+        grad_output: &[f32],
+        derivs: &[f32],
+    ) -> Option<f32> {
+        if (1.0 / self.std[in_idx]).is_finite() && derivs.iter().all(|d| d.is_finite()) {
+            return None;
+        }
+        let mut factors = [0.0f64; MAX_SPLINE_ORDER];
+        compute_derivative_factors(x, span, &self.knots, self.order, &mut factors);
+        let mut derivative = 0.0f64;
+        for (out_idx, &g_out) in grad_output.iter().enumerate() {
+            if g_out == 0.0 {
+                continue;
+            }
+            let start = self.weight_index(out_idx, in_idx, span - self.order);
+            for (k, &factor) in factors.iter().take(self.order).enumerate() {
+                // Difference first makes a constant spline's derivative exactly zero.
+                let delta = self.weights[start + k + 1] as f64 - self.weights[start + k] as f64;
+                derivative += g_out as f64 * delta * factor;
+            }
+        }
+        Some((derivative / self.std[in_idx] as f64) as f32)
+    }
+
     /// Backward pass: computes gradients for weights, biases, and optionally inputs.
     ///
     /// # Arguments
@@ -966,25 +996,36 @@ impl KanLayer {
 
             for j in 0..self.out_dim {
                 let g_out = grad_output[grad_out_start + j];
-                // Masking safety: zero grad_output short-circuits
-                if g_out == 0.0 {
-                    continue;
+                if g_out != 0.0 {
+                    grad_bias[j] += g_out;
                 }
+            }
 
-                grad_bias[j] += g_out;
+            for i in 0..self.in_dim {
+                let stored_span = grid_indices[span_batch_start + i];
+                let span = span_of(stored_span);
+                let start_idx = span - self.order;
+                let basis_start = basis_batch_start + i * self.basis_aligned;
+                let clamped = stored_span & SPAN_CLAMPED_FLAG != 0;
+                let dz_dx = if clamped { 0.0 } else { 1.0 / self.std[i] };
+                let wide_deriv = if grad_input.is_some() && !clamped {
+                    self.wide_input_derivative(
+                        normalized_input[span_batch_start + i],
+                        span,
+                        i,
+                        &grad_output[grad_out_start..grad_out_start + self.out_dim],
+                        &deriv_slice[basis_start..basis_start + self.local_basis_size],
+                    )
+                } else {
+                    None
+                };
 
-                for i in 0..self.in_dim {
-                    let stored_span = grid_indices[span_batch_start + i];
-                    let span = span_of(stored_span);
-                    let start_idx = span - self.order;
-                    let basis_start = basis_batch_start + i * self.basis_aligned;
-                    // dz/dx for the *clamped* normalization: zero where the forward
-                    // pass saturated, so a saturated input reports no sensitivity.
-                    let dz_dx = if stored_span & SPAN_CLAMPED_FLAG != 0 {
-                        0.0
-                    } else {
-                        1.0 / self.std[i].max(EPSILON)
-                    };
+                for j in 0..self.out_dim {
+                    let g_out = grad_output[grad_out_start + j];
+                    // Masking safety: zero grad_output short-circuits.
+                    if g_out == 0.0 {
+                        continue;
+                    }
 
                     for k in 0..self.local_basis_size {
                         let weight_idx = self.weight_index(j, i, start_idx + k);
@@ -992,10 +1033,17 @@ impl KanLayer {
                         grad_weights[weight_idx] += g_out * basis_val;
 
                         if let Some(ref mut gi) = grad_input {
-                            let deriv = deriv_slice[basis_start + k];
-                            gi[span_batch_start + i] +=
-                                g_out * self.weights[weight_idx] * deriv * dz_dx;
+                            if !clamped && wide_deriv.is_none() {
+                                let deriv = deriv_slice[basis_start + k];
+                                gi[span_batch_start + i] +=
+                                    g_out * self.weights[weight_idx] * deriv * dz_dx;
+                            }
                         }
+                    }
+                }
+                if let Some(input_deriv) = wide_deriv {
+                    if let Some(ref mut gi) = grad_input {
+                        gi[span_batch_start + i] = input_deriv;
                     }
                 }
             }
@@ -1114,28 +1162,47 @@ impl KanLayer {
                 }
                 for j in 0..self.out_dim {
                     let g_out = grad_output[b * self.out_dim + j];
-                    if g_out == 0.0 {
-                        continue;
+                    if g_out != 0.0 {
+                        chunk.bias[j] += g_out;
                     }
-                    chunk.bias[j] += g_out;
-                    for i in 0..self.in_dim {
-                        let stored = grid_indices[input_offset + i];
-                        let start_idx = span_of(stored) - self.order;
-                        let basis_start = i * self.basis_aligned;
-                        let dz_dx = if stored & SPAN_CLAMPED_FLAG != 0 {
-                            0.0
-                        } else {
-                            1.0 / self.std[i].max(EPSILON)
-                        };
+                }
+                for i in 0..self.in_dim {
+                    let stored = grid_indices[input_offset + i];
+                    let start_idx = span_of(stored) - self.order;
+                    let basis_start = i * self.basis_aligned;
+                    let clamped = stored & SPAN_CLAMPED_FLAG != 0;
+                    let dz_dx = if clamped { 0.0 } else { 1.0 / self.std[i] };
+                    let wide_deriv = if gi.is_some() && !clamped {
+                        self.wide_input_derivative(
+                            normalized_input[input_offset + i],
+                            span_of(stored),
+                            i,
+                            &grad_output[b * self.out_dim..(b + 1) * self.out_dim],
+                            &chunk.derivs[basis_start..basis_start + self.local_basis_size],
+                        )
+                    } else {
+                        None
+                    };
+                    for j in 0..self.out_dim {
+                        let g_out = grad_output[b * self.out_dim + j];
+                        if g_out == 0.0 {
+                            continue;
+                        }
                         for k in 0..self.local_basis_size {
                             let weight_idx = self.weight_index(j, i, start_idx + k);
                             chunk.weights[weight_idx] += g_out * chunk.basis[basis_start + k];
                             if let Some(ref mut gi) = gi {
-                                gi[(b - first) * self.in_dim + i] += g_out
-                                    * self.weights[weight_idx]
-                                    * chunk.derivs[basis_start + k]
-                                    * dz_dx;
+                                if !clamped && wide_deriv.is_none() {
+                                    let deriv = chunk.derivs[basis_start + k];
+                                    gi[(b - first) * self.in_dim + i] +=
+                                        g_out * self.weights[weight_idx] * deriv * dz_dx;
+                                }
                             }
+                        }
+                    }
+                    if let Some(input_deriv) = wide_deriv {
+                        if let Some(ref mut gi) = gi {
+                            gi[(b - first) * self.in_dim + i] = input_deriv;
                         }
                     }
                 }

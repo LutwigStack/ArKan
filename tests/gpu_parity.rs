@@ -2009,8 +2009,26 @@ fn test_wgpu_options_variants() {
     println!("Default backend: {}", backend_default.adapter_info().name);
 
     // Test compute options
-    let backend_compute =
-        WgpuBackend::init(WgpuOptions::compute()).expect("Compute options failed");
+    let options = WgpuOptions::compute();
+    let supported = options
+        .required_limits
+        .check_limits(&backend_default.adapter.limits());
+    let backend_compute = match WgpuBackend::init(options) {
+        Ok(backend) => {
+            assert!(supported);
+            backend
+        }
+        Err(arkan::ArkanError::UnsupportedLimits(_)) if !supported => {
+            WgpuBackend::init(WgpuOptions::low_memory()).expect("Low-memory options failed")
+        }
+        Err(error) => panic!("Unexpected compute initialization failure: {error}"),
+    };
+    let mut impossible = backend_default.limits().clone();
+    impossible.max_compute_workgroups_per_dimension = u32::MAX;
+    assert!(matches!(
+        WgpuBackend::init(WgpuOptions::with_limits(impossible)),
+        Err(arkan::ArkanError::UnsupportedLimits(_))
+    ));
     println!("Compute backend: {}", backend_compute.adapter_info().name);
 
     // Both should work

@@ -259,34 +259,16 @@ pub(super) fn eval_basis_fixed(order: usize, t_q16: u32, out: &mut [u16]) {
 /// `q_z` must already be clamped to `[q_rmin, q_rmax]`. Returns `(span, t_q16)`
 /// with `span <= grid_size - 1` and `t_q16 <= 65535`.
 ///
-/// # Both upper clamps are load-bearing, NOT dead code
-///
-/// At the top of the grid range `q_z_off` is an exact (or near-exact) multiple of
-/// `h_q16`, so `span_raw` reaches `grid_size`:
-/// - `grid_range = (-3, 3)`, G=5 (library default): `q_z_off = 393215 = 5 * 78643`
-/// - `grid_range = (-1, 1)`, G=5 (every baked test): `q_z_off = 131071`, `h_q16 = 26214`
-///
-/// Unclamped, `start_idx + order == global_basis_size`, so the weight read in
-/// [`BakedModel::forward`](crate::baked::BakedModel::forward) runs one element past each `(j, i)` weight block — a
-/// cross-channel read for every block but the last, and a genuine out-of-bounds
-/// index for the last one (verified: `index out of bounds: the len is 48 but the
-/// index is 48`). The `- 1` in `q_rmax` does not prevent it, so the span clamp is
-/// memory safety, not tidiness.
-///
-/// Clamping the span down then leaves `t_rem == h_q16` (or a hair above), so
-/// `t_q16` reaches 65536 / 65538 for those two configs (and ~131072 for a narrow
-/// range with a large grid). The second clamp keeps `eval_basis_fixed` inside its
-/// documented `[0, 65535]` domain, where its closed forms are valid.
-///
-/// `test_span_t_clamps_fire_at_grid_top` pins both.
+/// Use the whole extent: rounding each interval separately accumulates grid drift.
+/// Widen before adding the exclusive upper tick, which may exceed i32::MAX.
 #[inline]
-pub(super) fn extract_span_t(q_z: i32, q_rmin: i32, h_q16: i32, grid_size: usize) -> (usize, u32) {
-    // q_z_off = (z - r_min) * 65536 = position above grid start in Q16 z-units.
-    // Always >= 0 because the caller clamped q_z to [q_rmin, q_rmax].
-    let q_z_off = i64::from(q_z) - i64::from(q_rmin);
-    let h = h_q16 as i64; // one grid interval in Q16 z-units, >= 1 by construction
-    let span = (q_z_off / h).clamp(0, grid_size as i64 - 1) as usize;
-    let t_rem = q_z_off - span as i64 * h;
-    let t_q16 = ((t_rem * 65536) / h).clamp(0, 65535) as u32;
+pub(super) fn extract_span_t(q_z: i32, q_rmin: i32, q_rmax: i32, grid_size: usize) -> (usize, u32) {
+    let extent = i64::from(q_rmax) + 1 - i64::from(q_rmin);
+    // The quantized-grid single-tick fallback has extent 1 and zero offset.
+    // Validated grids have G <= 64, so even the full i32 range times G * 65536 fits i64.
+    let position = (i64::from(q_z) - i64::from(q_rmin)) * grid_size as i64;
+    let span = (position / extent).clamp(0, grid_size as i64 - 1) as usize;
+    let remainder = position - span as i64 * extent;
+    let t_q16 = ((remainder * 65536) / extent).clamp(0, 65535) as u32;
     (span, t_q16)
 }

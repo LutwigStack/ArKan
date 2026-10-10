@@ -203,7 +203,7 @@ impl HeuristicAgent {
         let mut best_score = f32::NEG_INFINITY;
         let mut best_action = 0;
 
-        for (i, &dir) in directions.iter().enumerate() {
+        for &dir in &directions {
             let mut test_game = game.clone();
             let (_, changed) = test_game.make_move(dir);
             
@@ -211,7 +211,7 @@ impl HeuristicAgent {
                 let score = self.evaluate(&test_game);
                 if score > best_score {
                     best_score = score;
-                    best_action = i;
+                    best_action = dir as usize;
                 }
             }
         }
@@ -227,5 +227,27 @@ impl super::Agent for HeuristicAgent {
 
     fn name(&self) -> &str {
         "Heuristic"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::Board;
+
+    #[test]
+    fn corner_lookahead_returns_the_direction_it_evaluated() {
+        let mut board = Board::empty();
+        board.set(0, 3, 14);
+        board.set(1, 3, 1);
+        let game = Game { board, score: 0, game_over: false };
+        let agent = HeuristicAgent::new();
+        for _ in 0..16 {
+            let action = agent.best_action(&game);
+            assert_eq!(Direction::from_index(action), Direction::Left);
+            let mut moved = game.clone();
+            assert!(moved.make_move(Direction::from_index(action)).1);
+            assert_ne!(moved.board.0, board.0);
+        }
     }
 }

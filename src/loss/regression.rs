@@ -1,7 +1,5 @@
 //! Regression losses and fit metrics.
 
-use super::*;
-
 /// Masked Mean Squared Error loss.
 ///
 /// Computes MSE only for positions where `mask > 0`.
@@ -39,8 +37,8 @@ pub fn masked_mse(predictions: &[f32], targets: &[f32], mask: Option<&[f32]>) ->
 /// Masked MSE and its output derivative in a caller-owned buffer.
 ///
 /// All lengths must match. Invalid shapes return an error before modifying
-/// `gradient`; inactive positions are always cleared. Normalization uses the
-/// same reciprocal multiplication as the network training path.
+/// `gradient`; inactive positions are always cleared. Weighted sums and
+/// normalization use f64 before the final loss and derivative are narrowed.
 pub fn masked_mse_into(
     predictions: &[f32],
     targets: &[f32],
@@ -67,26 +65,25 @@ pub(super) fn masked_mse_impl(
             return Err(crate::ArkanError::shape_mismatch(&[n], &[actual]));
         }
     }
-    let mut loss = 0.0;
-    let mut count = 0.0;
+    let count = (0..n)
+        .map(|index| f64::from(mask.map_or(1.0, |mask| mask[index])))
+        .filter(|&weight| weight > 0.0)
+        .sum::<f64>();
+    let mut loss = 0.0f64;
     gradient.fill(0.0);
-    for index in 0..n {
-        let weight = mask.map_or(1.0, |mask| mask[index]);
-        if weight > 0.0 {
-            let difference = predictions[index] - targets.map_or(0.0, |targets| targets[index]);
-            loss += weight * difference * difference;
-            gradient[index] = 2.0 * weight * difference;
-            count += weight;
-        }
-    }
     if count > 0.0 {
-        let inverse = 1.0 / count;
-        loss *= inverse;
-        for value in gradient {
-            *value *= inverse;
+        for index in 0..n {
+            let weight = f64::from(mask.map_or(1.0, |mask| mask[index]));
+            if weight > 0.0 {
+                let difference = f64::from(predictions[index])
+                    - f64::from(targets.map_or(0.0, |targets| targets[index]));
+                let normalized_weight = weight / count;
+                loss += normalized_weight * difference * difference;
+                gradient[index] = (2.0 * normalized_weight * difference) as f32;
+            }
         }
     }
-    Ok(loss)
+    Ok(loss as f32)
 }
 
 /// Huber loss (smooth L1) for robust training.
@@ -301,29 +298,26 @@ pub fn r_squared(predictions: &[f32], targets: &[f32]) -> f32 {
         return 0.0;
     }
 
-    let n = predictions.len() as f32;
+    let n = predictions.len() as f64;
 
-    // Mean of targets
-    let mean: f32 = targets.iter().sum::<f32>() / n;
-
-    // SS_tot = sum((y - mean)^2)
-    let ss_tot: f32 = targets.iter().map(|&y| (y - mean).powi(2)).sum();
-
-    // SS_res = sum((y - pred)^2)
-    let ss_res: f32 = predictions
+    let mean = targets.iter().map(|&target| f64::from(target)).sum::<f64>() / n;
+    let ss_tot = targets
+        .iter()
+        .map(|&target| (f64::from(target) - mean).powi(2))
+        .sum::<f64>();
+    let ss_res = predictions
         .iter()
         .zip(targets.iter())
-        .map(|(&p, &t)| (t - p).powi(2))
-        .sum();
+        .map(|(&prediction, &target)| (f64::from(target) - f64::from(prediction)).powi(2))
+        .sum::<f64>();
 
-    if ss_tot < EPSILON {
-        // All targets are the same
-        if ss_res < EPSILON {
-            1.0 // Perfect prediction of constant
+    if ss_tot == 0.0 {
+        if ss_res == 0.0 {
+            1.0
         } else {
             0.0
         }
     } else {
-        1.0 - ss_res / ss_tot
+        (1.0 - ss_res / ss_tot) as f32
     }
 }

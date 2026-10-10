@@ -84,7 +84,7 @@ pub struct BakedLayer {
     /// Quantized grid range upper bound: round(r_max * 2^16) - 1.
     pub q_rmax: i32,
     /// One span interval in Q16 units of z: round(65536 * (r_max - r_min) / G).
-    /// Used to extract span and t from the Q15.16 z value.
+    /// Retained as wire metadata; inference uses the whole quantized extent.
     pub h_q16: i32,
     /// Per-input normalization mean (stored for entry-layer f32 normalization).
     pub mean: Vec<f32>,
@@ -891,139 +891,57 @@ mod tests {
 
     #[test]
     fn test_fixed_span_exact_boundary_values() {
-        // Literal interval/fraction pins: h=3 gives thirds 21845 and 43690.
-        // Include both saturation edges, wide offsets, and a negative q_z whose
-        // offset is positive. No second implementation is used as the oracle.
+        // Literal whole-range coordinates, including thirds and the 95-tick regression.
         let cases: &[(i32, i32, i32, usize, usize, u32)] = &[
-            (-11, -10, 3, 5, 0, 0),
-            (-10, -10, 3, 5, 0, 0),
-            (-9, -10, 3, 5, 0, 21845),
-            (-8, -10, 3, 5, 0, 43690),
-            (-7, -10, 3, 5, 1, 0),
-            (-6, -10, 3, 5, 1, 21845),
-            (-5, -10, 3, 5, 1, 43690),
-            (-4, -10, 3, 5, 2, 0),
-            (-3, -10, 3, 5, 2, 21845),
-            (-2, -10, 3, 5, 2, 43690),
-            (-1, -10, 3, 5, 3, 0),
-            (0, -10, 3, 5, 3, 21845),
-            (1, -10, 3, 5, 3, 43690),
-            (2, -10, 3, 5, 4, 0),
-            (3, -10, 3, 5, 4, 21845),
-            (4, -10, 3, 5, 4, 43690),
-            (5, -10, 3, 5, 4, 65535),
-            (6, -10, 3, 5, 4, 65535),
-            (2, 0, 3, 1, 0, 43690),
-            (3, 0, 3, 1, 0, 65535),
-            (63, 0, 1, 64, 63, 0),
-            (64, 0, 1, 64, 63, 65535),
-            (65, 0, 1, 64, 63, 65535),
-            (65536, 0, 1, 64, 63, 65535),
-            (4128767, 0, 65536, 64, 62, 65535),
-            (4128768, 0, 65536, 64, 63, 0),
-            (4128769, 0, 65536, 64, 63, 1),
-            (4194303, 0, 65536, 64, 63, 65535),
-            (4194304, 0, 65536, 64, 63, 65535),
-            (4194305, 0, 65536, 64, 63, 65535),
-            (196607, -196608, 78643, 5, 4, 65535),
-            (65535, -65536, 26214, 5, 4, 65535),
-            (i32::MIN, i32::MIN, 1, 64, 0, 0),
-            (i32::MAX, i32::MAX, i32::MAX, 1, 0, 0),
-            (i32::MIN, i32::MAX, 1, 64, 0, 0),
-            (i32::MIN, i32::MAX, i32::MAX, 64, 0, 0),
-            (i32::MAX, i32::MIN, 1, 1, 0, 65535),
-            (i32::MAX, i32::MIN, 1, 64, 63, 65535),
-            (i32::MAX, i32::MIN, i32::MAX, 1, 0, 65535),
-            (i32::MAX, i32::MIN, i32::MAX, 64, 2, 0),
-            (2147483646, 0, i32::MAX, 64, 0, 65535),
-            (i32::MAX, 0, i32::MAX, 64, 1, 0),
-            (i32::MAX, -1, i32::MAX, 64, 1, 0),
+            (-11, -10, 4, 5, 0, 0),
+            (-10, -10, 4, 5, 0, 0),
+            (-9, -10, 4, 5, 0, 21845),
+            (-8, -10, 4, 5, 0, 43690),
+            (-7, -10, 4, 5, 1, 0),
+            (2, -10, 4, 5, 4, 0),
+            (3, -10, 4, 5, 4, 21845),
+            (4, -10, 4, 5, 4, 43690),
+            (5, -10, 4, 5, 4, 65535),
+            (6, -10, 4, 5, 4, 65535),
+            (64, 0, 94, 64, 43, 7588),
+            (94, 0, 94, 64, 63, 21385),
+            (95, 0, 94, 64, 63, 65535),
+            (196607, -196608, 196607, 5, 4, 65535),
+            (65535, -65536, 65535, 5, 4, 65533),
+            (i32::MIN, i32::MIN, i32::MAX, 64, 0, 0),
+            (0, i32::MIN, i32::MAX, 64, 32, 0),
+            (i32::MAX, i32::MIN, i32::MAX, 64, 63, 65535),
+            (i32::MAX, i32::MAX, i32::MAX, 64, 0, 0),
+            (0, 0, 0, 64, 0, 0),
         ];
-        for &(q_z, q_rmin, h_q16, grid_size, expected_span, expected_t) in cases {
+        for &(q_z, q_rmin, q_rmax, grid_size, expected_span, expected_t) in cases {
             assert_eq!(
-                extract_span_t(q_z, q_rmin, h_q16, grid_size),
+                extract_span_t(q_z, q_rmin, q_rmax, grid_size),
                 (expected_span, expected_t),
-                "q_z={q_z}, q_rmin={q_rmin}, h={h_q16}, grid={grid_size}"
+                "q_z={q_z}, range=({q_rmin},{q_rmax}), grid={grid_size}"
             );
         }
     }
 
-    /// The upper clamps in `extract_span_t` look provably dead and are not: they
-    /// are the only thing keeping the weight read in `forward` in bounds.
-    ///
-    /// Pins the pre-clamp values (so the "can't happen" reading stays falsified)
-    /// *and* the post-clamp invariants, so a rewrite that drops either clamp fails
-    /// here instead of reading past `weights_i8`.
     #[test]
     fn test_span_t_clamps_fire_at_grid_top() {
-        let grid_size = 5;
-        let order = 3;
-        // (grid_range, expected h_q16, expected pre-clamp t_q16)
-        let cases: [((f32, f32), i32, i64); 2] = [
-            ((-3.0, 3.0), 78643, 65536), // library default KanConfig
-            ((-1.0, 1.0), 26214, 65538), // every baked test in this crate
-        ];
-
-        for (range, want_h_q16, want_t_q16_raw) in cases {
-            let network = make_network_ranged(range, grid_size, order);
+        for range in [(-3.0, 3.0), (-1.0, 1.0), (0.0, 95.0 / 65536.0)] {
+            let grid_size = 64;
+            let network = make_network_ranged(range, grid_size, 3);
             let baked = BakedModel::from_network(&network, None);
             let l = &baked.layers[0];
-            assert_eq!(l.h_q16, want_h_q16, "grid_range={range:?}: h_q16");
-
-            // Extreme input: z pinned at the very top of the grid range.
-            let q_z_off = (l.q_rmax - l.q_rmin) as i64;
-            let h = l.h_q16 as i64;
-
-            // (1) Pre-clamp span reaches grid_size, and the weight index it would
-            //     produce for the last (j, i) block is out of bounds. If this ever
-            //     stops holding, the test below guards nothing and must be revisited
-            //     rather than deleted.
-            let span_raw = q_z_off / h;
+            // The exclusive endpoint would select span G and fraction 65536
+            // after the span clamp. Both must stay inside the coefficient domain.
             assert_eq!(
-                span_raw, grid_size as i64,
-                "grid_range={range:?}: span_raw must reach grid_size (q_z_off={q_z_off}, h={h})"
+                extract_span_t(l.q_rmax + 1, l.q_rmin, l.q_rmax, grid_size),
+                (grid_size - 1, 65535)
             );
-            assert_eq!(
-                span_raw as usize + order,
-                l.global_basis_size,
-                "grid_range={range:?}: unclamped start_idx+order must equal global_basis_size"
-            );
-            let unclamped_w_idx = ((l.out_dim - 1) * l.in_dim + (l.in_dim - 1))
-                * l.global_basis_size
-                + span_raw as usize
-                + order;
-            assert!(
-                unclamped_w_idx >= l.weights_i8.len(),
-                "grid_range={range:?}: unclamped weight index {unclamped_w_idx} must be out of \
-                 bounds of weights_i8 (len {})",
-                l.weights_i8.len()
-            );
-
-            // (2) Once span is clamped down, t_rem reaches h_q16, so t_q16 leaves the
-            //     [0, 65535] domain that eval_basis_fixed's closed forms assume.
-            let t_rem = q_z_off - (grid_size as i64 - 1) * h;
-            assert_eq!(
-                (t_rem * 65536) / h,
-                want_t_q16_raw,
-                "grid_range={range:?}: pre-clamp t_q16"
-            );
-
-            // (3) The invariants a refactor must preserve.
-            let (span, t_q16) = extract_span_t(l.q_rmax, l.q_rmin, l.h_q16, grid_size);
-            assert!(
-                span < grid_size,
-                "grid_range={range:?}: span {span} exceeds grid_size-1 ({})",
-                grid_size - 1
-            );
-            assert!(
-                t_q16 <= 65535,
-                "grid_range={range:?}: t_q16 {t_q16} exceeds 65535"
-            );
-
-            // (4) Black-box: forward at an input that saturates the grid range must
-            //     not read out of bounds.
-            let mut out = vec![0.0f32; 2];
+            let (span, t) = extract_span_t(l.q_rmax, l.q_rmin, l.q_rmax, grid_size);
+            assert!(span + l.order < l.global_basis_size);
+            assert!(t <= 65535);
+            let mut out = [0.0; 2];
             baked.forward(&[1e9, 1e9, 1e9], &mut out);
+            assert!(out.iter().all(|v| v.is_finite()));
         }
     }
 

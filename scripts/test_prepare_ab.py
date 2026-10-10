@@ -129,6 +129,17 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(list(self.output.iterdir()), [marker])
         self.unchanged()
 
+    def test_feature_free_profile_rejects_rustc_response_file(self):
+        response = self.root / "unexpected-feature.args"
+        response.write_text('--cfg\nfeature="unexpected"\n')
+        recipe = copy.deepcopy(self.recipe)
+        recipe["profiles"] = dict(none=dict(codegen=[], features=[], externs=[]))
+        recipe["commands"][0].update(
+            profile="none", argv_parts=[["/qualified/rustc", "--print", "cfg", "@" + str(response)]])
+        self.refused(recipe)
+        self.assertFalse(self.output.exists())
+        self.assertEqual(response.read_text(), '--cfg\nfeature="unexpected"\n')
+
     def test_reject_preimage_duplicate_token_unknown_fields_and_profiles(self):
         mutations = [
             lambda r: r["overlays"][0].update(preimage_sha256="0" * 64),

@@ -2,7 +2,7 @@
 //!
 //! This module provides compute pipeline creation and management for GPU operations.
 
-use crate::error::ArkanResult;
+use crate::error::{ArkanError, ArkanResult};
 use crate::gpu::layer::GpuLayer;
 use crate::gpu::shaders;
 use std::collections::HashMap;
@@ -881,6 +881,24 @@ impl std::fmt::Debug for PipelineCache {
 #[inline]
 pub fn workgroup_count(total: usize, workgroup_size: usize) -> u32 {
     total.div_ceil(workgroup_size) as u32
+}
+
+/// Checks shader indexing and one-dimensional dispatch before any queue mutation.
+pub(crate) fn checked_workgroup_count(
+    device: &wgpu::Device,
+    total: usize,
+    size: usize,
+) -> ArkanResult<u32> {
+    let groups = total.div_ceil(size);
+    if total > u32::MAX as usize
+        || groups > device.limits().max_compute_workgroups_per_dimension as usize
+    {
+        return Err(ArkanError::unsupported_limits(
+            "GPU one-dimensional dispatch exceeds device or u32 indexing limits",
+        ));
+    }
+    u32::try_from(groups)
+        .map_err(|_| ArkanError::unsupported_limits("GPU dispatch count exceeds u32"))
 }
 
 /// Default workgroup size for compute shaders.

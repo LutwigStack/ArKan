@@ -106,7 +106,7 @@ impl BakedModel {
             // Span and basis depend on the input, and are shared by all outputs.
             for i in 0..in_dim {
                 let q_z = act_a[i].clamp(layer.q_rmin, layer.q_rmax);
-                let (span, t) = extract_span_t(q_z, layer.q_rmin, layer.h_q16, grid_size);
+                let (span, t) = extract_span_t(q_z, layer.q_rmin, layer.q_rmax, grid_size);
                 spans[i] = span;
                 eval_basis_fixed(order, t, &mut bases[i][..local_basis_size]);
             }
