@@ -53,6 +53,22 @@ no qualified latency result. The change is adopted for the allocation reduction
 above; it makes no speedup promise. The benchmark remains available to reproduce
 the whole-step workload.
 
+A separate optimizer change omits the second finite-gradient scan for validated
+AMP factors at least `1.0`: dividing finite f32 values by a finite factor at least
+one cannot overflow the f32 result. With finite checking enabled, this avoids
+`P` additional `is_finite` checks and a logical `4 * P`-byte traversal, where `P`
+is the total number of weight and bias gradient coefficients. This is an
+operation-count reduction, not measured memory bandwidth or a latency claim.
+`None` already skipped that scan; with both safety checks disabled, the old
+helper already performed no per-element finite scan. Factors below one retain
+the post-unscale check. Matched debug/release optimizer suites and the permanent
+regression cover neighboring factors around one, large factors, signed zeros,
+subnormals, explicit unscale parity and tiny-factor strict/skip rollback.
+
+A combined allocation proposal was rejected because matched release results
+differed in NaN payload bits. Its memory savings were not adopted; only the
+independently qualified optimizer guard above was retained.
+
 GPU training uses `BatchSize::PerIteration`: each reset of the shared GPU model
 finishes before its measured step. `SmallInput` would run multiple setup closures
 before multiple routines and therefore reset the shared device model only before

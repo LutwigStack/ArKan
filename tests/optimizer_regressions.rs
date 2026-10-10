@@ -1529,3 +1529,139 @@ fn amp_identity_late_rejection_preserves_warmed_parameters_state_and_inputs() {
         "SGD update or state",
     );
 }
+
+fn amp_check_nonexpanding_unscale<O: Optimizer>(
+    make: impl Fn(&KanNetwork, SafetyConfig) -> O,
+    snapshot: impl Fn(&O) -> AmpOptimizerSnapshot,
+) {
+    let values = [
+        0.25,
+        -0.5,
+        0.0,
+        -0.0,
+        f32::from_bits(1),
+        -f32::from_bits(1),
+        f32::MIN_POSITIVE,
+        f32::MAX,
+        -f32::MAX,
+    ];
+    for factor in [
+        f64::from_bits(1.0f64.to_bits() - 1),
+        1.0,
+        f64::from_bits(1.0f64.to_bits() + 1),
+        1024.0,
+        f64::MAX,
+    ] {
+        let mut actual = network(true);
+        let mut reference = actual.clone();
+        let (mut weights, mut biases) = gradients(&actual);
+        for (index, value) in weights.iter_mut().chain(&mut biases).flatten().enumerate() {
+            *value = values[index % values.len()];
+        }
+        let original = amp_gradient_snapshot(&weights, &biases);
+        let unscale = |tensors: &[Vec<f32>]| -> Vec<Vec<f32>> {
+            tensors
+                .iter()
+                .map(|tensor| {
+                    tensor
+                        .iter()
+                        .map(|&value| (f64::from(value) / factor) as f32)
+                        .collect()
+                })
+                .collect()
+        };
+        let reference_weights = unscale(&weights);
+        let reference_biases = unscale(&biases);
+        let plain_safety = SafetyConfig::strict();
+        let mut scaled = make(
+            &actual,
+            SafetyConfig {
+                grad_scaling_factor: Some(factor),
+                ..plain_safety
+            },
+        );
+        let mut plain = make(&reference, plain_safety);
+        for _ in 0..2 {
+            scaled
+                .step(&mut actual, &weights, &biases, Some(0.25))
+                .unwrap();
+            plain
+                .step(
+                    &mut reference,
+                    &reference_weights,
+                    &reference_biases,
+                    Some(0.25),
+                )
+                .unwrap();
+            assert_eq!(amp_model_snapshot(&actual), amp_model_snapshot(&reference));
+            let mut scaled_state = snapshot(&scaled);
+            assert_eq!(scaled_state.1 .1, Some(factor.to_bits()));
+            scaled_state.1 .1 = None;
+            assert_eq!(scaled_state, snapshot(&plain));
+            assert_eq!(scaled.get_state_version(), plain.get_state_version());
+            assert_eq!(amp_gradient_snapshot(&weights, &biases), original);
+        }
+    }
+    for factor in [f64::MIN_POSITIVE, f64::from_bits(1)] {
+        for skip in [false, true] {
+            let mut model = network(true);
+            let (mut weights, biases) = gradients(&model);
+            let mut optimizer = make(
+                &model,
+                SafetyConfig {
+                    grad_scaling_factor: Some(factor),
+                    skip_step_on_nan: skip,
+                    ..SafetyConfig::strict()
+                },
+            );
+            // Warm public optimizer state with a valid zero gradient first.
+            optimizer.step(&mut model, &weights, &biases, None).unwrap();
+            weights[0][0] = 1.0;
+            let model_before = amp_model_snapshot(&model);
+            let state_before = snapshot(&optimizer);
+            let version_before = optimizer.get_state_version();
+            let inputs_before = amp_gradient_snapshot(&weights, &biases);
+            let result = optimizer.step(&mut model, &weights, &biases, None);
+            if skip {
+                result.unwrap();
+            } else {
+                match result.unwrap_err() {
+                    ArkanError::NaNEncountered {
+                        param_index,
+                        context,
+                    } => {
+                        assert_eq!(param_index, 0);
+                        assert_eq!(context, "unscaled gradient");
+                    }
+                    other => panic!("unexpected unscale error: {other}"),
+                }
+            }
+            assert_eq!(amp_model_snapshot(&model), model_before);
+            assert_eq!(snapshot(&optimizer), state_before);
+            assert_eq!(optimizer.get_state_version(), version_before);
+            assert_eq!(amp_gradient_snapshot(&weights, &biases), inputs_before);
+        }
+    }
+}
+
+#[test]
+fn amp_nonexpanding_unscale_matches_explicit_gradients_and_tiny_factors_stay_atomic() {
+    amp_check_nonexpanding_unscale(
+        |model, safety| Adam::new(model, AdamConfig::default().with_safety(safety)),
+        amp_adam_snapshot,
+    );
+    amp_check_nonexpanding_unscale(
+        |model, safety| {
+            SGD::new(
+                model,
+                SGDConfig {
+                    momentum: 0.5,
+                    nesterov: true,
+                    ..SGDConfig::default()
+                }
+                .with_safety(safety),
+            )
+        },
+        amp_sgd_snapshot,
+    );
+}

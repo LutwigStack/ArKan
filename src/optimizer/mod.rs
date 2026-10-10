@@ -417,7 +417,8 @@ fn prepare_gradients<'a>(
     };
     let mut wg = unscale(weights);
     let mut bg = unscale(biases);
-    if safety.grad_scaling_factor.is_some() {
+    // Finite f32 gradients cannot overflow when divided by a finite factor >= 1.
+    if matches!(safety.grad_scaling_factor, Some(factor) if factor < 1.0) {
         for tensor in wg.iter().chain(bg.iter()) {
             if check_finite(tensor, safety, "unscaled gradient")? {
                 return Ok(None);
