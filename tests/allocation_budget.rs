@@ -115,6 +115,36 @@ fn entropy_is_allocation_free() {
     }
 }
 
+fn pde_allocates_only_its_returned_gradient() {
+    let residuals = [1.0, -2.0, 0.5, -0.0, 0.0, 0.25, -0.75];
+    let before = residuals.map(f32::to_bits);
+    let control = measure(|| {});
+    let mut result = None;
+    let counts = measure(|| {
+        result = Some(black_box(arkan::loss::pde_residual_loss(
+            black_box(&residuals),
+            None,
+        )));
+    });
+    let classes: [usize; 3] = std::array::from_fn(|i| CLASSES[i].load(Ordering::Relaxed));
+    let (loss, gradient) = result.unwrap();
+    assert!(loss.is_finite());
+    assert_eq!((gradient.len(), gradient.capacity()), (7, 7));
+    assert_eq!(residuals.map(f32::to_bits), before);
+    drop(gradient);
+    let empty = measure(|| {
+        black_box(arkan::loss::pde_residual_loss(black_box(&[]), None));
+    });
+    println!(
+        "PDE n=7 requests={} bytes={} classes={classes:?}",
+        counts.0, counts.1
+    );
+    assert_eq!(control, (0, 0));
+    assert_eq!(counts, (1, 28), "PDE must not allocate zero targets");
+    assert_eq!(classes, [0, 1, 0]);
+    assert_eq!(empty, (0, 0));
+}
+
 fn net(batch: usize) -> (KanNetwork, KanConfig) {
     let config = KanConfig {
         input_dim: 8,
@@ -402,6 +432,7 @@ fn try_create_workspace_does_not_panic_on_a_valid_config() {
 #[test]
 fn allocation_budget() {
     entropy_is_allocation_free();
+    pde_allocates_only_its_returned_gradient();
     inference_is_allocation_free();
     train_step_is_allocation_free();
     optimizer_step_is_allocation_free();

@@ -209,19 +209,21 @@ pub fn entropy_regularization_gradient(coefficients: &[f32], group_size: usize) 
         let sum = group.iter().map(|c| c * c).sum::<f32>() + EPSILON;
         let mean_derivative = group
             .iter()
-            .map(|c| {
+            .zip(output.iter_mut())
+            .map(|(c, derivative)| {
                 let p = c * c / sum;
                 if p > EPSILON {
-                    -p * (p.ln() + 1.0)
+                    let log_term = p.ln() + 1.0;
+                    *derivative = -log_term;
+                    -p * log_term
                 } else {
+                    *derivative = 0.0;
                     0.0
                 }
             })
             .sum::<f32>();
         for (&c, g) in group.iter().zip(output) {
-            let p = c * c / sum;
-            let derivative = if p > EPSILON { -(p.ln() + 1.0) } else { 0.0 };
-            *g = 2.0 * c / sum * (derivative - mean_derivative) / groups as f32;
+            *g = 2.0 * c / sum * (*g - mean_derivative) / groups as f32;
         }
     }
     gradient
@@ -496,7 +498,8 @@ pub fn kan_regularization_gradient(
 /// let (loss, grad) = pde_residual_loss(&residuals, None);
 /// ```
 pub fn pde_residual_loss(residuals: &[f32], mask: Option<&[f32]>) -> (f32, Vec<f32>) {
-    // PDE residual loss is essentially MSE with target = 0
-    let zeros = vec![0.0f32; residuals.len()];
-    masked_mse(residuals, &zeros, mask)
+    let mut gradient = vec![0.0; residuals.len()];
+    let loss = super::regression::masked_mse_impl(residuals, None, mask, &mut gradient)
+        .expect("masked_mse: incompatible prediction, target or mask lengths");
+    (loss, gradient)
 }

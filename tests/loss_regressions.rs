@@ -1,5 +1,72 @@
 use arkan::loss::*;
 
+#[test]
+fn pde_residual_preserves_weighted_mse_and_signed_zero() {
+    let residuals = [1.0, -2.0, f32::NAN, f32::INFINITY];
+    let before = residuals.map(f32::to_bits);
+    let mask = [0.5, 1.5, 0.0, -1.0];
+    let (loss, gradient) = pde_residual_loss(&residuals, Some(&mask));
+    // (.5 * 1 + 1.5 * 4) / 2; gradients 2 * mask * residual / 2.
+    assert_eq!(loss.to_bits(), 3.25f32.to_bits());
+    assert_eq!(
+        gradient.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        [0.5f32, -3.0, 0.0, 0.0].map(f32::to_bits)
+    );
+    assert_eq!(residuals.map(f32::to_bits), before);
+    let inactive = [-0.0, -1.0, f32::NAN, 0.0];
+    let (loss, gradient) = pde_residual_loss(&residuals, Some(&inactive));
+    assert_eq!(loss.to_bits(), 0);
+    assert!(gradient.iter().all(|x| x.to_bits() == 0));
+
+    let (loss, gradient) = pde_residual_loss(&[-0.0, 0.0], None);
+    assert_eq!(loss.to_bits(), 0);
+    assert_eq!(gradient[0].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(gradient[1].to_bits(), 0);
+    let (loss, gradient) = pde_residual_loss(&[], None);
+    assert_eq!(loss.to_bits(), 0);
+    assert_eq!((gradient.len(), gradient.capacity()), (0, 0));
+
+    let (loss, gradient) = pde_residual_loss(&[f32::INFINITY, f32::NEG_INFINITY], None);
+    assert_eq!(loss, f32::INFINITY);
+    assert_eq!(gradient, [f32::INFINITY, f32::NEG_INFINITY]);
+    let (loss, gradient) = pde_residual_loss(&[f32::from_bits(0x7fc01234)], None);
+    assert!(loss.is_nan() && gradient[0].is_nan());
+}
+
+#[test]
+fn mse_validation_precedes_output_writes_and_pde_rejects_wrong_masks() {
+    for (targets, gradient_len, mask_len, first_bad_len) in
+        [(1, 3, 4, 1), (2, 3, 4, 3), (2, 2, 4, 4)]
+    {
+        let mut gradient = vec![f32::from_bits(0x7fc01234); gradient_len];
+        let before: Vec<_> = gradient.iter().map(|x| x.to_bits()).collect();
+        let error = masked_mse_into(
+            &[1.0, -2.0],
+            &vec![0.0; targets],
+            Some(&vec![1.0; mask_len]),
+            &mut gradient,
+        )
+        .unwrap_err();
+        match error {
+            arkan::ArkanError::ShapeMismatch { expected, got } => {
+                assert_eq!(expected, [2]);
+                assert_eq!(got, [first_bad_len]);
+            }
+            other => panic!("unexpected MSE error: {other}"),
+        }
+        assert_eq!(
+            gradient.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            before
+        );
+    }
+    for (residuals, mask) in [(2, 1), (2, 3), (0, 1)] {
+        assert!(std::panic::catch_unwind(|| {
+            pde_residual_loss(&vec![1.0; residuals], Some(&vec![1.0; mask]))
+        })
+        .is_err());
+    }
+}
+
 // Frozen allocating objective from accepted C 3c129df; keep its storage/reduction.
 fn frozen_c_entropy(coefficients: &[f32], group_size: usize) -> f32 {
     const EPSILON: f32 = 1e-6;

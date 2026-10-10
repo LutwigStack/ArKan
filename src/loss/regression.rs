@@ -47,9 +47,19 @@ pub fn masked_mse_into(
     mask: Option<&[f32]>,
     gradient: &mut [f32],
 ) -> crate::ArkanResult<f32> {
+    masked_mse_impl(predictions, Some(targets), mask, gradient)
+}
+
+// PDE residuals use implicit positive-zero targets without a temporary vector.
+pub(super) fn masked_mse_impl(
+    predictions: &[f32],
+    targets: Option<&[f32]>,
+    mask: Option<&[f32]>,
+    gradient: &mut [f32],
+) -> crate::ArkanResult<f32> {
     let n = predictions.len();
     for actual in [
-        targets.len(),
+        targets.map_or(n, |targets| targets.len()),
         gradient.len(),
         mask.map_or(n, |mask| mask.len()),
     ] {
@@ -63,7 +73,7 @@ pub fn masked_mse_into(
     for index in 0..n {
         let weight = mask.map_or(1.0, |mask| mask[index]);
         if weight > 0.0 {
-            let difference = predictions[index] - targets[index];
+            let difference = predictions[index] - targets.map_or(0.0, |targets| targets[index]);
             loss += weight * difference * difference;
             gradient[index] = 2.0 * weight * difference;
             count += weight;

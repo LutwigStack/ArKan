@@ -104,6 +104,21 @@ analysis supplied no eligible target or qualified nonregression result. The
 production rewrite was not adopted; these regressions establish correctness
 contracts without a speed claim.
 
+The PDE residual loss now uses implicit positive-zero targets in the shared MSE
+implementation while preserving subtraction, mask reduction and shape validation.
+Matched public-call qualification removes one temporary zero-target vector:
+valid nonempty calls request one vector for `4 * n` bytes instead of two for
+`8 * n` bytes, retaining the same returned gradient. Empty calls request none.
+The ordinary allocation test pins the seven-element case at one request/28 bytes.
+
+Entropy gradients store the per-coefficient derivative in the existing returned
+buffer and reuse it in the final pass, avoiding repeated active probability and
+logarithm work without another allocation. Debug/release comparisons covered
+complete loss/gradient bits, including signed zeros and NaN payloads, input
+immutability, malformed masks and whole-call allocation/live/peak behavior.
+These changes are adopted for their demonstrated storage and operation reductions;
+no latency measurement or speedup is claimed.
+
 Python baseline operations share `scripts/bench_reference.py`: normalize, clamp,
 find the span from the actual knots, evaluate local basis functions, and gather
 active global coefficients from `[output, input, global_basis]`. Hidden layers
