@@ -88,6 +88,22 @@ There was no eligible target or confirmed paired slowdown. The rewrite was not
 adopted, and this campaign supplies no qualified latency result. Small exact
 coefficient boundary regressions remain in the ordinary test suite.
 
+A separate CPU inference experiment reduced hidden-layer staging copies while
+retaining every workspace reserve/resize, final full copy and initialized
+spare-capacity value. Four debug/release role profiles passed exact public-state,
+error, workspace-reuse and whole-call allocation/live/peak comparisons. Three
+ordinary integration regressions preserve initialized tails and output sentinels,
+including reuse across different layer shapes and a rejected input shape.
+
+Its paired timing used seed-42, grid-5/order-3 models on CPU 2, with one-/two-layer
+controls and wide/deep hidden-layer targets. An A-only calibration fixed the batch
+size before 32 balanced ABBA/BAAB bundles; the same-binary A/A null campaign passed.
+The subsequent A/B campaign ended `INVALID_STOP`: the wide-hidden half-to-half
+drift guard failed and control equivalence was unresolved. The predeclared
+analysis supplied no eligible target or qualified nonregression result. The
+production rewrite was not adopted; these regressions establish correctness
+contracts without a speed claim.
+
 Python baseline operations share `scripts/bench_reference.py`: normalize, clamp,
 find the span from the actual knots, evaluate local basis functions, and gather
 active global coefficients from `[output, input, global_basis]`. Hidden layers
