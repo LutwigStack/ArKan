@@ -22,7 +22,8 @@ and record the revision before making a new deployment latency claim.
 
 ## Cases and state
 
-Rust models use seed 42. Training benchmarks clone the seeded base model for each
+The CPU raw-training, learning-rate and option comparisons use seed 42.
+Training benchmarks clone the seeded base model for each
 measured step, and prepare reusable scratch buffers outside the timer. Learning
 rate and option cases start from the same weights, rather than from a model
 trained by a preceding case. The CPU optimizer suite measures raw SGD training,
@@ -30,7 +31,7 @@ optimizer construction, and active/inactive clipping thresholds at one half/twic
 the measured initial gradient norm. The norm is asserted finite and nonzero and
 printed before timing.
 
-The `amp_identity` group measures whole public Adam/SGD `step` calls on seeded
+The `amp_identity` group measures whole public Adam/SGD `step` calls on seed-11
 `[8, 16, 16, 4]` models with grid 5/order 3 and prebuilt gradients. Each sample
 clones a model and optimizer warmed by five steps; cloning and fixture drops
 are outside the timer. Checked strict/skip factor `1.0` cases have unchecked

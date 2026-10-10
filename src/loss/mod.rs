@@ -304,6 +304,81 @@ mod tests {
         assert!((grad[0] - (-0.5)).abs() < 0.01);
     }
 
+    #[test]
+    fn test_bce_logits_weighted_mask_preserves_inactive_tail_bits() {
+        let logits = [
+            std::f32::consts::LN_2,
+            -std::f32::consts::LN_2,
+            f32::NAN,
+            f32::INFINITY,
+            -0.0,
+            f32::NAN,
+        ];
+        let targets = [0.5; 6];
+        let mask = [0.25, 0.75, 0.0, -1.0, f32::NAN, f32::NEG_INFINITY];
+        let (loss, grad) = masked_bce_with_logits(&logits, &targets, Some(&mask));
+
+        // BCE(ln(2), 1/2) = BCE(-ln(2), 1/2) = ln(3) - ln(2)/2.
+        assert!((loss - 0.7520387).abs() < 1e-6);
+        assert_eq!(grad.len(), logits.len());
+        assert!((grad[0] - 1.0 / 24.0).abs() < 1e-6);
+        assert!((grad[1] + 1.0 / 8.0).abs() < 1e-6);
+        for value in &grad[2..] {
+            assert_eq!(value.to_bits(), 0.0_f32.to_bits());
+        }
+
+        let full_mask = [1.0; 2];
+        for mask in [None, Some(full_mask.as_slice())] {
+            let (loss, grad) = masked_bce_with_logits(&logits[..2], &targets[..2], mask);
+            assert!((loss - 0.7520387).abs() < 1e-6);
+            assert_eq!(grad.len(), 2);
+            assert!((grad[0] - 1.0 / 12.0).abs() < 1e-6);
+            assert!((grad[1] + 1.0 / 12.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_bce_logits_zero_and_infinite_endpoint_gradients() {
+        let cases = [
+            (0.0_f32, 1.0_f32, std::f32::consts::LN_2, -0.5_f32),
+            (-0.0, 0.0, std::f32::consts::LN_2, 0.5),
+            (f32::INFINITY, 0.0, f32::NAN, 1.0),
+            (f32::INFINITY, 1.0, f32::NAN, 0.0),
+            (f32::NEG_INFINITY, 1.0, f32::INFINITY, -1.0),
+            (f32::NEG_INFINITY, 0.0, f32::NAN, 0.0),
+            (f32::from_bits(0xffc1_2345), 0.0, f32::NAN, f32::NAN),
+        ];
+        for (logit, target, expected_loss, expected_grad) in cases {
+            let (loss, grad) = masked_bce_with_logits(&[logit], &[target], None);
+            assert_eq!(grad.len(), 1);
+            if expected_loss.is_nan() {
+                assert!(loss.is_nan());
+            } else if expected_loss.is_infinite() {
+                assert_eq!(loss.to_bits(), expected_loss.to_bits());
+            } else {
+                assert!((loss - expected_loss).abs() < 1e-6);
+            }
+            if expected_grad.is_nan() {
+                assert!(grad[0].is_nan());
+            } else {
+                assert_eq!(grad[0].to_bits(), expected_grad.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn test_bce_logits_infinite_weight_preserves_normalized_nan() {
+        let logits = [0.0, 0.0, f32::NAN];
+        let targets = [1.0, 0.0, 1.0];
+        let mask = [f32::INFINITY, 1.0, 0.0];
+        let (loss, grad) = masked_bce_with_logits(&logits, &targets, Some(&mask));
+        assert!(loss.is_nan());
+        assert_eq!(grad.len(), 3);
+        assert!(grad[0].is_nan());
+        assert_eq!(grad[1].to_bits(), 0.0_f32.to_bits());
+        assert_eq!(grad[2].to_bits(), 0.0_f32.to_bits());
+    }
+
     // =========================================================================
     // L1 Sparsity Tests
     // =========================================================================

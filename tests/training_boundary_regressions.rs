@@ -450,3 +450,153 @@ fn zero_learning_rate_still_clips_finite_gradients() {
         }
     }
 }
+
+fn decay_order_fixture() -> KanNetwork {
+    let mut model = KanNetwork::new(KanConfig {
+        input_dim: 1,
+        output_dim: 1,
+        hidden_dims: vec![],
+        grid_size: 1,
+        spline_order: 1,
+        grid_range: (0.0, 1.0),
+        input_mean: vec![0.0],
+        input_std: vec![1.0],
+        multithreading_threshold: usize::MAX,
+        init_seed: Some(42),
+        ..KanConfig::default()
+    });
+    model.layers[0].weights.fill(1.0 / 16.0);
+    model.layers[0].bias.fill(1.0 / 8.0);
+    model
+}
+
+#[test]
+fn direct_sgd_decays_before_indexed_gradient_updates_and_never_decays_biases() {
+    let cases = [
+        (
+            0.25f32,
+            [-0.75, -0.25],
+            [31.0 / 128.0, 15.0 / 128.0],
+            [1.0 / 4.0, 1.0 / 8.0],
+        ),
+        (
+            0.5,
+            [-0.5, -0.5],
+            [23.0 / 128.0, 23.0 / 128.0],
+            [3.0 / 16.0, 3.0 / 16.0],
+        ),
+        (
+            0.75,
+            [-0.25, -0.75],
+            [15.0 / 128.0, 31.0 / 128.0],
+            [1.0 / 8.0, 1.0 / 4.0],
+        ),
+    ];
+    for (input, gradient, decayed, undecayed) in cases {
+        for decay in [0.0, -0.0, 0.5] {
+            let mut model = decay_order_fixture();
+            let mut no_update = model.clone();
+            let mut workspace = model.create_workspace(1);
+            let mut no_update_workspace = no_update.create_workspace(1);
+            let capacities = (
+                model.layers[0].weights.capacity(),
+                model.layers[0].bias.capacity(),
+            );
+            let options = TrainOptions {
+                max_grad_norm: None,
+                weight_decay: decay,
+            };
+            let reference_loss = no_update
+                .try_train_step_with_options(
+                    &[input],
+                    &[11.0 / 16.0],
+                    None,
+                    0.0,
+                    &mut no_update_workspace,
+                    &options,
+                )
+                .unwrap();
+            let loss = model
+                .try_train_step_with_options(
+                    &[input],
+                    &[11.0 / 16.0],
+                    None,
+                    1.0 / 4.0,
+                    &mut workspace,
+                    &options,
+                )
+                .unwrap();
+            assert_eq!(loss.to_bits(), (1.0 / 4.0_f32).to_bits());
+            assert_eq!(loss.to_bits(), reference_loss.to_bits());
+            assert_eq!(
+                workspace.weight_grads[0]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                gradient.map(f32::to_bits)
+            );
+            assert_eq!(workspace.bias_grads[0][0].to_bits(), (-1.0f32).to_bits());
+            let expected = if decay > 0.0 { decayed } else { undecayed };
+            assert_eq!(
+                parameter_bits(&model),
+                [expected[0], expected[1], 3.0 / 8.0].map(f32::to_bits)
+            );
+            assert_eq!(
+                workspace_bits(&workspace),
+                workspace_bits(&no_update_workspace)
+            );
+            assert_eq!(
+                (
+                    model.layers[0].weights.capacity(),
+                    model.layers[0].bias.capacity()
+                ),
+                capacities
+            );
+        }
+    }
+}
+
+#[test]
+fn negative_direct_sgd_decay_is_rejected_before_warmed_state_changes() {
+    for decay in [-0.5, -f32::MIN_POSITIVE] {
+        let mut model = decay_order_fixture();
+        let mut workspace = model.create_workspace(1);
+        model
+            .try_train_step_with_options(
+                &[0.5],
+                &[11.0 / 16.0],
+                None,
+                0.0,
+                &mut workspace,
+                &TrainOptions::default(),
+            )
+            .unwrap();
+        let parameters = parameter_bits(&model);
+        let buffers = workspace_bits(&workspace);
+        let capacities = (
+            model.layers[0].weights.capacity(),
+            model.layers[0].bias.capacity(),
+        );
+        let result = model.try_train_step_with_options(
+            &[0.25],
+            &[0.0],
+            None,
+            1.0 / 4.0,
+            &mut workspace,
+            &TrainOptions {
+                max_grad_norm: None,
+                weight_decay: decay,
+            },
+        );
+        assert!(matches!(result, Err(arkan::ArkanError::Cpu(_))));
+        assert_eq!(parameter_bits(&model), parameters);
+        assert_eq!(workspace_bits(&workspace), buffers);
+        assert_eq!(
+            (
+                model.layers[0].weights.capacity(),
+                model.layers[0].bias.capacity()
+            ),
+            capacities
+        );
+    }
+}
