@@ -5,8 +5,8 @@ rerun**. The Python baselines used spans inconsistent with the grid range, and
 the competitor baseline stored only `order + 1` coefficients instead of
 `grid_size + order`. Training option timings also carried model and optimizer
 state between samples; the CPU/GPU training comparison used different optimizers.
-These defects invalidate the old speedup and option-overhead conclusions. No new
-performance measurements are published here.
+These defects invalidate the old speedup and option-overhead conclusions. The AMP
+allocation qualification below is separate from those historical comparisons.
 
 Historical Rust constants remain explicitly tagged in `scripts/bench_competitors.py`
 for provenance, separate from the current Python results. Their estimated
@@ -29,6 +29,28 @@ trained by a preceding case. The CPU optimizer suite measures raw SGD training,
 optimizer construction, and active/inactive clipping thresholds at one half/twice
 the measured initial gradient norm. The norm is asserted finite and nonzero and
 printed before timing.
+
+The `amp_identity` group measures whole public Adam/SGD `step` calls on seeded
+`[8, 16, 16, 4]` models with grid 5/order 3 and prebuilt gradients. Each sample
+clones a model and optimizer warmed by five steps; cloning and fixture drops
+are outside the timer. Checked strict/skip factor `1.0` cases have unchecked
+identity, active clipping and non-unit factor `2.0` controls. Clipping uses a
+fixed `0.25` threshold below the independently checked fixture norm.
+
+The matched allocation qualification counted every request over fifty warmed
+public steps for each of Adam/SGD strict/skip identity AMP. Each baseline row
+made 400 requests for 731,200 bytes; each candidate row made zero requests.
+This applies to the finite, unclipped fixture above, not every safety result or
+AMP configuration. A separate public-step qualification checked 208 fixed cases
+per role with exact original/candidate bits, including exceptional gradients,
+clipping, caller immutability, warmed rollback, optimizer state and whole-window
+live/peak/drop accounting.
+
+The fixed ABBA timing attempt ended `INVALID_STOP`: 16 of 40 confidence widths
+and 9 of 20 paired drifts exceeded the unchanged 3% validity limits. It supplies
+no qualified latency result. The change is adopted for the allocation reduction
+above; it makes no speedup promise. The benchmark remains available to reproduce
+the whole-step workload.
 
 GPU training uses `BatchSize::PerIteration`: each reset of the shared GPU model
 finishes before its measured step. `SmallInput` would run multiple setup closures

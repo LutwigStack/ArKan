@@ -5,9 +5,9 @@
 //! - Optimizer initialization cost
 //! - Memory overhead of optimizer state
 //!
-//! Note: Full Adam/SGD optimizer step benchmarks require manual gradient
-//! extraction which adds overhead. The Adam/SGD cases focus on the train_step
-//! variants available in the API. L-BFGS cases include their objective callback.
+//! The AMP cases measure whole Adam/SGD steps with prebuilt gradients and warmed
+//! optimizer state. Train-step cases include gradient extraction. L-BFGS cases
+//! include their objective callback.
 
 use arkan::network::TrainOptions;
 use arkan::optimizer::{LineSearchMethod, SafetyConfig};
@@ -329,6 +329,128 @@ fn bench_lbfgs_step(c: &mut Criterion) {
     group.finish();
 }
 
+/// Whole public step on a cloned, already warmed model and optimizer.
+fn bench_amp_case<O: arkan::optimizer::Optimizer + Clone>(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    name: &str,
+    mut fixture: (KanNetwork, O),
+    gradients: &(Vec<Vec<f32>>, Vec<Vec<f32>>),
+    max_grad_norm: Option<f32>,
+) {
+    for _ in 0..5 {
+        fixture
+            .1
+            .step(&mut fixture.0, &gradients.0, &gradients.1, max_grad_norm)
+            .expect("AMP benchmark warmup failed");
+    }
+    group.bench_function(name, |b| {
+        b.iter_batched_ref(
+            || (fixture.0.clone(), fixture.1.clone()),
+            |(network, optimizer)| {
+                optimizer
+                    .step(
+                        black_box(&mut *network),
+                        black_box(&gradients.0[..]),
+                        black_box(&gradients.1[..]),
+                        black_box(max_grad_norm),
+                    )
+                    .expect("AMP benchmark step failed");
+                black_box(&*network);
+                black_box(&*optimizer);
+            },
+            // Each clock covers one full step; cloning and all drops remain outside.
+            criterion::BatchSize::NumIterations(1),
+        );
+    });
+}
+
+fn bench_amp_identity(c: &mut Criterion) {
+    let network = KanNetwork::new(KanConfig {
+        input_dim: 8,
+        output_dim: 4,
+        hidden_dims: vec![16, 16],
+        grid_size: 5,
+        spline_order: 3,
+        grid_range: (-1.0, 1.0),
+        input_mean: vec![0.0; 8],
+        input_std: vec![1.0; 8],
+        multithreading_threshold: 1 << 20,
+        simd_width: 8,
+        init_seed: Some(11),
+    });
+    let gradients = (
+        network
+            .layers
+            .iter()
+            .map(|layer| vec![0.125; layer.weights.len()])
+            .collect::<Vec<_>>(),
+        network
+            .layers
+            .iter()
+            .map(|layer| vec![-0.125; layer.bias.len()])
+            .collect::<Vec<_>>(),
+    );
+    let norm = gradients
+        .0
+        .iter()
+        .chain(&gradients.1)
+        .flatten()
+        .map(|&g| f64::from(g).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    assert!(norm > 0.25 && norm < 100.0, "AMP clipping fixture bounds");
+    let cases = [
+        ("checked_strict", true, false, 1.0, None),
+        ("checked_skip", false, true, 1.0, None),
+        ("unchecked_identity", false, false, 1.0, None),
+        ("active_clip", true, false, 1.0, Some(0.25)),
+        ("nonunit2", true, false, 2.0, None),
+    ];
+    let mut group = c.benchmark_group("amp_identity");
+    for (name, fail_on_nan, skip_step_on_nan, factor, max_grad_norm) in cases {
+        let safety = SafetyConfig {
+            fail_on_nan,
+            skip_step_on_nan,
+            grad_scaling_factor: Some(factor),
+            unscale_before_step: true,
+        };
+        let adam = Adam::new(
+            &network,
+            AdamConfig {
+                lr: 0.125,
+                weight_decay: 0.05,
+                safety,
+                ..Default::default()
+            },
+        );
+        bench_amp_case(
+            &mut group,
+            &format!("adam_{name}"),
+            (network.clone(), adam),
+            &gradients,
+            max_grad_norm,
+        );
+        let sgd = SGD::new(
+            &network,
+            SGDConfig {
+                lr: 0.125,
+                momentum: 0.5,
+                weight_decay: 0.05,
+                nesterov: true,
+                safety,
+            },
+        );
+        bench_amp_case(
+            &mut group,
+            &format!("sgd_{name}"),
+            (network.clone(), sgd),
+            &gradients,
+            max_grad_norm,
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_raw_train_step,
@@ -336,5 +458,6 @@ criterion_group!(
     bench_optimizer_init,
     bench_learning_rates,
     bench_lbfgs_step,
+    bench_amp_identity,
 );
 criterion_main!(benches);

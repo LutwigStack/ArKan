@@ -248,6 +248,83 @@ fn optimizer_step_is_allocation_free() {
     assert_eq!(allocs, 0, "SGD path allocated {allocs} times ({bytes} B)");
 }
 
+fn identity_amp_optimizer_steps_are_allocation_free() {
+    use arkan::{Optimizer, SafetyConfig};
+
+    let (network, _) = net(1);
+    let weight_grads: Vec<_> = network
+        .layers
+        .iter()
+        .map(|layer| vec![0.125; layer.weights.len()])
+        .collect();
+    let bias_grads: Vec<_> = network
+        .layers
+        .iter()
+        .map(|layer| vec![-0.125; layer.bias.len()])
+        .collect();
+    let observations = std::array::from_fn::<_, 4, _>(|row| {
+        let mut model = network.clone();
+        let safety = SafetyConfig {
+            grad_scaling_factor: Some(1.0),
+            ..if row % 2 == 0 {
+                SafetyConfig::strict()
+            } else {
+                SafetyConfig::default()
+            }
+        };
+        let counts = if row < 2 {
+            let mut optimizer = Adam::new(&model, AdamConfig::default().with_safety(safety));
+            for _ in 0..5 {
+                optimizer
+                    .step(&mut model, &weight_grads, &bias_grads, None)
+                    .unwrap();
+            }
+            measure(|| {
+                for _ in 0..50 {
+                    optimizer
+                        .step(&mut model, &weight_grads, &bias_grads, None)
+                        .unwrap();
+                }
+            })
+        } else {
+            let mut optimizer = SGD::new(&model, SGDConfig::default().with_safety(safety));
+            for _ in 0..5 {
+                optimizer
+                    .step(&mut model, &weight_grads, &bias_grads, None)
+                    .unwrap();
+            }
+            measure(|| {
+                for _ in 0..50 {
+                    optimizer
+                        .step(&mut model, &weight_grads, &bias_grads, None)
+                        .unwrap();
+                }
+            })
+        };
+        let classes: [usize; 3] = std::array::from_fn(|i| CLASSES[i].load(Ordering::Relaxed));
+        (counts, classes)
+    });
+    let ids = ["adam_strict", "adam_skip", "sgd_strict", "sgd_skip"];
+    for (id, (counts, classes)) in ids.into_iter().zip(observations) {
+        println!(
+            "identity_amp id={id} calls=50 requests={} bytes={} classes={classes:?}",
+            counts.0, counts.1
+        );
+    }
+    for (counts, classes) in observations {
+        assert_eq!(
+            counts,
+            (0, 0),
+            "warmed identity AMP step must not copy gradients"
+        );
+        assert_eq!(
+            classes,
+            [0, 0, 0],
+            "identity AMP must not allocate or reallocate"
+        );
+    }
+}
+
 /// Single entry point on purpose.
 ///
 /// The counter behind `measure` is a process-global `GlobalAlloc`, but libtest runs
@@ -328,6 +405,7 @@ fn allocation_budget() {
     inference_is_allocation_free();
     train_step_is_allocation_free();
     optimizer_step_is_allocation_free();
+    identity_amp_optimizer_steps_are_allocation_free();
     workspace_size_ignores_the_multithreading_threshold();
     try_create_workspace_does_not_panic_on_a_valid_config();
     #[cfg(feature = "serde")]

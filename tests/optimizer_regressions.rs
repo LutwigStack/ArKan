@@ -1257,3 +1257,275 @@ fn lbfgs_stationary_step_saturates_evaluation_counter() {
     assert_eq!(l3_bits(&LBFGS::flatten_params(&net)), model);
     assert_eq!(bincode::serialize(&opt).unwrap(), before);
 }
+
+// Snapshots use public numerical state and capacities, rather than private Cow variants.
+type AmpSnapshot = Vec<(Vec<u32>, usize)>;
+type AmpOptimizerSnapshot = (AmpSnapshot, (Vec<u32>, Option<u64>));
+
+fn amp_gradient_snapshot(weights: &[Vec<f32>], biases: &[Vec<f32>]) -> AmpSnapshot {
+    weights
+        .iter()
+        .chain(biases)
+        .map(|tensor| (l3_bits(tensor), tensor.capacity()))
+        .collect()
+}
+
+fn amp_model_snapshot(model: &KanNetwork) -> AmpSnapshot {
+    model
+        .layers
+        .iter()
+        .flat_map(|layer| [&layer.weights, &layer.bias, &layer.mean, &layer.std])
+        .map(|tensor| (l3_bits(tensor), tensor.capacity()))
+        .collect()
+}
+
+fn amp_adam_snapshot(optimizer: &Adam) -> AmpOptimizerSnapshot {
+    let mut result = vec![(vec![], optimizer.layer_states.capacity())];
+    for state in &optimizer.layer_states {
+        for tensor in [&state.weights, &state.bias] {
+            result.push((l3_bits(tensor.m.as_slice()), tensor.m.capacity()));
+            result.push((l3_bits(tensor.v.as_slice()), tensor.v.capacity()));
+            result.push((vec![], tensor.t));
+        }
+    }
+    let config = optimizer.config;
+    (
+        result,
+        (
+            vec![
+                config.lr.to_bits(),
+                config.beta1.to_bits(),
+                config.beta2.to_bits(),
+                config.epsilon.to_bits(),
+                config.weight_decay.to_bits(),
+                u32::from(config.safety.fail_on_nan),
+                u32::from(config.safety.skip_step_on_nan),
+                u32::from(config.safety.unscale_before_step),
+            ],
+            config.safety.grad_scaling_factor.map(f64::to_bits),
+        ),
+    )
+}
+
+fn amp_sgd_snapshot(optimizer: &SGD) -> AmpOptimizerSnapshot {
+    let mut result = vec![(vec![], optimizer.velocities.capacity())];
+    for (weights, biases) in &optimizer.velocities {
+        result.push((l3_bits(weights.as_slice()), weights.capacity()));
+        result.push((l3_bits(biases.as_slice()), biases.capacity()));
+    }
+    let config = optimizer.config;
+    (
+        result,
+        (
+            vec![
+                config.lr.to_bits(),
+                config.momentum.to_bits(),
+                config.weight_decay.to_bits(),
+                u32::from(config.nesterov),
+                u32::from(config.safety.fail_on_nan),
+                u32::from(config.safety.skip_step_on_nan),
+                u32::from(config.safety.unscale_before_step),
+            ],
+            config.safety.grad_scaling_factor.map(f64::to_bits),
+        ),
+    )
+}
+
+fn amp_check_finite_identity<O: Optimizer>(
+    make: impl Fn(&KanNetwork, SafetyConfig) -> O,
+    snapshot: impl Fn(&O) -> AmpOptimizerSnapshot,
+) {
+    let values = [
+        0.125,
+        -0.5,
+        0.0,
+        -0.0,
+        f32::from_bits(1),
+        -f32::from_bits(1),
+        f32::from_bits(0x007f_ffff),
+        -f32::from_bits(0x007f_ffff),
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        2.0,
+        -4.0,
+    ];
+    for hidden in [false, true] {
+        for (fail_on_nan, skip_step_on_nan) in
+            [(true, false), (false, true), (true, true), (false, false)]
+        {
+            for clipping in [None, Some(100.0), Some(0.25)] {
+                let mut plain = network(hidden);
+                let mut identity = plain.clone();
+                let (mut weights, mut biases) = gradients(&plain);
+                let mut element = 0;
+                for tensor in weights.iter_mut().chain(&mut biases) {
+                    tensor.reserve(8);
+                    for value in tensor.iter_mut() {
+                        *value = values[element % values.len()];
+                        element += 1;
+                    }
+                }
+                let norm = weights
+                    .iter()
+                    .chain(&biases)
+                    .flatten()
+                    .map(|&value| f64::from(value).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(norm > 0.25 && norm < 100.0, "clipping fixture norm={norm}");
+                let inputs = amp_gradient_snapshot(&weights, &biases);
+                let outer_capacities = (weights.capacity(), biases.capacity());
+                let safety = SafetyConfig {
+                    fail_on_nan,
+                    skip_step_on_nan,
+                    grad_scaling_factor: None,
+                    unscale_before_step: false,
+                };
+                let mut plain_optimizer = make(&plain, safety);
+                let mut identity_optimizer = make(
+                    &identity,
+                    SafetyConfig {
+                        grad_scaling_factor: Some(1.0),
+                        ..safety
+                    },
+                );
+                let plain_config = snapshot(&plain_optimizer).1;
+                let identity_config = snapshot(&identity_optimizer).1;
+                assert_eq!(plain_config.1, None);
+                assert_eq!(identity_config.1, Some(1.0f64.to_bits()));
+                for _ in 0..3 {
+                    plain_optimizer
+                        .step(&mut plain, &weights, &biases, clipping)
+                        .unwrap();
+                    assert_eq!(amp_gradient_snapshot(&weights, &biases), inputs);
+                    identity_optimizer
+                        .step(&mut identity, &weights, &biases, clipping)
+                        .unwrap();
+                    assert_eq!(amp_model_snapshot(&identity), amp_model_snapshot(&plain));
+                    let plain_state = snapshot(&plain_optimizer);
+                    let mut identity_state = snapshot(&identity_optimizer);
+                    assert_eq!(plain_state.1, plain_config);
+                    assert_eq!(identity_state.1, identity_config);
+                    identity_state.1 .1 = None;
+                    assert_eq!(identity_state, plain_state);
+                    assert_eq!(
+                        identity_optimizer.get_state_version(),
+                        plain_optimizer.get_state_version()
+                    );
+                    assert_eq!(amp_gradient_snapshot(&weights, &biases), inputs);
+                    assert_eq!((weights.capacity(), biases.capacity()), outer_capacities);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn amp_identity_preserves_finite_parameter_state_and_input_bits() {
+    amp_check_finite_identity(
+        |model, safety| {
+            Adam::new(
+                model,
+                AdamConfig {
+                    lr: 0.125,
+                    weight_decay: 0.05,
+                    safety,
+                    ..AdamConfig::default()
+                },
+            )
+        },
+        amp_adam_snapshot,
+    );
+    amp_check_finite_identity(
+        |model, safety| {
+            SGD::new(
+                model,
+                SGDConfig {
+                    lr: 0.125,
+                    momentum: 0.5,
+                    weight_decay: 0.05,
+                    nesterov: true,
+                    safety,
+                },
+            )
+        },
+        amp_sgd_snapshot,
+    );
+}
+
+fn amp_check_late_rejection<O: Optimizer>(
+    make: impl Fn(&KanNetwork, SafetyConfig) -> O,
+    snapshot: impl Fn(&O) -> AmpOptimizerSnapshot,
+    update_context: &str,
+) {
+    for (fail_on_nan, skip_step_on_nan) in [(true, false), (false, true), (true, true)] {
+        for bad_gradient in [
+            f32::from_bits(0x7fc0_1234),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+        ] {
+            let mut model = network(true);
+            let (weights, mut biases) = gradients(&model);
+            biases[0][0] = 0.125;
+            let safety = SafetyConfig {
+                fail_on_nan,
+                skip_step_on_nan,
+                grad_scaling_factor: Some(1.0),
+                unscale_before_step: true,
+            };
+            let mut optimizer = make(&model, safety);
+            optimizer.step(&mut model, &weights, &biases, None).unwrap();
+            biases.last_mut().unwrap()[0] = bad_gradient;
+            let parameters = amp_model_snapshot(&model);
+            let state = snapshot(&optimizer);
+            let version = optimizer.get_state_version();
+            let inputs = amp_gradient_snapshot(&weights, &biases);
+            let outer_capacities = (weights.capacity(), biases.capacity());
+            let result = optimizer.step(&mut model, &weights, &biases, None);
+            if skip_step_on_nan {
+                assert!(
+                    result.is_ok(),
+                    "skip must take precedence over strict failure"
+                );
+            } else {
+                match result {
+                    Err(ArkanError::NaNEncountered {
+                        param_index,
+                        context,
+                    }) => {
+                        assert_eq!(param_index, usize::from(bad_gradient.is_finite()));
+                        assert_eq!(
+                            context,
+                            if bad_gradient.is_finite() {
+                                update_context
+                            } else {
+                                "gradient"
+                            }
+                        );
+                    }
+                    other => panic!("expected numerical rejection, got {other:?}"),
+                }
+            }
+            assert_eq!(amp_model_snapshot(&model), parameters);
+            assert_eq!(snapshot(&optimizer), state);
+            assert_eq!(optimizer.get_state_version(), version);
+            assert_eq!(amp_gradient_snapshot(&weights, &biases), inputs);
+            assert_eq!((weights.capacity(), biases.capacity()), outer_capacities);
+        }
+    }
+}
+
+#[test]
+fn amp_identity_late_rejection_preserves_warmed_parameters_state_and_inputs() {
+    amp_check_late_rejection(
+        |model, safety| Adam::new(model, AdamConfig::default().with_safety(safety)),
+        amp_adam_snapshot,
+        "Adam update or state",
+    );
+    amp_check_late_rejection(
+        |model, safety| SGD::new(model, SGDConfig::with_lr(2.0).with_safety(safety)),
+        amp_sgd_snapshot,
+        "SGD update or state",
+    );
+}

@@ -356,8 +356,11 @@ APIs are named separately; legacy fused gradient contracts remain available.
 Disabled clipping skips the global norm pass and native GPU clipping downloads.
 The GPU options entry points validate the same finite positive clipping threshold.
 Parallel CPU backward keeps bounded reusable scratch and deterministic chunk
-reduction; default warmed allocation guarantees cover the existing no-clipping,
-no-AMP optimizer configuration. Active optimizer preprocessing may allocate.
+reduction. CPU Adam and SGD borrow finite caller gradients for AMP factor `1.0`
+when strict or skip safety checks are enabled; caller tensors remain unchanged.
+Unchecked AMP retains the divide-and-cast path. Active clipping uses owned copies,
+and non-unit scaling may allocate. With safety checks enabled, the complete update
+preflight still runs before parameter or optimizer-state mutation.
 
 LBFGS evaluates a closure at trial parameters, restores parameters/history on
 errors, and shrinks rejected numerical trials within its bounded line search.

@@ -403,6 +403,9 @@ fn prepare_gradients<'a>(
     }
     let unscale = |source: &'a [Vec<f32>]| -> Cow<'a, [Vec<f32>]> {
         match safety.grad_scaling_factor {
+            Some(factor) if factor == 1.0 && (safety.fail_on_nan || safety.skip_step_on_nan) => {
+                Cow::Borrowed(source)
+            }
             Some(factor) => Cow::Owned(
                 source
                     .iter()
