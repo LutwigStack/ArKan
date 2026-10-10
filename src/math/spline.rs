@@ -380,17 +380,16 @@ pub fn compute_basis_and_deriv(
 
     // Now basis_prev contains B_{start_idx, p-1}, B_{start_idx+1, p-1}, ..., B_{span+1, p-1}
     // Compute derivatives
+    let denom1 = knots[start_idx + order] - knots[start_idx];
+    let mut term1 = if denom1 > 0.0 {
+        basis_prev[0] / denom1
+    } else {
+        0.0
+    };
     for i in 0..=order {
         let idx = start_idx + i; // Global index of this order-p basis function
 
         // B'_{idx,p}(x) = p * (B_{idx,p-1}(x)/(t_{idx+p} - t_idx) - B_{idx+1,p-1}(x)/(t_{idx+p+1} - t_{idx+1}))
-        let denom1 = knots[idx + order] - knots[idx];
-        let term1 = if denom1 > 0.0 {
-            basis_prev[i] / denom1
-        } else {
-            0.0
-        };
-
         let denom2 = knots[idx + order + 1] - knots[idx + 1];
         let term2 = if denom2 > 0.0 {
             basis_prev[i + 1] / denom2
@@ -399,6 +398,8 @@ pub fn compute_basis_and_deriv(
         };
 
         deriv_out[i] = (order as f32) * (term1 - term2);
+        // This right quotient is the next iteration's left quotient.
+        term1 = term2;
     }
 }
 

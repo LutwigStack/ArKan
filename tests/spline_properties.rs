@@ -613,3 +613,111 @@ fn config_rejects_a_grid_whose_knots_collide_in_f32() {
         "a grid with colliding knots must be rejected, not silently zeroed"
     );
 }
+
+// Fixed linear witnesses exercise quotient guards and IEEE values that the
+// finite-difference sweep above does not generate. Check output bits and tails.
+#[test]
+fn derivative_quotient_guards_preserve_bits_and_output_tails() {
+    let sentinel = f32::from_bits(0x7fc1_2345);
+    let cases: [(f32, [f32; 4], [f32; 2]); 6] = [
+        (0.0, [-1.0, -0.0, 1.0, 2.0], [1.0, 0.0]),
+        (-0.0, [-1.0, -0.0, 1.0, 2.0], [1.0, 0.0]),
+        (0.5, [-0.0, 0.0, 1.0, 2.0], [0.5, 0.5]),
+        (0.5, [2.0, 0.0, 1.0, -1.0], [0.5, 0.5]),
+        (0.5, [f32::NAN, 0.0, 1.0, f32::NAN], [0.5, 0.5]),
+        (
+            0.5,
+            [f32::NEG_INFINITY, 0.0, 1.0, f32::INFINITY],
+            [0.5, 0.5],
+        ),
+    ];
+    for (x, knots, expected_basis) in cases {
+        let mut basis = [sentinel; 4];
+        let mut deriv = [sentinel; 4];
+        compute_basis_and_deriv(x, 1, &knots, 1, &mut basis, &mut deriv);
+        for (actual, expected) in basis[..2].iter().zip(expected_basis) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        assert_eq!(deriv[0].to_bits(), (-1.0f32).to_bits());
+        assert_eq!(deriv[1].to_bits(), 1.0f32.to_bits());
+        for value in basis[2..].iter().chain(&deriv[2..]) {
+            assert_eq!(value.to_bits(), sentinel.to_bits());
+        }
+    }
+
+    let guarded_gaps: [(f32, [f32; 4], [f32; 2]); 2] = [
+        (0.0, [0.0, -0.0, 0.0, 1.0], [0.0, 0.0]),
+        (0.5, [0.0, 1.0, 0.0, 1.0], [0.0, -0.0]),
+    ];
+    for (x, knots, expected_basis) in guarded_gaps {
+        let mut basis = [sentinel; 4];
+        let mut deriv = [sentinel; 4];
+        compute_basis_and_deriv(x, 1, &knots, 1, &mut basis, &mut deriv);
+        for (actual, expected) in basis[..2].iter().zip(expected_basis) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        for value in &deriv[..2] {
+            assert_eq!(value.to_bits(), 0.0f32.to_bits());
+        }
+        for value in basis[2..].iter().chain(&deriv[2..]) {
+            assert_eq!(value.to_bits(), sentinel.to_bits());
+        }
+    }
+}
+
+#[test]
+fn derivative_short_buffers_and_late_knot_panics_preserve_write_prefixes() {
+    let sentinel = f32::from_bits(0x7fc1_2345);
+    let expected_basis: [f32; 4] = [1.0 / 48.0, 23.0 / 48.0, 23.0 / 48.0, 1.0 / 48.0];
+    let expected_deriv = [-0.125f32, -0.625, 0.625];
+    let knots = compute_knots(5, 3, (0.0, 5.0));
+    for len in [0, 2, 3] {
+        let mut basis = [sentinel; 7];
+        let mut deriv = [sentinel; 7];
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compute_basis_and_deriv(2.5, 5, &knots, 3, &mut basis, &mut deriv[..len]);
+        }));
+        assert!(panicked.is_err());
+        if cfg!(debug_assertions) {
+            // Ordinary debug CI rejects the short derivative slice at entry.
+            for value in basis.iter().chain(&deriv) {
+                assert_eq!(value.to_bits(), sentinel.to_bits());
+            }
+        } else {
+            for (actual, expected) in basis[..4].iter().zip(expected_basis) {
+                assert!((actual - expected).abs() < 1e-6);
+            }
+            for (actual, expected) in deriv[..len].iter().zip(&expected_deriv[..len]) {
+                assert_eq!(actual.to_bits(), expected.to_bits());
+            }
+            for value in basis[4..].iter().chain(&deriv[len..]) {
+                assert_eq!(value.to_bits(), sentinel.to_bits());
+            }
+        }
+    }
+
+    // Buffers are valid in both profiles. The final right quotient reaches a
+    // missing knot only after basis completion and the first three derivatives.
+    let mut basis = [sentinel; 7];
+    let mut deriv = [sentinel; 7];
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compute_basis_and_deriv(
+            3.5,
+            3,
+            &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            3,
+            &mut basis,
+            &mut deriv,
+        );
+    }));
+    assert!(panicked.is_err());
+    for (actual, expected) in basis[..4].iter().zip(expected_basis) {
+        assert!((actual - expected).abs() < 1e-6);
+    }
+    for (actual, expected) in deriv[..3].iter().zip(expected_deriv) {
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+    for value in basis[4..].iter().chain(&deriv[3..]) {
+        assert_eq!(value.to_bits(), sentinel.to_bits());
+    }
+}
