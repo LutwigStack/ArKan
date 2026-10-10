@@ -228,6 +228,9 @@ jobs:
       - name: Test A/B source preparation
         run: python3 -B -m unittest discover -s scripts -p test_prepare_ab.py -v
 
+      - name: Test paired benchmark protocol and statistics
+        run: python3 -B -m unittest discover -s scripts -p test_paired_benchmark.py -v
+
       - name: Build in-crate examples
         run: cargo build --examples
 

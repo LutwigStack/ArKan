@@ -153,3 +153,69 @@ preimage rejection, replay refusal, and failure/cancellation before and after ma
 publication. A separate workspace integration check reproduced a pinned recipe's
 32 argv vectors, 320 role files and four auxiliary files byte for byte; it launched
 no application command and did not adopt that recipe's candidate.
+
+## Reuse a paired timing method
+
+`paired_benchmark.py` freezes a small pre-data plan, emits the exact prospective
+schedule, and analyzes retained measurements without launching a benchmark:
+
+```text
+python3 scripts/paired_benchmark.py plan --base /absolute/A-kernel --candidate /absolute/B-kernel --cases control0 control1 target0 target1 --cpu 2 --output /new/plan.json
+python3 scripts/paired_benchmark.py schedule --plan /new/plan.json
+python3 scripts/paired_benchmark.py analyze --plan /new/plan.json --null /run/null.jsonl --paired /run/paired.jsonl --guards /run/guards.json --output /new/analysis.json
+python3 -B -m unittest discover -s scripts -p test_paired_benchmark.py -v
+```
+
+The first two cases are controls and the last two are the only eligible targets.
+The plan pins both program byte identities, four unique case names, selected CPU
+and the fixed method. Plan and result publication is atomic and create-only;
+require a complete result and normal command exit zero together for numeric PASS.
+Interrupted attempts can leave partial files and never authorize a retry.
+
+Collectors may import `schedule`, `parse_campaign` and `null_report` from this
+module. The collector must run A-only doubling calibration (eight untimed calls,
+first batch reaching 100 ms, at most 250 ms, N at most 2^24), then freeze
+W=max(8,ceil(N/10)). Each campaign uses 32 four-case bundles and four ABBA/BAAB
+chunks per case, balanced 16/16. Complete the same-binary A/A null campaign and
+require its `null_report` PASS **before launching any candidate chunk**. The
+analyzer checks that prerequisite but cannot establish launch chronology by itself.
+Do not rerun, change thresholds or recalibrate with B after seeing a result.
+
+Each raw JSONL stream has a header, 512 ordered chunks and a terminal record.
+Headers contain `type`, `schema`, `campaign`, `authority_sha256`, `plan_sha256`,
+`binaries` and the complete ordered `calibration` list. Authority is the collector's
+pre-data contract hash, not an invented external approval. Calibration records
+and chunks contain the kernel's `case`, `iterations`, `warmup`, `elapsed_nanos`,
+four raw-u32 `output_bits`, and actual `affinity_before`/`affinity_after`, plus
+`binary_sha256`, `exit_code` and `reaped`. Chunks also contain `type`, `campaign`,
+`bundle`, `case_id`, `slot` and logical `role`. The terminal has `type`, `campaign`,
+`rows` (512) and `status` (`COMPLETE`). The complete output words must remain
+identical; booleans, duplicate keys, extra fields and incomplete streams reject.
+
+`guards.json` is the collector's ordered array of calibration/null/paired
+before/after controls: six records, or four when the null gate stops execution.
+Each has schema 1, alternating `BEFORE_NATIVE`/`QUALIFIED` status,
+`AUTHORITY_TIMING_sha256` matching the header, and `CPU` with quota, period,
+cgroup, cpuset, parent affinity and cumulative period/throttle counters.
+CPU identity must stay fixed, the selected child CPU must belong to the parent
+mask, period counts cannot decrease and throttle counters cannot change.
+Omit `--paired` for a null-only stop; the report records zero candidate chunks.
+
+Statistics reuse exact rational arithmetic on fourth powers of B/A ratios and
+10,000 shared circular moving-block bootstrap draws (length four, seed 20261010).
+All gates use the unchanged 3% bounds, including interval width relative to its
+lower bound, half drift and order effect. Controls require equivalence; every
+case requires nonregression. A target needs at least 3% median gain, upper CI below
+one and both half estimates below one. Structural/null/noise failure produces
+`INVALID_STOP`; validated material slowdown produces `REJECT` before ordinary
+control equivalence; unresolved nonregression or no eligible target produces
+`DEFER`. Only the remaining case is numeric `PASS`.
+
+These are approximate per-case moving-bootstrap intervals under local stationarity,
+not a simultaneous 95% guarantee. Each predeclared target uses a nominal 97.5%
+upper endpoint; a union bound gives nominal 5% family error if those approximate
+bootstrap coverage assumptions hold. Native receipts, compiler/features,
+source/dependency identities, resource limits and independent correctness/memory
+review remain with `check_command.py` and the collector. This utility neither
+discovers that closure nor approves a code change. CI exercises synthetic protocol
+and exact-statistic oracles; it takes no performance measurements.
