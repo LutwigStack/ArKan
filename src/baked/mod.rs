@@ -368,6 +368,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_baked_basis_high_order_exact_boundaries() {
+        // Exact Q0.15 vectors pin integer truncation and the partition remainder
+        // at endpoints and neighboring representable coordinates.
+        let cases: &[(usize, u32, &[u16])] = &[
+            (4, 0, &[1365, 15018, 15020, 1365, 0]),
+            (4, 1, &[1365, 15018, 15020, 1365, 0]),
+            (4, 32767, &[85, 6485, 19628, 6485, 85]),
+            (4, 32768, &[85, 6485, 19628, 6485, 85]),
+            (4, 65534, &[0, 1365, 15020, 15018, 1365]),
+            (4, 65535, &[0, 1365, 15020, 15018, 1365]),
+            (5, 0, &[273, 7099, 18022, 7101, 273, 0]),
+            (5, 1, &[273, 7099, 18022, 7101, 273, 0]),
+            (5, 32767, &[8, 2022, 14353, 14355, 2022, 8]),
+            (5, 32769, &[8, 2022, 14352, 14356, 2022, 8]),
+            (5, 65534, &[0, 273, 7100, 18023, 7099, 273]),
+            (5, 65535, &[0, 273, 7099, 18024, 7099, 273]),
+        ];
+        for &(order, t_q16, expected) in cases {
+            let mut basis = [0xA55A_u16; 8];
+            eval_basis_fixed(order, t_q16, &mut basis);
+            assert_eq!(&basis[..=order], expected, "order={order}, t_q16={t_q16}");
+            assert!(
+                basis[order + 1..].iter().all(|&value| value == 0xA55A),
+                "order={order}, t_q16={t_q16}: unused coefficients changed"
+            );
+        }
+    }
+
     /// Cox-de Boor ground truth for the *uniform* B-spline basis on t in [0,1).
     ///
     /// Knots are the integers, span = order, x = order + t — the canonical

@@ -74,6 +74,20 @@ payload count; it excludes some metadata, capacities, allocator overhead, and th
 workspace. The f32 column counts only weights and biases. Neither reports total
 process memory or serialized size.
 
+An experimental order-4/5 integer-basis rewrite preserved the complete coefficient
+vectors for all 65,536 Q16 coordinates in both debug and release qualification.
+The retained release assembly removed two wide signed-division helper calls for
+order 4 and three for order 5 from whole baked inference. These checks establish
+exact arithmetic and the intended codegen change.
+
+Its CPU-2 ABBA timing used the medium `8 → 16 → 8 → 4`, grid-5 fixture, with
+order-4/5 targets and order-3 baked/f32 controls, 100 samples, a 5-second warmup
+and a 15-second measurement. The frozen analysis ended `INVALID_STOP`: 1 of 16
+confidence widths, 5 of 8 repeat drift guards and 3 of 16 comparison guards failed.
+There was no eligible target or confirmed paired slowdown. The rewrite was not
+adopted, and this campaign supplies no qualified latency result. Small exact
+coefficient boundary regressions remain in the ordinary test suite.
+
 Python baseline operations share `scripts/bench_reference.py`: normalize, clamp,
 find the span from the actual knots, evaluate local basis functions, and gather
 active global coefficients from `[output, input, global_basis]`. Hidden layers
