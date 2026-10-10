@@ -239,6 +239,11 @@ impl KanNetwork {
             opts.max_grad_norm,
         );
 
+        // Zero times a nonfinite gradient is not a parameter no-op.
+        if learning_rate == 0.0 {
+            return Ok(loss);
+        }
+
         // =====================================================================
         // Parameter update: decoupled weight decay + SGD
         //

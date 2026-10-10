@@ -231,3 +231,222 @@ fn mse_into_checks_shapes_before_writes_and_clears_masked_slots() {
     assert_eq!(loss, 19.0 / 3.0);
     assert_eq!(gradients, [2.0 / 3.0, 0.0, 4.0]);
 }
+
+fn zero_rate_network(multithreading_threshold: usize) -> KanNetwork {
+    let mut net = KanNetwork::new(KanConfig {
+        input_dim: 1,
+        output_dim: 1,
+        hidden_dims: vec![],
+        grid_size: 3,
+        spline_order: 3,
+        input_mean: vec![0.0],
+        input_std: vec![1.0],
+        multithreading_threshold,
+        init_seed: Some(42),
+        ..KanConfig::default()
+    });
+    net.layers[0].weights.fill(0.0);
+    net.layers[0].weights[0] = -0.0;
+    net.layers[0].bias[0] = -0.0;
+    net
+}
+
+fn parameter_bits(net: &KanNetwork) -> Vec<u32> {
+    net.layers
+        .iter()
+        .flat_map(|layer| layer.weights.iter().chain(&layer.bias))
+        .map(|value| value.to_bits())
+        .collect()
+}
+
+// Compare NaNs and signed zeros exactly, including reusable buffer capacities.
+fn workspace_bits(workspace: &arkan::Workspace) -> Vec<(Vec<u32>, usize)> {
+    let mut result: Vec<_> = [
+        &workspace.z_buffer,
+        &workspace.basis_values,
+        &workspace.basis_derivs,
+        &workspace.layer_output,
+        &workspace.layer_input,
+        &workspace.layer_grads,
+        &workspace.staging_buffer,
+        &workspace.predictions_buffer,
+        &workspace.grad_output,
+    ]
+    .into_iter()
+    .chain(&workspace.layers_inputs)
+    .map(|buffer| {
+        (
+            buffer
+                .as_slice()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect(),
+            buffer.capacity(),
+        )
+    })
+    .collect();
+    for buffer in workspace.weight_grads.iter().chain(&workspace.bias_grads) {
+        result.push((
+            buffer.iter().map(|value| value.to_bits()).collect(),
+            buffer.capacity(),
+        ));
+    }
+    result.push((
+        workspace.grid_indices.clone(),
+        workspace.grid_indices.capacity(),
+    ));
+    for buffer in &workspace.layers_grid_indices {
+        result.push((buffer.clone(), buffer.capacity()));
+    }
+    for capacity in [
+        workspace.layers_inputs.capacity(),
+        workspace.layers_grid_indices.capacity(),
+        workspace.weight_grads.capacity(),
+        workspace.bias_grads.capacity(),
+        workspace.batch_capacity(),
+        workspace.history_batch_size(),
+    ] {
+        result.push((vec![], capacity));
+    }
+    result
+}
+
+fn check_zero_rate_nonfinite_gradients(threshold: usize) {
+    for learning_rate in [0.0, -0.0] {
+        for input in [0.0, 1.0] {
+            for target in [3e38_f32, -3e38_f32] {
+                for options in [
+                    TrainOptions::default(),
+                    TrainOptions {
+                        max_grad_norm: Some(1.0),
+                        weight_decay: 0.1,
+                    },
+                ] {
+                    let mut actual = zero_rate_network(threshold);
+                    let mut reference = actual.clone();
+                    let original = parameter_bits(&actual);
+                    let mut workspace = actual.create_workspace(1);
+                    let mut reference_workspace = reference.create_workspace(1);
+                    assert_eq!(
+                        workspace_bits(&workspace),
+                        workspace_bits(&reference_workspace)
+                    );
+                    let loss = actual
+                        .try_train_step_with_options(
+                            &[input],
+                            &[target],
+                            None,
+                            learning_rate,
+                            &mut workspace,
+                            &options,
+                        )
+                        .unwrap();
+                    // A nonzero update uses the same loss/backward/clipping path.
+                    let reference_loss = reference
+                        .try_train_step_with_options(
+                            &[input],
+                            &[target],
+                            None,
+                            0.125,
+                            &mut reference_workspace,
+                            &options,
+                        )
+                        .unwrap();
+                    assert_eq!(loss.to_bits(), f32::INFINITY.to_bits());
+                    assert_eq!(loss.to_bits(), reference_loss.to_bits());
+                    assert_eq!(workspace.predictions_buffer[0].to_bits(), 0.0_f32.to_bits());
+                    let gradient = if target > 0.0 {
+                        f32::NEG_INFINITY
+                    } else {
+                        f32::INFINITY
+                    };
+                    assert_eq!(workspace.grad_output[0].to_bits(), gradient.to_bits());
+                    if options.max_grad_norm.is_none() {
+                        assert_eq!(workspace.bias_grads[0][0].to_bits(), gradient.to_bits());
+                    }
+                    assert_eq!(workspace.history_batch_size(), 1);
+                    assert_eq!(
+                        workspace_bits(&workspace),
+                        workspace_bits(&reference_workspace)
+                    );
+                    assert_eq!(
+                        parameter_bits(&actual), original,
+                        "zero-rate parameter mutation: lr={learning_rate:?}, input={input}, target={target}, options={options:?}, threshold={threshold}",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn zero_learning_rate_preserves_parameter_bits_serial() {
+    check_zero_rate_nonfinite_gradients(usize::MAX);
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn zero_learning_rate_preserves_parameter_bits_parallel() {
+    check_zero_rate_nonfinite_gradients(1);
+}
+
+#[test]
+fn zero_learning_rate_still_clips_finite_gradients() {
+    let thresholds: &[usize] = if cfg!(feature = "parallel") {
+        &[usize::MAX, 1]
+    } else {
+        &[usize::MAX]
+    };
+    for &threshold in thresholds {
+        for learning_rate in [0.0, -0.0] {
+            let mut actual = zero_rate_network(threshold);
+            let mut reference = actual.clone();
+            let original = parameter_bits(&actual);
+            let mut workspace = actual.create_workspace(1);
+            let mut reference_workspace = reference.create_workspace(1);
+            let options = TrainOptions {
+                max_grad_norm: Some(0.25),
+                weight_decay: 0.1,
+            };
+            let loss = actual
+                .try_train_step_with_options(
+                    &[0.0],
+                    &[4.0],
+                    None,
+                    learning_rate,
+                    &mut workspace,
+                    &options,
+                )
+                .unwrap();
+            let reference_loss = reference
+                .try_train_step_with_options(
+                    &[0.0],
+                    &[4.0],
+                    None,
+                    0.125,
+                    &mut reference_workspace,
+                    &options,
+                )
+                .unwrap();
+            assert_eq!(loss.to_bits(), 16.0_f32.to_bits());
+            assert_eq!(loss.to_bits(), reference_loss.to_bits());
+            let norm = workspace
+                .weight_grads
+                .iter()
+                .chain(&workspace.bias_grads)
+                .flatten()
+                .map(|&g| f64::from(g).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(
+                (norm - 0.25).abs() < 1e-6,
+                "finite gradients were not clipped: {norm}"
+            );
+            assert_eq!(
+                workspace_bits(&workspace),
+                workspace_bits(&reference_workspace)
+            );
+            assert_eq!(parameter_bits(&actual), original);
+        }
+    }
+}
