@@ -860,6 +860,65 @@ mod tests {
         })
     }
 
+    #[test]
+    fn test_fixed_span_exact_boundary_values() {
+        // Literal interval/fraction pins: h=3 gives thirds 21845 and 43690.
+        // Include both saturation edges, wide offsets, and a negative q_z whose
+        // offset is positive. No second implementation is used as the oracle.
+        let cases: &[(i32, i32, i32, usize, usize, u32)] = &[
+            (-11, -10, 3, 5, 0, 0),
+            (-10, -10, 3, 5, 0, 0),
+            (-9, -10, 3, 5, 0, 21845),
+            (-8, -10, 3, 5, 0, 43690),
+            (-7, -10, 3, 5, 1, 0),
+            (-6, -10, 3, 5, 1, 21845),
+            (-5, -10, 3, 5, 1, 43690),
+            (-4, -10, 3, 5, 2, 0),
+            (-3, -10, 3, 5, 2, 21845),
+            (-2, -10, 3, 5, 2, 43690),
+            (-1, -10, 3, 5, 3, 0),
+            (0, -10, 3, 5, 3, 21845),
+            (1, -10, 3, 5, 3, 43690),
+            (2, -10, 3, 5, 4, 0),
+            (3, -10, 3, 5, 4, 21845),
+            (4, -10, 3, 5, 4, 43690),
+            (5, -10, 3, 5, 4, 65535),
+            (6, -10, 3, 5, 4, 65535),
+            (2, 0, 3, 1, 0, 43690),
+            (3, 0, 3, 1, 0, 65535),
+            (63, 0, 1, 64, 63, 0),
+            (64, 0, 1, 64, 63, 65535),
+            (65, 0, 1, 64, 63, 65535),
+            (65536, 0, 1, 64, 63, 65535),
+            (4128767, 0, 65536, 64, 62, 65535),
+            (4128768, 0, 65536, 64, 63, 0),
+            (4128769, 0, 65536, 64, 63, 1),
+            (4194303, 0, 65536, 64, 63, 65535),
+            (4194304, 0, 65536, 64, 63, 65535),
+            (4194305, 0, 65536, 64, 63, 65535),
+            (196607, -196608, 78643, 5, 4, 65535),
+            (65535, -65536, 26214, 5, 4, 65535),
+            (i32::MIN, i32::MIN, 1, 64, 0, 0),
+            (i32::MAX, i32::MAX, i32::MAX, 1, 0, 0),
+            (i32::MIN, i32::MAX, 1, 64, 0, 0),
+            (i32::MIN, i32::MAX, i32::MAX, 64, 0, 0),
+            (i32::MAX, i32::MIN, 1, 1, 0, 65535),
+            (i32::MAX, i32::MIN, 1, 64, 63, 65535),
+            (i32::MAX, i32::MIN, i32::MAX, 1, 0, 65535),
+            (i32::MAX, i32::MIN, i32::MAX, 64, 2, 0),
+            (2147483646, 0, i32::MAX, 64, 0, 65535),
+            (i32::MAX, 0, i32::MAX, 64, 1, 0),
+            (i32::MAX, -1, i32::MAX, 64, 1, 0),
+        ];
+        for &(q_z, q_rmin, h_q16, grid_size, expected_span, expected_t) in cases {
+            assert_eq!(
+                extract_span_t(q_z, q_rmin, h_q16, grid_size),
+                (expected_span, expected_t),
+                "q_z={q_z}, q_rmin={q_rmin}, h={h_q16}, grid={grid_size}"
+            );
+        }
+    }
+
     /// The upper clamps in `extract_span_t` look provably dead and are not: they
     /// are the only thing keeping the weight read in `forward` in bounds.
     ///

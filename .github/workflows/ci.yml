@@ -225,6 +225,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-examples-
 
+      - name: Test A/B source preparation
+        run: python3 -B -m unittest discover -s scripts -p test_prepare_ab.py -v
+
       - name: Build in-crate examples
         run: cargo build --examples
 
