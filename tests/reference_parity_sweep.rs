@@ -151,8 +151,27 @@ fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     a.iter()
         .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
+        .enumerate()
+        .map(|(index, (x, y))| {
+            assert!(
+                x.is_finite() && y.is_finite(),
+                "Nonfinite parity value at index {index}: actual={x}, reference={y}"
+            );
+            (x - y).abs()
+        })
         .fold(0.0f32, f32::max)
+}
+
+#[test]
+fn parity_rejects_nonfinite_values() {
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        for (actual, expected) in [([0.0, value], [0.0, 0.0]), ([0.0, 0.0], [0.0, value])] {
+            assert!(
+                std::panic::catch_unwind(|| max_abs_err(&actual, &expected)).is_err(),
+                "parity comparison accepted nonfinite values: {actual:?}, {expected:?}"
+            );
+        }
+    }
 }
 
 fn arkan_forward(network: &KanNetwork, dataset: &Dataset) -> Vec<f32> {
@@ -382,7 +401,7 @@ fn assert_parity(config_name: &str, ref_data: &Reference) -> (f32, f32, f32) {
         };
 
         let ref_loss = ref_data.loss_trajectory[step];
-        let rel_err = (arkan_loss - ref_loss).abs() / ref_loss.abs().max(1e-8);
+        let rel_err = max_abs_err(&[arkan_loss], &[ref_loss]) / ref_loss.abs().max(1e-8);
         max_traj_rel_err = max_traj_rel_err.max(rel_err);
 
         if step < 5 || step % 10 == 0 {
@@ -459,6 +478,18 @@ fn assert_parity(config_name: &str, ref_data: &Reference) -> (f32, f32, f32) {
 // ---------------------------------------------------------------------------
 // CPU tests — one per config
 // ---------------------------------------------------------------------------
+
+#[test]
+fn parity_rejects_nonfinite_loss_reference() {
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut ref_data = load_reference("training_ref_sgd_order3.json");
+        ref_data.loss_trajectory[0] = value;
+        assert!(
+            std::panic::catch_unwind(|| assert_parity("nonfinite_loss", &ref_data)).is_err(),
+            "trajectory comparison accepted nonfinite loss: {value}"
+        );
+    }
+}
 
 #[test]
 fn sweep_sgd_order3() {
@@ -597,7 +628,7 @@ fn sweep_gpu_adam_hybrid() {
             .expect("GPU hybrid Adam train_step_mse failed");
 
         let ref_loss = ref_data.loss_trajectory[step];
-        let rel_err = (arkan_loss - ref_loss).abs() / ref_loss.abs().max(1e-8);
+        let rel_err = max_abs_err(&[arkan_loss], &[ref_loss]) / ref_loss.abs().max(1e-8);
         max_traj_rel_err = max_traj_rel_err.max(rel_err);
 
         if step < 5 || step % 10 == 0 {

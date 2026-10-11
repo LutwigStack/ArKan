@@ -18,16 +18,16 @@ KEY DESIGN CHOICES (matching ArKan exactly):
 FIND_SPAN EQUIVALENCE (grid_range=(-1,1)):
   ArKan:  t_min=knots[order], step=(t_max-t_min)/G
           ratio=(x-t_min)/step+eps, span=clamp(floor(ratio),0,G-1)+order
-  PyTorch: implemented to match exactly (see find_span below).
+  PyTorch: shared bench_reference clamps layer inputs before span and basis.
 """
 
 import json
-import math
 import os
 import sys
 
 import torch
 import numpy as np
+from bench_reference import forward_layer
 
 # ---------------------------------------------------------------------------
 # Default values — individual configs override these
@@ -90,69 +90,6 @@ def compute_knots(grid_size: int, order: int, grid_range: tuple) -> torch.Tensor
     )
 
 
-def find_span(x: torch.Tensor, knots: torch.Tensor, order: int, grid_size: int) -> torch.Tensor:
-    """
-    Span index — exactly matches ArKan's find_span.
-
-    ArKan spline.rs:
-      t_min = knots[order]
-      t_max = knots[order + grid_size]
-      step  = (t_max - t_min) / grid_size
-      x_c   = clamp(x, t_min, t_max)
-      ratio = (x_c - t_min) / step
-      raw   = floor(ratio + EPSILON)   -- EPSILON = 1e-6
-      idx   = clamp(raw, 0, grid_size-1)
-      span  = idx + order
-    """
-    EPSILON = 1e-6
-    t_min = knots[order]
-    t_max = knots[order + grid_size]
-    step = (t_max - t_min) / grid_size
-    x_c = torch.clamp(x, t_min.item(), t_max.item())
-    ratio = (x_c - t_min) / step
-    raw = (ratio + EPSILON).floor().to(torch.long)
-    idx = torch.clamp(raw, 0, grid_size - 1)
-    return idx + order
-
-
-def compute_basis_vectorized(
-    x: torch.Tensor, span: torch.Tensor, knots: torch.Tensor, order: int
-) -> torch.Tensor:
-    """Cox-de Boor vectorized — same algorithm as bench_pytorch_train.py."""
-    batch, in_dim = x.shape
-    device = x.device
-    dtype = x.dtype
-
-    basis_list = [torch.ones(batch, in_dim, dtype=dtype, device=device)]
-    for _ in range(order):
-        basis_list.append(torch.zeros(batch, in_dim, dtype=dtype, device=device))
-    basis = torch.stack(basis_list, dim=2)  # [batch, in_dim, order+1]
-
-    for j in range(1, order + 1):
-        saved = torch.zeros(batch, in_dim, dtype=dtype, device=device)
-        for r in range(j):
-            idx_right = span + r + 1
-            idx_left = span + 1 - j + r
-
-            right_val = knots[idx_right] - x
-            left_val = x - knots[idx_left]
-
-            denom = right_val + left_val
-            mask = denom.abs() > 1e-6
-            safe_denom = torch.where(mask, denom, torch.ones_like(denom))
-            temp = (basis[:, :, r] / safe_denom) * mask.float()
-
-            new_basis_r = saved + right_val * temp
-            saved = left_val * temp
-
-            basis = basis.clone()
-            basis[:, :, r] = new_basis_r
-        basis = basis.clone()
-        basis[:, :, j] = saved
-
-    return basis  # [batch, in_dim, order+1]
-
-
 def forward_one_layer(
     x: torch.Tensor,
     weights: torch.Tensor,   # [out_dim, in_dim, global_basis]
@@ -162,27 +99,7 @@ def forward_one_layer(
     grid_size: int,
 ) -> torch.Tensor:
     """Forward pass for one KAN layer."""
-    batch = x.shape[0]
-    in_dim = x.shape[1]
-    out_dim = weights.shape[0]
-    global_basis = weights.shape[2]
-
-    span = find_span(x, knots, order, grid_size)  # [batch, in_dim]
-    basis = compute_basis_vectorized(x, span, knots, order)  # [batch, in_dim, order+1]
-    start_idx = span - order  # [batch, in_dim]
-
-    k_range = torch.arange(order + 1, device=x.device, dtype=torch.long)
-    global_k_idx = start_idx.unsqueeze(-1) + k_range  # [batch, in_dim, order+1]
-    global_k_idx = global_k_idx.clamp(0, global_basis - 1)
-
-    w_exp = weights.unsqueeze(0).expand(batch, -1, -1, -1)
-    idx_exp = global_k_idx.unsqueeze(1).expand(-1, out_dim, -1, -1)
-    w_active = torch.gather(w_exp, dim=3, index=idx_exp)
-
-    b_exp = basis.unsqueeze(1).expand(-1, out_dim, -1, -1)
-    out = (w_active * b_exp).sum(dim=3).sum(dim=2)  # [batch, out_dim]
-    out = out + bias.unsqueeze(0)
-    return out
+    return forward_layer(x, weights, bias, knots, grid_size, order)
 
 
 def network_forward(
@@ -319,6 +236,7 @@ def export_config(name: str, cfg: dict, out_dir: str):
         beta2 = cfg.get("beta2", 0.999)
         eps = cfg.get("epsilon", 1e-8)
         wd = cfg.get("weight_decay", 0.0)
+        # ponytail: checked-in Adam uses zero decay; nonzero decay needs AdamW for ArKan parity.
         optimizer = torch.optim.Adam(
             params, lr=lr, betas=(beta1, beta2), eps=eps, weight_decay=wd
         )

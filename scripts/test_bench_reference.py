@@ -4,6 +4,7 @@ from pathlib import Path
 import unittest
 
 import torch
+import export_training_reference as exporter
 import bench_pytorch as cpu
 import bench_pytorch_train as training
 import bench_competitors as competitors
@@ -57,6 +58,23 @@ class ReferenceParity(unittest.TestCase):
         x = torch.tensor([[-1e-7], [0.0], [1e-7]])
         result = cpu.forward_vectorized(network, cfg, x, cpu.compute_knots(cfg)).flatten()
         torch.testing.assert_close(result, torch.tensor([1.0, 3.5, 6.0]))
+
+    def test_exporter_clamps_basis_input_and_gradient(self):
+        knots = exporter.compute_knots(5, 3, (-3.0, 3.0))
+        weights = torch.arange(8, dtype=torch.float32).reshape(1, 1, 8).requires_grad_()
+        x = torch.tensor([[-10.0], [-3.0], [0.0], [3.0], [10.0]], requires_grad=True)
+        result = exporter.forward_one_layer(x, weights, torch.zeros(1), knots, 3, 5)
+        torch.testing.assert_close(result.flatten(), torch.tensor([1.0, 1.0, 3.5, 6.0, 6.0]))
+        result.sum().backward()
+        torch.testing.assert_close(x.grad.flatten(), torch.tensor([0.0, 5.0 / 6.0, 5.0 / 6.0, 5.0 / 6.0, 0.0]))
+        self.assertAlmostEqual(weights.grad.sum().item(), 5.0, places=5)
+
+    def test_exporter_narrow_grid_preserves_linear_spline(self):
+        knots = exporter.compute_knots(5, 3, (-1e-7, 1e-7))
+        weights = torch.arange(8, dtype=torch.float32).reshape(1, 1, 8)
+        x = torch.tensor([[-1e-7], [0.0], [1e-7]])
+        result = exporter.forward_one_layer(x, weights, torch.zeros(1), knots, 3, 5)
+        torch.testing.assert_close(result.flatten(), torch.tensor([1.0, 3.5, 6.0]))
 
     def test_reset_repeats_same_adam_step(self):
         from bench_reference import capture_reset
