@@ -158,6 +158,16 @@ impl ParallelBackwardScratch {
 }
 
 impl KanLayer {
+    /// Heap capacity retained by this layer, excluding the inline value.
+    pub fn heap_capacity_bytes(&self) -> usize {
+        (self.knots.capacity()
+            + self.mean.capacity()
+            + self.std.capacity()
+            + self.weights.capacity()
+            + self.bias.capacity())
+            * std::mem::size_of::<f32>()
+    }
+
     /// Creates a new KAN layer with the given dimensions (fallible version).
     ///
     /// This is the fallible version of [`new`](Self::new) that returns an error

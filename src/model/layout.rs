@@ -148,3 +148,22 @@ impl ModelLayout {
         &self.layers
     }
 }
+
+impl crate::model::KanNetwork {
+    /// All owned heap capacities, including checked geometry and normalization.
+    /// Workspaces and optimizers have independent owners and are excluded.
+    pub fn heap_capacity_bytes(&self) -> usize {
+        self.layers.capacity() * std::mem::size_of::<crate::layer::KanLayer>()
+            + self
+                .layers
+                .iter()
+                .map(|layer| layer.heap_capacity_bytes())
+                .sum::<usize>()
+            + self.config.hidden_dims.capacity() * std::mem::size_of::<usize>()
+            + (self.config.input_mean.capacity() + self.config.input_std.capacity())
+                * std::mem::size_of::<f32>()
+            + self.layout.dimensions.capacity() * std::mem::size_of::<usize>()
+            + self.layout.parameter_sizes.capacity() * std::mem::size_of::<(usize, usize)>()
+            + self.layout.layers.capacity() * std::mem::size_of::<LayerLayout>()
+    }
+}

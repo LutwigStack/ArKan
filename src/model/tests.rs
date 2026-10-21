@@ -739,3 +739,14 @@ fn test_from_bytes_legacy() {
     let loaded = KanNetwork::from_bytes_legacy(&legacy_bytes).expect("from_bytes_legacy failed");
     assert_eq!(loaded.param_count(), original.param_count());
 }
+
+#[test]
+fn heap_capacity_includes_reserved_layer_weights_without_changing_the_model() {
+    let mut network = KanNetwork::new(KanConfig::preset());
+    let before = network.heap_capacity_bytes();
+    let old_capacity = network.layers[0].weights.capacity();
+    network.layers[0].weights.reserve(1000);
+    let added = (network.layers[0].weights.capacity() - old_capacity) * std::mem::size_of::<f32>();
+    assert!(added > 0);
+    assert_eq!(network.heap_capacity_bytes(), before + added);
+}
