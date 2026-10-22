@@ -320,6 +320,7 @@ impl SafetyConfig {
 /// Checks for non-finite values in gradients (NaN or ±inf).
 ///
 /// Returns the index of the first non-finite value found, or None if all values are finite.
+#[inline]
 fn find_nan_in_grads(grads: &[f32]) -> Option<usize> {
     grads.iter().position(|&g| !g.is_finite())
 }
@@ -369,6 +370,7 @@ fn validate_grad_shapes(
 }
 
 /// Ok(true) preserves the legacy skip policy; strict errors precede every mutation.
+#[inline]
 fn check_finite(values: &[f32], safety: &SafetyConfig, context: &str) -> ArkanResult<bool> {
     if safety.fail_on_nan || safety.skip_step_on_nan {
         if let Some(index) = find_nan_in_grads(values) {

@@ -252,17 +252,19 @@ impl Adam {
             1.0 - config.beta1.powi((state.t + 1) as i32),
             1.0 - config.beta2.powi((state.t + 1) as i32),
         );
-        for i in 0..params.len() {
-            let values = Self::updated_values(
-                params[i],
-                grads[i],
-                state.m.as_slice()[i],
-                state.v.as_slice()[i],
-                config,
-                correction,
-            );
-            if check_finite(&values, &config.safety, "Adam update or state")? {
-                return Ok(());
+        if config.safety.fail_on_nan || config.safety.skip_step_on_nan {
+            for i in 0..params.len() {
+                let values = Self::updated_values(
+                    params[i],
+                    grads[i],
+                    state.m.as_slice()[i],
+                    state.v.as_slice()[i],
+                    config,
+                    correction,
+                );
+                if check_finite(&values, &config.safety, "Adam update or state")? {
+                    return Ok(());
+                }
             }
         }
         Self::update_params(params, &grads, state, config);
