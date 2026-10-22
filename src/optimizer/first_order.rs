@@ -248,6 +248,7 @@ impl Adam {
         let Some(grads) = prepare_gradient(grads, &config.safety)? else {
             return Ok(());
         };
+        let grads = grads.as_ref();
         let correction = (
             1.0 - config.beta1.powi((state.t + 1) as i32),
             1.0 - config.beta2.powi((state.t + 1) as i32),
@@ -323,6 +324,7 @@ impl Adam {
         Ok(())
     }
 
+    #[inline(always)]
     fn updated_values(
         param: f32,
         grad: f32,
