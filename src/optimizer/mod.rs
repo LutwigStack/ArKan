@@ -417,6 +417,14 @@ fn prepare_gradients<'a>(
     safety: &SafetyConfig,
     max_norm: Option<f32>,
 ) -> ArkanResult<Option<PreparedGradients<'a>>> {
+    if safety.grad_scaling_factor.is_none() && max_norm.is_none() {
+        for tensor in weights.iter().chain(biases) {
+            if check_finite(tensor, safety, "gradient")? {
+                return Ok(None);
+            }
+        }
+        return Ok(Some((Cow::Borrowed(weights), Cow::Borrowed(biases))));
+    }
     let prepare = |source: &'a [Vec<f32>]| -> ArkanResult<Option<Cow<'a, [Vec<f32>]>>> {
         let mut tensors = Cow::Borrowed(source);
         for (index, tensor) in source.iter().enumerate() {
