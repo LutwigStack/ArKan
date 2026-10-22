@@ -229,6 +229,53 @@ unsafe impl Send for Adam {}
 unsafe impl Sync for Adam {}
 
 impl Adam {
+    /// Applies the same Adam update to a standalone parameter tensor.
+    /// Shape and numeric validation finish before parameters or moments change.
+    pub fn step_tensor(
+        params: &mut [f32],
+        grads: &[f32],
+        state: &mut AdamState,
+        config: &AdamConfig,
+    ) -> ArkanResult<()> {
+        validate_shape(params.len(), grads.len())?;
+        validate_shape(params.len(), state.m.len())?;
+        validate_shape(params.len(), state.v.len())?;
+        validate_nonnegative(config.lr as f64, "learning rate")?;
+        validate_nonnegative(config.weight_decay as f64, "weight decay")?;
+        if !(0.0..1.0).contains(&config.beta1)
+            || !(0.0..1.0).contains(&config.beta2)
+            || !config.epsilon.is_finite()
+            || config.epsilon <= 0.0
+            || state.t >= i32::MAX as usize
+        {
+            return Err(ArkanError::optimizer(
+                "invalid Adam tensor configuration or timestep",
+            ));
+        }
+        let correction = (
+            1.0 - config.beta1.powi((state.t + 1) as i32),
+            1.0 - config.beta2.powi((state.t + 1) as i32),
+        );
+        for i in 0..params.len() {
+            let values = Self::updated_values(
+                params[i],
+                grads[i],
+                state.m.as_slice()[i],
+                state.v.as_slice()[i],
+                config,
+                correction,
+            );
+            if !params[i].is_finite()
+                || !grads[i].is_finite()
+                || values.iter().any(|value| !value.is_finite())
+            {
+                return Err(ArkanError::optimizer("nonfinite Adam tensor update"));
+            }
+        }
+        Self::update_params(params, grads, state, config);
+        Ok(())
+    }
+
     /// Creates a new Adam optimizer for the given network.
     pub fn new(network: &KanNetwork, config: AdamConfig) -> Self {
         let layer_states = network.layers.iter().map(LayerAdamState::new).collect();

@@ -473,6 +473,40 @@ mod tests {
     }
 
     #[test]
+    fn tensor_adam_matches_network_and_rejects_before_writing() {
+        let mut network = KanNetwork::new(KanConfig {
+            input_dim: 2,
+            input_mean: vec![0.0; 2],
+            input_std: vec![1.0; 2],
+            output_dim: 1,
+            hidden_dims: vec![],
+            init_seed: Some(41),
+            ..Default::default()
+        });
+        let config = AdamConfig::with_lr(0.01);
+        let mut optimizer = Adam::new(&network, config);
+        let mut params = network.layers[0].weights.as_slice().to_vec();
+        let mut state = AdamState::new(params.len());
+        for step in 0..7 {
+            let gradients = vec![(step as f32 - 3.0) * 0.1; params.len()];
+            Adam::step_tensor(&mut params, &gradients, &mut state, &config).unwrap();
+            optimizer
+                .step(&mut network, &[gradients], &[vec![0.0]], None)
+                .unwrap();
+            assert_eq!(params, network.layers[0].weights.as_slice());
+        }
+        let before = params.clone();
+        let moments = state.clone();
+        let mut invalid = vec![0.0; params.len()];
+        *invalid.last_mut().unwrap() = f32::NAN;
+        assert!(Adam::step_tensor(&mut params, &invalid, &mut state, &config).is_err());
+        assert_eq!(params, before);
+        assert_eq!(state.t, moments.t);
+        assert_eq!(state.m.as_slice(), moments.m.as_slice());
+        assert_eq!(state.v.as_slice(), moments.v.as_slice());
+    }
+
+    #[test]
     fn test_adam_update() {
         let config = KanConfig {
             input_dim: 4,
