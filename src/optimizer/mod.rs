@@ -322,7 +322,11 @@ impl SafetyConfig {
 /// Returns the index of the first non-finite value found, or None if all values are finite.
 #[inline(always)]
 fn find_nan_in_grads(grads: &[f32]) -> Option<usize> {
-    grads.iter().position(|&g| !g.is_finite())
+    if grads.iter().fold(true, |finite, g| finite & g.is_finite()) {
+        None
+    } else {
+        grads.iter().position(|&g| !g.is_finite())
+    }
 }
 
 fn validate_nonnegative(value: f64, name: &str) -> ArkanResult<()> {
