@@ -240,10 +240,14 @@ impl Adam {
         validate_shape(params.len(), grads.len())?;
         validate_shape(params.len(), state.m.len())?;
         validate_shape(params.len(), state.v.len())?;
+        validate_safety(&config.safety, None)?;
         Self::validate_config(config)?;
         if state.t >= i32::MAX as usize {
             return Err(ArkanError::optimizer("Adam timestep exhausted"));
         }
+        let Some(grads) = prepare_gradient(grads, &config.safety)? else {
+            return Ok(());
+        };
         let correction = (
             1.0 - config.beta1.powi((state.t + 1) as i32),
             1.0 - config.beta2.powi((state.t + 1) as i32),
@@ -257,14 +261,11 @@ impl Adam {
                 config,
                 correction,
             );
-            if !params[i].is_finite()
-                || !grads[i].is_finite()
-                || values.iter().any(|value| !value.is_finite())
-            {
-                return Err(ArkanError::optimizer("nonfinite Adam tensor update"));
+            if check_finite(&values, &config.safety, "Adam update or state")? {
+                return Ok(());
             }
         }
-        Self::update_params(params, grads, state, config);
+        Self::update_params(params, &grads, state, config);
         Ok(())
     }
 

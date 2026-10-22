@@ -390,41 +390,48 @@ pub(crate) enum StepOutcome {
 
 type PreparedGradients<'a> = (Cow<'a, [Vec<f32>]>, Cow<'a, [Vec<f32>]>);
 
+fn prepare_gradient<'a>(
+    source: &'a [f32],
+    safety: &SafetyConfig,
+) -> ArkanResult<Option<Cow<'a, [f32]>>> {
+    if check_finite(source, safety, "gradient")? {
+        return Ok(None);
+    }
+    let gradient = match safety.grad_scaling_factor {
+        Some(factor) if factor != 1.0 => {
+            Cow::Owned(source.iter().map(|&g| (g as f64 / factor) as f32).collect())
+        }
+        _ => Cow::Borrowed(source),
+    };
+    if matches!(safety.grad_scaling_factor, Some(factor) if factor < 1.0)
+        && check_finite(&gradient, safety, "unscaled gradient")?
+    {
+        return Ok(None);
+    }
+    Ok(Some(gradient))
+}
+
 fn prepare_gradients<'a>(
     weights: &'a [Vec<f32>],
     biases: &'a [Vec<f32>],
     safety: &SafetyConfig,
     max_norm: Option<f32>,
 ) -> ArkanResult<Option<PreparedGradients<'a>>> {
-    for tensor in weights.iter().chain(biases) {
-        if check_finite(tensor, safety, "gradient")? {
-            return Ok(None);
-        }
-    }
-    let unscale = |source: &'a [Vec<f32>]| -> Cow<'a, [Vec<f32>]> {
-        match safety.grad_scaling_factor {
-            Some(factor) if factor == 1.0 && (safety.fail_on_nan || safety.skip_step_on_nan) => {
-                Cow::Borrowed(source)
-            }
-            Some(factor) => Cow::Owned(
-                source
-                    .iter()
-                    .map(|tensor| tensor.iter().map(|&g| (g as f64 / factor) as f32).collect())
-                    .collect(),
-            ),
-            None => Cow::Borrowed(source),
-        }
-    };
-    let mut wg = unscale(weights);
-    let mut bg = unscale(biases);
-    // Finite f32 gradients cannot overflow when divided by a finite factor >= 1.
-    if matches!(safety.grad_scaling_factor, Some(factor) if factor < 1.0) {
-        for tensor in wg.iter().chain(bg.iter()) {
-            if check_finite(tensor, safety, "unscaled gradient")? {
+    let prepare = |source: &'a [Vec<f32>]| -> ArkanResult<Option<Cow<'a, [Vec<f32>]>>> {
+        let mut tensors = Cow::Borrowed(source);
+        for (index, tensor) in source.iter().enumerate() {
+            let Some(gradient) = prepare_gradient(tensor, safety)? else {
                 return Ok(None);
+            };
+            if let Cow::Owned(gradient) = gradient {
+                tensors.to_mut()[index] = gradient;
             }
         }
-    }
+        Ok(Some(tensors))
+    };
+    let (Some(mut wg), Some(mut bg)) = (prepare(weights)?, prepare(biases)?) else {
+        return Ok(None);
+    };
     if max_norm.is_some() {
         let scale = global_clip_scale(global_grad_norm(&wg, &bg), max_norm);
         if scale != 1.0 {
@@ -499,11 +506,73 @@ mod tests {
         let moments = state.clone();
         let mut invalid = vec![0.0; params.len()];
         *invalid.last_mut().unwrap() = f32::NAN;
-        assert!(Adam::step_tensor(&mut params, &invalid, &mut state, &config).is_err());
+        assert!(Adam::step_tensor(&mut params, &invalid, &mut state, &config).is_ok());
         assert_eq!(params, before);
         assert_eq!(state.t, moments.t);
         assert_eq!(state.m.as_slice(), moments.m.as_slice());
         assert_eq!(state.v.as_slice(), moments.v.as_slice());
+    }
+
+    #[test]
+    fn tensor_adam_preserves_the_network_owners_amp_semantics() {
+        for factor in [1024.0, 1.0, 0.25] {
+            for safety in [
+                SafetyConfig::with_amp(factor),
+                SafetyConfig {
+                    grad_scaling_factor: Some(factor),
+                    unscale_before_step: false,
+                    ..SafetyConfig::strict()
+                },
+            ] {
+                let mut network = KanNetwork::new(KanConfig {
+                    input_dim: 2,
+                    input_mean: vec![0.0; 2],
+                    input_std: vec![1.0; 2],
+                    output_dim: 1,
+                    hidden_dims: vec![],
+                    init_seed: Some(41),
+                    ..Default::default()
+                });
+                let config = AdamConfig {
+                    safety,
+                    ..AdamConfig::with_lr(0.01)
+                };
+                let mut optimizer = Adam::new(&network, config);
+                let mut params = network.layers[0].weights.as_slice().to_vec();
+                let mut state = AdamState::new(params.len());
+                for value in [0.25, f32::NAN, f32::INFINITY, f32::MAX, -0.125] {
+                    let gradients = vec![value; params.len()];
+                    let tensor = Adam::step_tensor(&mut params, &gradients, &mut state, &config);
+                    let net = optimizer.step(&mut network, &[gradients], &[vec![0.0]], None);
+                    assert_eq!(tensor.is_ok(), net.is_ok());
+                    assert_eq!(params, network.layers[0].weights.as_slice());
+                    assert_eq!(state.t, optimizer.layer_states[0].weights.t);
+                    assert_eq!(
+                        state.m.as_slice(),
+                        optimizer.layer_states[0].weights.m.as_slice()
+                    );
+                    assert_eq!(
+                        state.v.as_slice(),
+                        optimizer.layer_states[0].weights.v.as_slice()
+                    );
+                }
+            }
+        }
+        assert!(matches!(
+            prepare_gradient(&[0.25], &SafetyConfig::default()).unwrap(),
+            Some(Cow::Borrowed(_))
+        ));
+        for factor in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut params = [1.0];
+            let mut state = AdamState::new(1);
+            let config = AdamConfig {
+                safety: SafetyConfig::with_amp(factor),
+                ..AdamConfig::default()
+            };
+            assert!(Adam::step_tensor(&mut params, &[0.25], &mut state, &config).is_err());
+            assert_eq!(params, [1.0]);
+            assert_eq!(state.t, 0);
+        }
     }
 
     #[test]
