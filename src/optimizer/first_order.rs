@@ -240,17 +240,9 @@ impl Adam {
         validate_shape(params.len(), grads.len())?;
         validate_shape(params.len(), state.m.len())?;
         validate_shape(params.len(), state.v.len())?;
-        validate_nonnegative(config.lr as f64, "learning rate")?;
-        validate_nonnegative(config.weight_decay as f64, "weight decay")?;
-        if !(0.0..1.0).contains(&config.beta1)
-            || !(0.0..1.0).contains(&config.beta2)
-            || !config.epsilon.is_finite()
-            || config.epsilon <= 0.0
-            || state.t >= i32::MAX as usize
-        {
-            return Err(ArkanError::optimizer(
-                "invalid Adam tensor configuration or timestep",
-            ));
+        Self::validate_config(config)?;
+        if state.t >= i32::MAX as usize {
+            return Err(ArkanError::optimizer("Adam timestep exhausted"));
         }
         let correction = (
             1.0 - config.beta1.powi((state.t + 1) as i32),
@@ -311,6 +303,21 @@ impl Adam {
     #[inline]
     pub fn set_learning_rate(&mut self, lr: f32) {
         self.config.lr = lr;
+    }
+
+    fn validate_config(config: &AdamConfig) -> ArkanResult<()> {
+        validate_nonnegative(config.lr as f64, "learning rate")?;
+        validate_nonnegative(config.weight_decay as f64, "weight decay")?;
+        if !(0.0..1.0).contains(&config.beta1)
+            || !(0.0..1.0).contains(&config.beta2)
+            || !config.epsilon.is_finite()
+            || config.epsilon <= 0.0
+        {
+            return Err(ArkanError::optimizer(
+                "Adam requires betas in [0, 1) and finite positive epsilon",
+            ));
+        }
+        Ok(())
     }
 
     fn updated_values(
@@ -399,17 +406,7 @@ impl Adam {
         let mut parameters = network.try_parameters_mut()?;
         validate_grad_shapes(&parameters, weight_grads, bias_grads)?;
         validate_safety(&self.config.safety, max_grad_norm)?;
-        validate_nonnegative(self.config.lr as f64, "learning rate")?;
-        validate_nonnegative(self.config.weight_decay as f64, "weight decay")?;
-        if !(0.0..1.0).contains(&self.config.beta1)
-            || !(0.0..1.0).contains(&self.config.beta2)
-            || !self.config.epsilon.is_finite()
-            || self.config.epsilon <= 0.0
-        {
-            return Err(ArkanError::optimizer(
-                "Adam requires betas in [0, 1) and finite positive epsilon",
-            ));
-        }
+        Self::validate_config(&self.config)?;
         validate_shape(parameters.len(), self.layer_states.len())?;
         for ((parameter_weights, parameter_bias), state) in
             parameters.iter().zip(&self.layer_states)
